@@ -4,10 +4,15 @@
 #include <stdint.h>
 
 #ifdef __BYTE_ORDER
+/* __BYTE_ORDER already defined, define the constants */
 #define __BIG_ENDIAN 4321
 #define __LITTLE_ENDIAN 1234
-#elif __APPLE__
+#elif defined(__APPLE__)
 #include <machine/endian.h>
+/* macOS uses BYTE_ORDER, not __BYTE_ORDER - map them */
+#define __BYTE_ORDER BYTE_ORDER
+#define __BIG_ENDIAN BIG_ENDIAN
+#define __LITTLE_ENDIAN LITTLE_ENDIAN
 #else
 #include <endian.h>
 #endif
