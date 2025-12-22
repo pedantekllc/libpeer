@@ -500,7 +500,16 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
     case PEER_CONNECTION_COMPLETED:
-      if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
+      /* Drain all pending packets from the socket.
+       * STUN consent requests arrive frequently (~16/sec) and we must respond
+       * to all of them. agent_recv returns 0 for STUN (handled internally),
+       * >0 for data packets, <0 when no more data is available. */
+      while ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) >= 0) {
+        if (pc->agent_ret == 0) {
+          /* STUN packet was handled internally, continue draining */
+          continue;
+        }
+
         LOGD("agent_recv %d", pc->agent_ret);
 
         if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
