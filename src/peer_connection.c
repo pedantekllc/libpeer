@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "agent.h"
@@ -12,6 +13,7 @@
 #include "rtp.h"
 #include "sctp.h"
 #include "sdp.h"
+#include "utils.h"
 
 #define STATE_CHANGED(pc, curr_state)                                 \
   if (pc->oniceconnectionstatechange && pc->state != curr_state) {    \
@@ -53,26 +55,208 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
   agent_send(&pc->agent, data, size);
 }
 
+/*
+ * DTLS handshake fragment reassembly for ClientHello
+ *
+ * Firefox with DTLS 1.3 + PQC sends ~1531 byte ClientHello which gets fragmented.
+ * mbedtls does not support reassembling fragmented ClientHello messages.
+ * We reassemble fragments here before passing to mbedtls.
+ *
+ * DTLS record header (13 bytes):
+ *   [0]      Content type (22 = handshake)
+ *   [1-2]    Version
+ *   [3-4]    Epoch
+ *   [5-10]   Sequence number (6 bytes)
+ *   [11-12]  Length
+ *
+ * Handshake message header (12 bytes, after record header):
+ *   [0]      Handshake type (1 = ClientHello)
+ *   [1-3]    Total message length (24-bit big-endian)
+ *   [4-5]    Message sequence
+ *   [6-8]    Fragment offset (24-bit big-endian)
+ *   [9-11]   Fragment length (24-bit big-endian)
+ */
+
+#define DTLS_RECORD_HEADER_LEN 13
+#define DTLS_HANDSHAKE_HEADER_LEN 12
+#define DTLS_CONTENT_TYPE_HANDSHAKE 22
+#define DTLS_HANDSHAKE_TYPE_CLIENT_HELLO 1
+#define DTLS_MAX_HANDSHAKE_SIZE 4096
+
+/* Fragment reassembly state */
+typedef struct {
+  uint8_t data[DTLS_MAX_HANDSHAKE_SIZE];
+  uint32_t total_len;        /* Expected total handshake message length */
+  uint32_t received_len;     /* Bytes received so far */
+  uint16_t msg_seq;          /* Message sequence number */
+  uint8_t version[2];        /* DTLS version from first fragment */
+  uint8_t epoch[2];          /* Epoch from first fragment */
+  uint8_t seq_num[6];        /* Sequence number from first fragment */
+  int active;                /* Reassembly in progress */
+} dtls_fragment_state_s;
+
+static dtls_fragment_state_s g_frag_state = {0};
+
+static uint32_t read_uint24_be(const uint8_t* p) {
+  return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+}
+
+static void write_uint24_be(uint8_t* p, uint32_t val) {
+  p[0] = (val >> 16) & 0xFF;
+  p[1] = (val >> 8) & 0xFF;
+  p[2] = val & 0xFF;
+}
+
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
   int recv_max = 0;
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+  uint8_t recv_buf[2048];
 
+  /* Check if there's already buffered data from agent */
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
     memcpy(buf, pc->agent_buf, pc->agent_ret);
     return pc->agent_ret;
   }
 
   while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, buf, len);
+    ret = agent_recv(&pc->agent, recv_buf, sizeof(recv_buf));
 
-    if (ret > 0) {
-      break;
+    if (ret <= 0) {
+      recv_max++;
+      continue;
     }
 
-    recv_max++;
+    /* Check if this is a DTLS handshake record */
+    if (ret < DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN) {
+      /* Too short to be a handshake, pass through */
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    uint8_t content_type = recv_buf[0];
+    if (content_type != DTLS_CONTENT_TYPE_HANDSHAKE) {
+      /* Not a handshake message, pass through */
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    /* Parse handshake header (starts after 13-byte record header) */
+    const uint8_t* hs = recv_buf + DTLS_RECORD_HEADER_LEN;
+    uint8_t hs_type = hs[0];
+    uint32_t hs_total_len = read_uint24_be(hs + 1);
+    uint16_t hs_msg_seq = ((uint16_t)hs[4] << 8) | hs[5];
+    uint32_t frag_offset = read_uint24_be(hs + 6);
+    uint32_t frag_len = read_uint24_be(hs + 9);
+
+    LOGD("Handshake: type=%d, total=%u, seq=%u, frag_off=%u, frag_len=%u",
+         hs_type, hs_total_len, hs_msg_seq, frag_offset, frag_len);
+
+    /* Only reassemble ClientHello (type 1) */
+    if (hs_type != DTLS_HANDSHAKE_TYPE_CLIENT_HELLO) {
+      /* Not ClientHello, pass through */
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    /* Check if this is a fragmented message */
+    if (frag_offset == 0 && frag_len == hs_total_len) {
+      /* Not fragmented, pass through */
+      LOGD("ClientHello not fragmented, passing through");
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    /* Fragmented ClientHello - need to reassemble */
+    LOGI("ClientHello fragmented: offset=%u, len=%u, total=%u", frag_offset, frag_len, hs_total_len);
+
+    /* Check if this is the start of a new message */
+    if (frag_offset == 0) {
+      /* Start new reassembly */
+      memset(&g_frag_state, 0, sizeof(g_frag_state));
+      g_frag_state.active = 1;
+      g_frag_state.total_len = hs_total_len;
+      g_frag_state.msg_seq = hs_msg_seq;
+      /* Save record header fields for reconstruction */
+      memcpy(g_frag_state.version, recv_buf + 1, 2);
+      memcpy(g_frag_state.epoch, recv_buf + 3, 2);
+      memcpy(g_frag_state.seq_num, recv_buf + 5, 6);
+      LOGI("Starting ClientHello reassembly, total_len=%u", hs_total_len);
+    }
+
+    /* Validate this fragment belongs to current reassembly */
+    if (!g_frag_state.active || hs_msg_seq != g_frag_state.msg_seq || hs_total_len != g_frag_state.total_len) {
+      LOGW("Fragment mismatch, resetting");
+      g_frag_state.active = 0;
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    /* Bounds check */
+    if (frag_offset + frag_len > g_frag_state.total_len) {
+      LOGE("Fragment exceeds total length");
+      g_frag_state.active = 0;
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    if (frag_offset + frag_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN) {
+      LOGE("Handshake message too large for reassembly buffer");
+      g_frag_state.active = 0;
+      memcpy(buf, recv_buf, ret);
+      return ret;
+    }
+
+    /* Copy fragment data (handshake payload, after 12-byte handshake header) */
+    const uint8_t* frag_data = hs + DTLS_HANDSHAKE_HEADER_LEN;
+    memcpy(g_frag_state.data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
+    g_frag_state.received_len += frag_len;
+
+    LOGI("Received fragment: offset=%u, len=%u, total_received=%u/%u",
+         frag_offset, frag_len, g_frag_state.received_len, g_frag_state.total_len);
+
+    /* Check if reassembly is complete */
+    if (g_frag_state.received_len >= g_frag_state.total_len) {
+      LOGI("ClientHello reassembly complete (%u bytes)", g_frag_state.total_len);
+
+      /* Build the complete handshake header */
+      g_frag_state.data[0] = DTLS_HANDSHAKE_TYPE_CLIENT_HELLO;
+      write_uint24_be(g_frag_state.data + 1, g_frag_state.total_len);
+      g_frag_state.data[4] = (g_frag_state.msg_seq >> 8) & 0xFF;
+      g_frag_state.data[5] = g_frag_state.msg_seq & 0xFF;
+      write_uint24_be(g_frag_state.data + 6, 0);  /* fragment_offset = 0 */
+      write_uint24_be(g_frag_state.data + 9, g_frag_state.total_len);  /* fragment_length = total */
+
+      /* Build complete DTLS record */
+      uint32_t handshake_size = DTLS_HANDSHAKE_HEADER_LEN + g_frag_state.total_len;
+      uint32_t total_record_len = DTLS_RECORD_HEADER_LEN + handshake_size;
+
+      if (total_record_len > len) {
+        LOGE("Reassembled message too large for buffer");
+        g_frag_state.active = 0;
+        return -1;
+      }
+
+      /* Build record header */
+      buf[0] = DTLS_CONTENT_TYPE_HANDSHAKE;
+      memcpy(buf + 1, g_frag_state.version, 2);
+      memcpy(buf + 3, g_frag_state.epoch, 2);
+      memcpy(buf + 5, g_frag_state.seq_num, 6);
+      buf[11] = (handshake_size >> 8) & 0xFF;
+      buf[12] = handshake_size & 0xFF;
+
+      /* Copy handshake data */
+      memcpy(buf + DTLS_RECORD_HEADER_LEN, g_frag_state.data, handshake_size);
+
+      g_frag_state.active = 0;
+      return total_record_len;
+    }
+
+    /* Not complete yet, continue receiving more fragments */
+    /* Don't increment recv_max here - we're actively reassembling */
   }
+
   return ret;
 }
 
