@@ -25,8 +25,15 @@ void peer_log(char* level_tag, const char* file_name, int line_number, const cha
 #define LOG_PRINT(level_tag, fmt, ...) \
   peer_log(level_tag, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #else
-#define LOG_PRINT(level_tag, fmt, ...) \
-  fprintf(stdout, "%s\t%s\t%d\t" fmt "\n", level_tag, __FILE__, __LINE__, ##__VA_ARGS__)
+#include <sys/time.h>
+#define LOG_PRINT(level_tag, fmt, ...) do { \
+  struct timeval _tv; gettimeofday(&_tv, NULL); \
+  struct tm* _tm = localtime(&_tv.tv_sec); \
+  fprintf(stdout, "%02d:%02d:%02d.%03d %s\t%s\t%d\t" fmt "\n", \
+    _tm->tm_hour, _tm->tm_min, _tm->tm_sec, (int)(_tv.tv_usec/1000), \
+    level_tag, __FILE__, __LINE__, ##__VA_ARGS__); \
+  fflush(stdout); \
+} while(0)
 #endif
 
 #if LOG_LEVEL >= LEVEL_DEBUG

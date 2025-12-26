@@ -65,7 +65,7 @@
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
 
-// #define LOG_LEVEL LEVEL_DEBUG
+#define LOG_LEVEL LEVEL_INFO
 #ifndef LOG_REDIRECT
 #define LOG_REDIRECT 0
 #endif

@@ -635,9 +635,13 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 void sctp_destroy_association(Sctp* sctp) {
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
-    usrsctp_shutdown(sctp->sock, SHUT_RDWR);
+    /* Set socket to non-blocking to prevent close from blocking */
+    usrsctp_set_non_blocking(sctp->sock, 1);
     usrsctp_close(sctp->sock);
     sctp->sock = NULL;
+  }
+  if (sctp) {
+    usrsctp_deregister_address(sctp);
   }
 #endif
 }

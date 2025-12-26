@@ -13,9 +13,10 @@
 #include "utils.h"
 
 #define AGENT_POLL_TIMEOUT 1
-#define AGENT_CONNCHECK_MAX 1000
-#define AGENT_CONNCHECK_PERIOD 100
+#define AGENT_CONNCHECK_MAX 100
+#define AGENT_CONNCHECK_PERIOD 10
 #define AGENT_STUN_RECV_MAXTIMES 1000
+#define AGENT_MAX_INPROGRESS 5  // Parallel pair checking
 
 void agent_clear_candidates(Agent* agent) {
   agent->local_candidates_count = 0;
@@ -86,7 +87,8 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
   if (ret < 0) {
     LOGE("select error");
   } else if (ret == 0) {
-    // timeout
+    // timeout - return -1 to indicate no data available
+    ret = -1;
   } else {
     for (i = 0; i < 2; i++) {
       if (FD_ISSET(agent->udp_sockets[i].fd, &rfds)) {
@@ -357,11 +359,24 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
   }
 }
 
-void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
+void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr) {
+  int i;
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
-        agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+        // Find the pair that matches this response's source address
+        for (i = 0; i < agent->candidate_pairs_num; i++) {
+          if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS &&
+              addr_equal(&agent->candidate_pairs[i].remote->addr, from_addr)) {
+            agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_SUCCEEDED;
+            LOGI("STUN response matched pair %d", i);
+            return;
+          }
+        }
+        // Fallback to nominated_pair for backwards compatibility
+        if (agent->nominated_pair) {
+          agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+        }
       }
       break;
     default:
@@ -382,7 +397,7 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
         agent_process_stun_request(agent, &stun_msg, &addr);
         break;
       case STUN_CLASS_RESPONSE:
-        agent_process_stun_response(agent, &stun_msg);
+        agent_process_stun_response(agent, &stun_msg, &addr);
         break;
       case STUN_CLASS_ERROR:
         break;
@@ -434,6 +449,16 @@ void agent_set_remote_description(Agent* agent, char* description) {
   LOGD("remote upwd: %s", agent->remote_upwd);
 }
 
+// Comparator for sorting candidate pairs by priority (highest first)
+static int compare_pairs_by_priority(const void* a, const void* b) {
+  const IceCandidatePair* pa = (const IceCandidatePair*)a;
+  const IceCandidatePair* pb = (const IceCandidatePair*)b;
+  // Higher priority first
+  if (pb->priority > pa->priority) return 1;
+  if (pb->priority < pa->priority) return -1;
+  return 0;
+}
+
 void agent_update_candidate_pairs(Agent* agent) {
   int i, j;
   // Please set gather candidates before set remote description
@@ -448,33 +473,71 @@ void agent_update_candidate_pairs(Agent* agent) {
       }
     }
   }
+
+  // Sort by priority (highest first) - RFC 5245 optimization
+  if (agent->candidate_pairs_num > 1) {
+    qsort(agent->candidate_pairs, agent->candidate_pairs_num,
+          sizeof(IceCandidatePair), compare_pairs_by_priority);
+    LOGD("Sorted %d candidate pairs by priority", agent->candidate_pairs_num);
+  }
+
   LOGD("candidate pairs num: %d", agent->candidate_pairs_num);
 }
 
-int agent_connectivity_check(Agent* agent) {
+// Send binding request to a specific pair
+static void agent_send_binding_to_pair(Agent* agent, IceCandidatePair* pair) {
   char addr_string[ADDRSTRLEN];
-  uint8_t buf[1400];
   StunMessage msg;
+  memset(&msg, 0, sizeof(msg));
 
-  if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
-    LOGI("nominated pair is not in progress");
+  // Temporarily set nominated_pair for the binding request creation
+  IceCandidatePair* saved = agent->nominated_pair;
+  agent->nominated_pair = pair;
+  agent_create_binding_request(agent, &msg);
+  agent->nominated_pair = saved;
+
+  addr_to_string(&pair->remote->addr, addr_string, sizeof(addr_string));
+  LOGD("send binding request to %s:%d (priority: %llu)",
+       addr_string, pair->remote->addr.port, (unsigned long long)pair->priority);
+  agent_socket_send(agent, &pair->remote->addr, msg.buf, msg.size);
+}
+
+int agent_connectivity_check(Agent* agent) {
+  uint8_t buf[1400];
+  int i;
+  int inprogress_count = 0;
+  int recv_count = 0;
+
+  // Send binding requests to all in-progress pairs
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
+      inprogress_count++;
+      // Send on first check (conncheck==0) and every PERIOD thereafter
+      if (agent->candidate_pairs[i].conncheck % AGENT_CONNCHECK_PERIOD == 0) {
+        agent_send_binding_to_pair(agent, &agent->candidate_pairs[i]);
+      }
+      agent->candidate_pairs[i].conncheck++;  // Increment AFTER the send decision
+    }
+  }
+
+  if (inprogress_count == 0) {
+    LOGI("No pairs in progress");
     return -1;
   }
 
-  memset(&msg, 0, sizeof(msg));
-
-  if (agent->nominated_pair->conncheck % AGENT_CONNCHECK_PERIOD == 0) {
-    addr_to_string(&agent->nominated_pair->remote->addr, addr_string, sizeof(addr_string));
-    LOGD("send binding request to remote ip: %s, port: %d", addr_string, agent->nominated_pair->remote->addr.port);
-    agent_create_binding_request(agent, &msg);
-    agent_socket_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
+  // Drain all pending packets from the socket (up to 10 per iteration)
+  while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
+    recv_count++;
   }
 
-  agent_recv(agent, buf, sizeof(buf));
-
-  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-    agent->selected_pair = agent->nominated_pair;
-    return 0;
+  // Check if any pair succeeded
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = &agent->candidate_pairs[i];
+      agent->nominated_pair = &agent->candidate_pairs[i];
+      LOGI("Pair %d succeeded (priority: %llu)", i, (unsigned long long)agent->candidate_pairs[i].priority);
+      return 0;
+    }
   }
 
   return -1;
@@ -482,25 +545,44 @@ int agent_connectivity_check(Agent* agent) {
 
 int agent_select_candidate_pair(Agent* agent) {
   int i;
+  int inprogress_count = 0;
+  int frozen_started = 0;
+
+  // First pass: check for success and count in-progress pairs
   for (i = 0; i < agent->candidate_pairs_num; i++) {
-    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
-      // nominate this pair
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = &agent->candidate_pairs[i];
       agent->nominated_pair = &agent->candidate_pairs[i];
-      agent->candidate_pairs[i].conncheck = 0;
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
       return 0;
     } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
-      agent->candidate_pairs[i].conncheck++;
-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
-        return 0;
+      inprogress_count++;
+      // Check for timeout (conncheck is incremented in agent_connectivity_check)
+      if (agent->candidate_pairs[i].conncheck >= AGENT_CONNCHECK_MAX) {
+        agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
+        inprogress_count--;
+        LOGD("Pair %d failed after %d checks", i, AGENT_CONNCHECK_MAX);
       }
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      agent->selected_pair = &agent->candidate_pairs[i];
-      return 0;
     }
   }
-  // all candidate pairs are failed
-  return -1;
+
+  // Second pass: start more pairs if we have room (parallel checking)
+  for (i = 0; i < agent->candidate_pairs_num && inprogress_count < AGENT_MAX_INPROGRESS; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
+      agent->candidate_pairs[i].conncheck = 0;
+      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
+      if (agent->nominated_pair == NULL) {
+        agent->nominated_pair = &agent->candidate_pairs[i];
+      }
+      inprogress_count++;
+      frozen_started++;
+      LOGD("Started pair %d (priority: %llu)", i, (unsigned long long)agent->candidate_pairs[i].priority);
+    }
+  }
+
+  if (frozen_started > 0) {
+    LOGD("Started %d new pairs, %d total in progress", frozen_started, inprogress_count);
+  }
+
+  // Return 0 if we have pairs to check, -1 if all failed
+  return (inprogress_count > 0) ? 0 : -1;
 }
