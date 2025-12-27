@@ -21,6 +21,9 @@
     pc->state = curr_state;                                           \
   }
 
+/* Forward declaration for fragment state */
+typedef struct dtls_fragment_state_s dtls_fragment_state_t;
+
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
@@ -47,6 +50,9 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+
+  /* Per-connection DTLS fragment reassembly state */
+  dtls_fragment_state_t* frag_state;
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -83,8 +89,8 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
 #define DTLS_HANDSHAKE_TYPE_CLIENT_HELLO 1
 #define DTLS_MAX_HANDSHAKE_SIZE 4096
 
-/* Fragment reassembly state */
-typedef struct {
+/* Fragment reassembly state - stored per-connection to support multiple peers */
+struct dtls_fragment_state_s {
   uint8_t data[DTLS_MAX_HANDSHAKE_SIZE];
   uint32_t total_len;        /* Expected total handshake message length */
   uint32_t received_len;     /* Bytes received so far */
@@ -93,9 +99,7 @@ typedef struct {
   uint8_t epoch[2];          /* Epoch from first fragment */
   uint8_t seq_num[6];        /* Sequence number from first fragment */
   int active;                /* Reassembly in progress */
-} dtls_fragment_state_s;
-
-static dtls_fragment_state_s g_frag_state = {0};
+};
 
 static uint32_t read_uint24_be(const uint8_t* p) {
   return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -112,6 +116,7 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+  dtls_fragment_state_t* frag = pc->frag_state;
   uint8_t recv_buf[2048];
 
   /* Check if there's already buffered data from agent */
@@ -174,82 +179,82 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     /* Check if this is the start of a new message */
     if (frag_offset == 0) {
       /* Start new reassembly */
-      memset(&g_frag_state, 0, sizeof(g_frag_state));
-      g_frag_state.active = 1;
-      g_frag_state.total_len = hs_total_len;
-      g_frag_state.msg_seq = hs_msg_seq;
+      memset(frag, 0, sizeof(*frag));
+      frag->active = 1;
+      frag->total_len = hs_total_len;
+      frag->msg_seq = hs_msg_seq;
       /* Save record header fields for reconstruction */
-      memcpy(g_frag_state.version, recv_buf + 1, 2);
-      memcpy(g_frag_state.epoch, recv_buf + 3, 2);
-      memcpy(g_frag_state.seq_num, recv_buf + 5, 6);
+      memcpy(frag->version, recv_buf + 1, 2);
+      memcpy(frag->epoch, recv_buf + 3, 2);
+      memcpy(frag->seq_num, recv_buf + 5, 6);
       LOGI("Starting ClientHello reassembly, total_len=%u", hs_total_len);
     }
 
     /* Validate this fragment belongs to current reassembly */
-    if (!g_frag_state.active || hs_msg_seq != g_frag_state.msg_seq || hs_total_len != g_frag_state.total_len) {
+    if (!frag->active || hs_msg_seq != frag->msg_seq || hs_total_len != frag->total_len) {
       LOGW("Fragment mismatch, resetting");
-      g_frag_state.active = 0;
+      frag->active = 0;
       memcpy(buf, recv_buf, ret);
       return ret;
     }
 
     /* Bounds check */
-    if (frag_offset + frag_len > g_frag_state.total_len) {
+    if (frag_offset + frag_len > frag->total_len) {
       LOGE("Fragment exceeds total length");
-      g_frag_state.active = 0;
+      frag->active = 0;
       memcpy(buf, recv_buf, ret);
       return ret;
     }
 
     if (frag_offset + frag_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN) {
       LOGE("Handshake message too large for reassembly buffer");
-      g_frag_state.active = 0;
+      frag->active = 0;
       memcpy(buf, recv_buf, ret);
       return ret;
     }
 
     /* Copy fragment data (handshake payload, after 12-byte handshake header) */
     const uint8_t* frag_data = hs + DTLS_HANDSHAKE_HEADER_LEN;
-    memcpy(g_frag_state.data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
-    g_frag_state.received_len += frag_len;
+    memcpy(frag->data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
+    frag->received_len += frag_len;
 
     LOGI("Received fragment: offset=%u, len=%u, total_received=%u/%u",
-         frag_offset, frag_len, g_frag_state.received_len, g_frag_state.total_len);
+         frag_offset, frag_len, frag->received_len, frag->total_len);
 
     /* Check if reassembly is complete */
-    if (g_frag_state.received_len >= g_frag_state.total_len) {
-      LOGI("ClientHello reassembly complete (%u bytes)", g_frag_state.total_len);
+    if (frag->received_len >= frag->total_len) {
+      LOGI("ClientHello reassembly complete (%u bytes)", frag->total_len);
 
       /* Build the complete handshake header */
-      g_frag_state.data[0] = DTLS_HANDSHAKE_TYPE_CLIENT_HELLO;
-      write_uint24_be(g_frag_state.data + 1, g_frag_state.total_len);
-      g_frag_state.data[4] = (g_frag_state.msg_seq >> 8) & 0xFF;
-      g_frag_state.data[5] = g_frag_state.msg_seq & 0xFF;
-      write_uint24_be(g_frag_state.data + 6, 0);  /* fragment_offset = 0 */
-      write_uint24_be(g_frag_state.data + 9, g_frag_state.total_len);  /* fragment_length = total */
+      frag->data[0] = DTLS_HANDSHAKE_TYPE_CLIENT_HELLO;
+      write_uint24_be(frag->data + 1, frag->total_len);
+      frag->data[4] = (frag->msg_seq >> 8) & 0xFF;
+      frag->data[5] = frag->msg_seq & 0xFF;
+      write_uint24_be(frag->data + 6, 0);  /* fragment_offset = 0 */
+      write_uint24_be(frag->data + 9, frag->total_len);  /* fragment_length = total */
 
       /* Build complete DTLS record */
-      uint32_t handshake_size = DTLS_HANDSHAKE_HEADER_LEN + g_frag_state.total_len;
+      uint32_t handshake_size = DTLS_HANDSHAKE_HEADER_LEN + frag->total_len;
       uint32_t total_record_len = DTLS_RECORD_HEADER_LEN + handshake_size;
 
       if (total_record_len > len) {
         LOGE("Reassembled message too large for buffer");
-        g_frag_state.active = 0;
+        frag->active = 0;
         return -1;
       }
 
       /* Build record header */
       buf[0] = DTLS_CONTENT_TYPE_HANDSHAKE;
-      memcpy(buf + 1, g_frag_state.version, 2);
-      memcpy(buf + 3, g_frag_state.epoch, 2);
-      memcpy(buf + 5, g_frag_state.seq_num, 6);
+      memcpy(buf + 1, frag->version, 2);
+      memcpy(buf + 3, frag->epoch, 2);
+      memcpy(buf + 5, frag->seq_num, 6);
       buf[11] = (handshake_size >> 8) & 0xFF;
       buf[12] = handshake_size & 0xFF;
 
       /* Copy handshake data */
-      memcpy(buf + DTLS_RECORD_HEADER_LEN, g_frag_state.data, handshake_size);
+      memcpy(buf + DTLS_RECORD_HEADER_LEN, frag->data, handshake_size);
 
-      g_frag_state.active = 0;
+      frag->active = 0;
       return total_record_len;
     }
 
@@ -342,6 +347,13 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
     return NULL;
   }
 
+  /* Allocate per-connection DTLS fragment reassembly state */
+  pc->frag_state = calloc(1, sizeof(dtls_fragment_state_t));
+  if (!pc->frag_state) {
+    free(pc);
+    return NULL;
+  }
+
   memcpy(&pc->config, config, sizeof(PeerConfiguration));
 
   agent_create(&pc->agent);
@@ -372,6 +384,9 @@ void peer_connection_destroy(PeerConnection* pc) {
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
+    if (pc->frag_state) {
+      free(pc->frag_state);
+    }
     free(pc);
     pc = NULL;
   }
@@ -485,9 +500,13 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
 
-    case PEER_CONNECTION_CONNECTED:
-
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+    case PEER_CONNECTION_CONNECTED: {
+      /* Pass the selected remote candidate's address to DTLS handshake.
+       * This is critical for multi-client support - mbedtls uses the transport ID
+       * (derived from this address) to distinguish between simultaneous DTLS sessions.
+       * Without a unique transport ID per client, cookies and sessions get confused. */
+      int dtls_ret = dtls_srtp_handshake(&pc->dtls_srtp, &pc->agent.selected_pair->remote->addr);
+      if (dtls_ret == 0) {
         LOGD("DTLS-SRTP handshake done");
 
         if (pc->config.datachannel) {
@@ -497,8 +516,13 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
+      } else {
+        /* DTLS handshake failed - move to FAILED state to stop retrying */
+        LOGE("DTLS handshake failed with error %d, connection failed", dtls_ret);
+        STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
       break;
+    }
     case PEER_CONNECTION_COMPLETED:
       /* Drain all pending packets from the socket.
        * STUN consent requests arrive frequently (~16/sec) and we must respond

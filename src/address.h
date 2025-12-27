@@ -29,6 +29,8 @@ int addr_inet_validate(const char* ipv4, size_t len, Address* addr);
 
 int addr_to_string(const Address* addr, char* buf, size_t len);
 
+int addr_to_string_with_port(const Address* addr, char* buf, size_t len);
+
 int addr_from_string(const char* str, Address* addr);
 
 int addr_equal(const Address* a, const Address* b);

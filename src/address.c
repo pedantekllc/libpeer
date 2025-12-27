@@ -42,13 +42,38 @@ int addr_from_string(const char* buf, Address* addr) {
 }
 
 int addr_to_string(const Address* addr, char* buf, size_t len) {
-  memset(buf, 0, sizeof(len));
+  memset(buf, 0, len);
   switch (addr->family) {
     case AF_INET6:
       return inet_ntop(AF_INET6, &addr->sin6.sin6_addr, buf, len) != NULL;
     case AF_INET:
     default:
       return inet_ntop(AF_INET, &addr->sin.sin_addr, buf, len) != NULL;
+  }
+  return 0;
+}
+
+int addr_to_string_with_port(const Address* addr, char* buf, size_t len) {
+  memset(buf, 0, len);
+  char ip_buf[INET6_ADDRSTRLEN];
+  const char* result = NULL;
+
+  switch (addr->family) {
+    case AF_INET6:
+      result = inet_ntop(AF_INET6, &addr->sin6.sin6_addr, ip_buf, sizeof(ip_buf));
+      if (result && len > strlen(ip_buf) + 8) {  /* room for "]:port" */
+        snprintf(buf, len, "[%s]:%u", ip_buf, addr->port);
+        return 1;
+      }
+      break;
+    case AF_INET:
+    default:
+      result = inet_ntop(AF_INET, &addr->sin.sin_addr, ip_buf, sizeof(ip_buf));
+      if (result && len > strlen(ip_buf) + 8) {  /* room for ":port" */
+        snprintf(buf, len, "%s:%u", ip_buf, addr->port);
+        return 1;
+      }
+      break;
   }
   return 0;
 }

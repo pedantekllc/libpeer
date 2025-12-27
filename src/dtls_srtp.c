@@ -15,6 +15,134 @@
 #include "socket.h"
 #include "utils.h"
 
+/*
+ * Shared DTLS certificate storage.
+ *
+ * Firefox has a bug where it cannot validate multiple DTLS certificates with
+ * the same Common Name (CN) but different public keys from the same browser.
+ * See: https://bugzilla.mozilla.org/show_bug.cgi?id=1397177
+ *
+ * To work around this, we generate ONE certificate at startup and share it
+ * across all PeerConnections. Each connection still has its own SSL context
+ * and unique SRTP session keys (derived during each DTLS handshake), so there
+ * is no security impact - only the certificate/public key is shared.
+ *
+ * This is standard practice for WebRTC media servers (Janus, mediasoup, etc).
+ */
+static struct {
+  int initialized;
+  mbedtls_x509_crt cert;
+  mbedtls_pk_context pkey;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  char fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+} g_shared_cert = {0};
+
+/* Forward declaration for fingerprint computation */
+static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf);
+
+/**
+ * Initialize the shared DTLS certificate.
+ * Call this once at application startup before any PeerConnections are created.
+ * Thread-safe: uses simple flag check (ok for init-once pattern).
+ */
+int dtls_srtp_init_cert(void) {
+  int ret;
+  mbedtls_x509write_cert crt;
+  unsigned char* cert_buf = NULL;
+#if CONFIG_MBEDTLS_2_X
+  mbedtls_mpi serial;
+#else
+  const char* serial = "peer";
+#endif
+  const char* pers = "dtls_srtp_shared";
+
+  if (g_shared_cert.initialized) {
+    LOGD("Shared DTLS certificate already initialized");
+    return 0;
+  }
+
+  LOGI("Initializing shared DTLS certificate...");
+
+  cert_buf = (unsigned char*)malloc(RSA_KEY_LENGTH * 2);
+  if (cert_buf == NULL) {
+    LOGE("malloc failed");
+    return -1;
+  }
+
+  /* Initialize mbedtls structures for shared cert */
+  mbedtls_x509_crt_init(&g_shared_cert.cert);
+  mbedtls_pk_init(&g_shared_cert.pkey);
+  mbedtls_entropy_init(&g_shared_cert.entropy);
+  mbedtls_ctr_drbg_init(&g_shared_cert.ctr_drbg);
+
+  mbedtls_ctr_drbg_seed(&g_shared_cert.ctr_drbg, mbedtls_entropy_func,
+                        &g_shared_cert.entropy, (const unsigned char*)pers, strlen(pers));
+
+#if CONFIG_DTLS_USE_ECDSA
+  mbedtls_pk_setup(&g_shared_cert.pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+  mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(g_shared_cert.pkey),
+                      mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
+#else
+  mbedtls_pk_setup(&g_shared_cert.pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+  mbedtls_rsa_gen_key(mbedtls_pk_rsa(g_shared_cert.pkey), mbedtls_ctr_drbg_random,
+                      &g_shared_cert.ctr_drbg, RSA_KEY_LENGTH, 65537);
+#endif
+
+  mbedtls_x509write_crt_init(&crt);
+  mbedtls_x509write_crt_set_subject_key(&crt, &g_shared_cert.pkey);
+  mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
+  mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
+  mbedtls_x509write_crt_set_subject_key(&crt, &g_shared_cert.pkey);
+  mbedtls_x509write_crt_set_issuer_key(&crt, &g_shared_cert.pkey);
+  mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
+  mbedtls_x509write_crt_set_issuer_name(&crt, "CN=dtls_srtp");
+
+#if CONFIG_MBEDTLS_2_X
+  mbedtls_mpi_init(&serial);
+  mbedtls_mpi_fill_random(&serial, 16, mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
+  ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
+  if (ret < 0) {
+    LOGE("mbedtls_x509write_crt_set_serial failed -0x%.4x", (unsigned int)-ret);
+  }
+#else
+  mbedtls_x509write_crt_set_serial_raw(&crt, (unsigned char*)serial, strlen(serial));
+#endif
+
+  mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20280101000000");
+
+  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH,
+                                   mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
+  if (ret < 0) {
+    LOGE("mbedtls_x509write_crt_pem failed -0x%.4x", (unsigned int)-ret);
+    free(cert_buf);
+    return ret;
+  }
+
+  mbedtls_x509_crt_parse(&g_shared_cert.cert, cert_buf, 2 * RSA_KEY_LENGTH);
+  mbedtls_x509write_crt_free(&crt);
+  free(cert_buf);
+
+  /* Compute fingerprint once */
+  dtls_srtp_x509_digest(&g_shared_cert.cert, g_shared_cert.fingerprint);
+
+  g_shared_cert.initialized = 1;
+  LOGI("Shared DTLS certificate initialized. Fingerprint: %s", g_shared_cert.fingerprint);
+
+  return 0;
+}
+
+/**
+ * Get the shared certificate fingerprint (for SDP generation).
+ * Returns pointer to static fingerprint string, or NULL if not initialized.
+ */
+const char* dtls_srtp_get_fingerprint(void) {
+  if (!g_shared_cert.initialized) {
+    return NULL;
+  }
+  return g_shared_cert.fingerprint;
+}
+
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -66,78 +194,9 @@ static int dtls_srtp_cert_verify(void* data, mbedtls_x509_crt* crt, int depth, u
   return 0;
 }
 
-static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
-  int ret;
-
-  mbedtls_x509write_cert crt;
-
-  unsigned char* cert_buf = NULL;
-#if CONFIG_MBEDTLS_2_X
-  mbedtls_mpi serial;
-#else
-  const char* serial = "peer";
-#endif
-  const char* pers = "dtls_srtp";
-
-  cert_buf = (unsigned char*)malloc(RSA_KEY_LENGTH * 2);
-  if (cert_buf == NULL) {
-    LOGE("malloc failed");
-    return -1;
-  }
-
-  mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg, mbedtls_entropy_func, &dtls_srtp->entropy, (const unsigned char*)pers, strlen(pers));
-
-#if CONFIG_DTLS_USE_ECDSA
-  mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
-  mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-#else
-  mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
-  mbedtls_rsa_gen_key(mbedtls_pk_rsa(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg, RSA_KEY_LENGTH, 65537);
-#endif
-
-  mbedtls_x509write_crt_init(&crt);
-
-  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
-
-  mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
-
-  mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
-
-  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
-
-  mbedtls_x509write_crt_set_issuer_key(&crt, &dtls_srtp->pkey);
-
-  mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
-
-  mbedtls_x509write_crt_set_issuer_name(&crt, "CN=dtls_srtp");
-
-#if CONFIG_MBEDTLS_2_X
-  mbedtls_mpi_init(&serial);
-  mbedtls_mpi_fill_random(&serial, 16, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-  ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
-  if (ret < 0) {
-    LOGE("mbedtls_x509write_crt_set_serial failed -0x%.4x", (unsigned int)-ret);
-  }
-#else
-  mbedtls_x509write_crt_set_serial_raw(&crt, (unsigned char*)serial, strlen(serial));
-#endif
-
-  mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20280101000000");
-
-  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-
-  if (ret < 0) {
-    LOGE("mbedtls_x509write_crt_pem failed -0x%.4x", (unsigned int)-ret);
-  }
-
-  mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, 2 * RSA_KEY_LENGTH);
-
-  mbedtls_x509write_crt_free(&crt);
-
-  free(cert_buf);
-
-  return ret;
-}
+/* NOTE: dtls_srtp_selfsign_cert was removed.
+ * Certificate generation is now done once via dtls_srtp_init_cert() and shared
+ * across all connections. This works around Firefox bug 1397177. */
 
 #if CONFIG_MBEDTLS_DEBUG
 static void dtls_srtp_debug(void* ctx, int level, const char* file, int line, const char* str) {
@@ -153,37 +212,30 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
       MBEDTLS_TLS_SRTP_NULL_HMAC_SHA1_32,
       MBEDTLS_TLS_SRTP_UNSET};
 
+  /* Ensure shared certificate is initialized */
+  if (!g_shared_cert.initialized) {
+    LOGE("Shared DTLS certificate not initialized! Call dtls_srtp_init_cert() first.");
+    return -1;
+  }
+
   dtls_srtp->role = role;
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
   dtls_srtp->user_data = user_data;
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
 
+  /* Initialize per-connection mbedtls structures (SSL context, config, etc.)
+   * but NOT cert/pkey/entropy/ctr_drbg - those are shared */
   mbedtls_ssl_config_init(&dtls_srtp->conf);
   mbedtls_ssl_init(&dtls_srtp->ssl);
 
-  mbedtls_x509_crt_init(&dtls_srtp->cert);
-  mbedtls_pk_init(&dtls_srtp->pkey);
-  mbedtls_entropy_init(&dtls_srtp->entropy);
-  mbedtls_ctr_drbg_init(&dtls_srtp->ctr_drbg);
-#if CONFIG_MBEDTLS_DEBUG
-  mbedtls_debug_set_threshold(3);
-  mbedtls_ssl_conf_dbg(&dtls_srtp->conf, dtls_srtp_debug, NULL);
-#endif
-  dtls_srtp_selfsign_cert(dtls_srtp);
+  /* Copy shared fingerprint to this connection's local_fingerprint */
+  memcpy(dtls_srtp->local_fingerprint, g_shared_cert.fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH);
+  LOGD("Using shared certificate fingerprint: %s", dtls_srtp->local_fingerprint);
 
-  mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
-
-  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-
-  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
-
-  mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
-
-  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
-
+  /* IMPORTANT: mbedtls_ssl_config_defaults MUST be called FIRST, before other
+   * mbedtls_ssl_conf_* functions. It sets default values which would overwrite
+   * any previously configured settings. */
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,
                                 MBEDTLS_SSL_IS_SERVER,
@@ -191,11 +243,8 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
                                 MBEDTLS_SSL_PRESET_DEFAULT);
 
     mbedtls_ssl_cookie_init(&dtls_srtp->cookie_ctx);
-
-    mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-
+    mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx, mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
     mbedtls_ssl_conf_dtls_cookies(&dtls_srtp->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check, &dtls_srtp->cookie_ctx);
-
   } else {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,
                                 MBEDTLS_SSL_IS_CLIENT,
@@ -203,29 +252,46 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
                                 MBEDTLS_SSL_PRESET_DEFAULT);
   }
 
-  dtls_srtp_x509_digest(&dtls_srtp->cert, dtls_srtp->local_fingerprint);
+  /* Now configure SSL options AFTER defaults are set */
+#if CONFIG_MBEDTLS_DEBUG
+  mbedtls_debug_set_threshold(CONFIG_MBEDTLS_DEBUG);
+  mbedtls_ssl_conf_dbg(&dtls_srtp->conf, dtls_srtp_debug, NULL);
+#endif
 
-  LOGD("local fingerprint: %s", dtls_srtp->local_fingerprint);
+  mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
+  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+  /* Use the shared certificate and private key for all connections */
+  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &g_shared_cert.cert, NULL);
+  mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &g_shared_cert.cert, &g_shared_cert.pkey);
+  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
 
+  /* Configure DTLS-SRTP specific options */
   mbedtls_ssl_conf_dtls_srtp_protection_profiles(&dtls_srtp->conf, default_profiles);
-
   mbedtls_ssl_conf_srtp_mki_value_supported(&dtls_srtp->conf, MBEDTLS_SSL_DTLS_SRTP_MKI_UNSUPPORTED);
-
   mbedtls_ssl_conf_cert_req_ca_list(&dtls_srtp->conf, MBEDTLS_SSL_CERT_REQ_CA_LIST_DISABLED);
 
+  /* Disable session resumption/tickets to prevent cross-connection confusion.
+   * Each WebRTC connection should use a fresh DTLS handshake. */
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_SRV_C)
+  /* For server: don't issue session tickets */
+  mbedtls_ssl_conf_session_tickets_cb(&dtls_srtp->conf, NULL, NULL, NULL);
+#endif
+
+  /* Finally, set up the SSL context with the configured options */
   mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
 
   return 0;
 }
 
 void dtls_srtp_deinit(DtlsSrtp* dtls_srtp) {
+  /* Free per-connection SSL context and config */
   mbedtls_ssl_free(&dtls_srtp->ssl);
   mbedtls_ssl_config_free(&dtls_srtp->conf);
 
-  mbedtls_x509_crt_free(&dtls_srtp->cert);
-  mbedtls_pk_free(&dtls_srtp->pkey);
-  mbedtls_entropy_free(&dtls_srtp->entropy);
-  mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
+  /* NOTE: We do NOT free cert, pkey, entropy, or ctr_drbg here because
+   * they are part of the shared g_shared_cert structure, not per-connection.
+   * The shared certificate persists for the lifetime of the application. */
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     mbedtls_ssl_cookie_free(&dtls_srtp->cookie_ctx);
@@ -369,9 +435,8 @@ static void dtls_srtp_key_derivation_cb(void* context,
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   int ret;
 
-  static mbedtls_timing_delay_context timer;
-
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  // Use per-connection timer instead of static to support multiple simultaneous handshakes
+  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
 
 #if CONFIG_MBEDTLS_2_X
   mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
@@ -392,12 +457,29 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
   int ret;
 
+  /* Verify we're using the shared certificate */
+  if (strncmp(dtls_srtp->local_fingerprint, g_shared_cert.fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
+    LOGE("CERTIFICATE MISMATCH! Connection: %s, Shared: %s", dtls_srtp->local_fingerprint, g_shared_cert.fingerprint);
+  }
+
   while (1) {
-    unsigned char client_ip[] = "test";
+    // Use actual client address with port for transport ID to distinguish between multiple clients.
+    // Including the port is critical when multiple clients connect from the same IP address.
+    char client_addr_str[ADDRSTRLEN + 10];  // IP + ":port"
+    int addr_len = 0;
+    if (dtls_srtp->remote_addr) {
+      addr_to_string_with_port(dtls_srtp->remote_addr, client_addr_str, sizeof(client_addr_str));
+      addr_len = strlen(client_addr_str);
+    } else {
+      // Fallback if no address set yet
+      strcpy(client_addr_str, "unknown");
+      addr_len = 7;
+    }
+    LOGD("DTLS handshake with client: %s", client_addr_str);
 
     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
 
-    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip));
+    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, (unsigned char*)client_addr_str, addr_len);
 
     ret = dtls_srtp_do_handshake(dtls_srtp);
 

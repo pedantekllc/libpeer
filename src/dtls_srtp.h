@@ -38,14 +38,14 @@ typedef enum DtlsSrtpState {
 } DtlsSrtpState;
 
 typedef struct DtlsSrtp {
-  // MbedTLS
+  // MbedTLS - per-connection SSL context and config
   mbedtls_ssl_context ssl;
   mbedtls_ssl_config conf;
   mbedtls_ssl_cookie_ctx cookie_ctx;
-  mbedtls_x509_crt cert;
-  mbedtls_pk_context pkey;
-  mbedtls_entropy_context entropy;
-  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_timing_delay_context timer;  // Per-connection timer for DTLS handshake
+  // NOTE: Certificate, private key, entropy, and ctr_drbg are now shared globally
+  // to work around Firefox bug with multiple certs using same CN.
+  // See: https://bugzilla.mozilla.org/show_bug.cgi?id=1397177
 
   // SRTP
   srtp_policy_t remote_policy;
@@ -71,11 +71,23 @@ typedef struct DtlsSrtp {
 
 } DtlsSrtp;
 
+/**
+ * Initialize the shared DTLS certificate.
+ * Must be called once at application startup before any PeerConnections.
+ * The certificate is shared across all connections to work around Firefox
+ * bug with multiple certs using the same Common Name.
+ */
+int dtls_srtp_init_cert(void);
+
+/**
+ * Get the shared certificate fingerprint (for SDP generation).
+ * Returns pointer to static fingerprint string, or NULL if not initialized.
+ */
+const char* dtls_srtp_get_fingerprint(void);
+
 int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data);
 
 void dtls_srtp_deinit(DtlsSrtp* dtls_srtp);
-
-int dtls_srtp_create_cert(DtlsSrtp* dtls_srtp);
 
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr);
 
