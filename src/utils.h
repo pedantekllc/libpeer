@@ -26,6 +26,7 @@ void peer_log(char* level_tag, const char* file_name, int line_number, const cha
   peer_log(level_tag, __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #else
 #include <sys/time.h>
+#include <time.h>
 #define LOG_PRINT(level_tag, fmt, ...) do { \
   struct timeval _tv; gettimeofday(&_tv, NULL); \
   struct tm* _tm = localtime(&_tv.tv_sec); \
