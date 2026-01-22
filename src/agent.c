@@ -462,6 +462,7 @@ static int compare_pairs_by_priority(const void* a, const void* b) {
 void agent_update_candidate_pairs(Agent* agent) {
   int i, j;
   // Please set gather candidates before set remote description
+  LOGI("Updating candidate pairs: local=%d, remote=%d", agent->local_candidates_count, agent->remote_candidates_count);
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {
       if (agent->local_candidates[i].addr.family == agent->remote_candidates[j].addr.family) {
@@ -481,7 +482,7 @@ void agent_update_candidate_pairs(Agent* agent) {
     LOGD("Sorted %d candidate pairs by priority", agent->candidate_pairs_num);
   }
 
-  LOGD("candidate pairs num: %d", agent->candidate_pairs_num);
+  LOGI("Created %d candidate pairs", agent->candidate_pairs_num);
 }
 
 // Send binding request to a specific pair
@@ -514,6 +515,7 @@ int agent_connectivity_check(Agent* agent) {
       inprogress_count++;
       // Send on first check (conncheck==0) and every PERIOD thereafter
       if (agent->candidate_pairs[i].conncheck % AGENT_CONNCHECK_PERIOD == 0) {
+        LOGI("Sending binding request to pair %d (conncheck=%d)", i, agent->candidate_pairs[i].conncheck);
         agent_send_binding_to_pair(agent, &agent->candidate_pairs[i]);
       }
       agent->candidate_pairs[i].conncheck++;  // Increment AFTER the send decision
@@ -521,7 +523,7 @@ int agent_connectivity_check(Agent* agent) {
   }
 
   if (inprogress_count == 0) {
-    LOGI("No pairs in progress");
+    LOGI("No pairs in progress - total pairs=%d", agent->candidate_pairs_num);
     return -1;
   }
 
@@ -547,6 +549,12 @@ int agent_select_candidate_pair(Agent* agent) {
   int i;
   int inprogress_count = 0;
   int frozen_started = 0;
+  static int call_count = 0;
+  call_count++;
+
+  if (call_count <= 3 || agent->candidate_pairs_num == 0) {
+    LOGI("agent_select_candidate_pair called (count=%d, pairs_num=%d)", call_count, agent->candidate_pairs_num);
+  }
 
   // First pass: check for success and count in-progress pairs
   for (i = 0; i < agent->candidate_pairs_num; i++) {

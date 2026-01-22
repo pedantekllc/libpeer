@@ -427,6 +427,15 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
     return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
 }
 
+int peer_connection_datachannel_send_binary(PeerConnection* pc, const uint8_t* data, size_t len) {
+  if (!sctp_is_connected(&pc->sctp)) {
+    LOGE("sctp not connected");
+    return -1;
+  }
+  /* Always use PPID_BINARY regardless of datachannel config */
+  return sctp_outgoing_data(&pc->sctp, (char*)data, len, PPID_BINARY, 0);
+}
+
 int peer_connection_create_datachannel(PeerConnection* pc, DecpChannelType channel_type, uint16_t priority, uint32_t reliability_parameter, char* label, char* protocol) {
   return peer_connection_create_datachannel_sid(pc, channel_type, priority, reliability_parameter, label, protocol, 0);
 }

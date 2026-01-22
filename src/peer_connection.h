@@ -113,6 +113,15 @@ int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t l
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid);
 
+/**
+ * @brief Send binary data on the data channel (always PPID_BINARY regardless of config)
+ *
+ * @param[in] peer connection
+ * @param[in] data buffer
+ * @param[in] length of data
+ */
+int peer_connection_datachannel_send_binary(PeerConnection* pc, const uint8_t* data, size_t len);
+
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);

@@ -531,6 +531,12 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
     lopt.l_linger = 0;
     usrsctp_setsockopt(sock, SOL_SOCKET, SO_LINGER, &lopt, sizeof(lopt));
 
+    /* Increase send/receive buffer sizes for large data transfers */
+    int bufsize = 4 * 1024 * 1024;  /* 4MB buffer */
+    usrsctp_setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    usrsctp_setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    LOGI("SCTP buffers set to %d bytes", bufsize);
+
 #if 0
     struct sctp_paddrparams peer_param;
     memset(&peer_param, 0, sizeof peer_param);
