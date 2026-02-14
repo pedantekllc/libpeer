@@ -104,10 +104,34 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   spa.sendv_sndinfo.snd_flags = SCTP_EOR;
   spa.sendv_sndinfo.snd_ppid = htonl(ppid);
 
+  /* Protect usrsctp_sendv from concurrent access - usrsctp is not thread-safe */
+  pthread_mutex_lock(&sctp->send_mutex);
+  /* Check socket is still valid (may have been closed by destroy) */
+  if (!sctp->sock) {
+    pthread_mutex_unlock(&sctp->send_mutex);
+    LOGE("sctp sendv: socket already closed");
+    return -1;
+  }
   res = usrsctp_sendv(sctp->sock, buf, len, NULL, 0, &spa, sizeof(spa), SCTP_SENDV_SPA, 0);
   if (res < 0) {
-    LOGE("sctp sendv error %d: %s", errno, strerror(errno));
+    int saved_errno = errno;
+    /* Query SCTP status to understand what's happening */
+    struct sctp_status status;
+    socklen_t status_len = sizeof(status);
+    memset(&status, 0, sizeof(status));
+    if (usrsctp_getsockopt(sctp->sock, IPPROTO_SCTP, SCTP_STATUS, &status, &status_len) == 0) {
+      LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) "
+           "status: state=0x%x, rwnd=%u, unack=%u, pend=%u",
+           saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid,
+           status.sstat_state, status.sstat_rwnd,
+           status.sstat_unackdata, status.sstat_penddata);
+    } else {
+      LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) [getsockopt failed]",
+           saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid);
+    }
+    errno = saved_errno;
   }
+  pthread_mutex_unlock(&sctp->send_mutex);
   return res;
 #else
   size_t padding_len = 0;
@@ -189,7 +213,7 @@ void sctp_parse_data_channel_open(Sctp* sctp, uint16_t sid, char* data, size_t l
     label_str[label_length] = '\0';
 
     // Log or process the DATA_CHANNEL_OPEN message
-    printf("DATA_CHANNEL_OPEN: Label=%s, sid=%d\n", label_str, sid);
+    LOGI("DATA_CHANNEL_OPEN: Label=%s, sid=%d, connected=%d", label_str, sid, sctp->connected);
 
     // Add stream mapping
     sctp_add_stream_mapping(sctp, label_str, sid);
@@ -202,14 +226,18 @@ void sctp_handle_sctp_packet(Sctp* sctp, char* buf, size_t len) {
   if (len <= 29)
     return;
 
-  if (buf[12] != 0)  // if chunk_type is no zero, it's not data
+  uint8_t chunk_type = (uint8_t)buf[12];
+
+  // Only process DATA chunks (type 0)
+  if (chunk_type != 0)
     return;
 
   uint16_t sid = ntohs(*(uint16_t*)(buf + 20));
   uint32_t ppid = ntohl(*(uint32_t*)(buf + 24));
 
-  if (ppid == DATA_CHANNEL_PPID_CONTROL)
+  if (ppid == DATA_CHANNEL_PPID_CONTROL) {
     sctp_parse_data_channel_open(sctp, sid, buf + 28, len - 28);
+  }
 }
 
 void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
@@ -444,12 +472,15 @@ static void sctp_process_notification(Sctp* sctp, union sctp_notification* notif
     return;
   }
 
+  LOGD("SCTP notification type=%u", notification->sn_header.sn_type);
+
   switch (notification->sn_header.sn_type) {
     case SCTP_ASSOC_CHANGE:
+      LOGI("SCTP_ASSOC_CHANGE: state=%u", notification->sn_assoc_change.sac_state);
 
       switch (notification->sn_assoc_change.sac_state) {
         case SCTP_COMM_UP:
-
+          LOGI("SCTP_COMM_UP - association established");
           sctp->connected = 1;
           if (sctp->onopen) {
             sctp->onopen(sctp->userdata);
@@ -458,12 +489,23 @@ static void sctp_process_notification(Sctp* sctp, union sctp_notification* notif
           break;
 
         case SCTP_COMM_LOST:
-        case SCTP_SHUTDOWN_COMP:
+          LOGI("SCTP_COMM_LOST - association lost");
           sctp->connected = 0;
           if (sctp->onclose) {
             sctp->onclose(sctp->userdata);
           }
+          break;
+
+        case SCTP_SHUTDOWN_COMP:
+          LOGI("SCTP_SHUTDOWN_COMP - shutdown complete");
+          sctp->connected = 0;
+          if (sctp->onclose) {
+            sctp->onclose(sctp->userdata);
+          }
+          break;
+
         default:
+          LOGI("SCTP_ASSOC_CHANGE: unknown state %u", notification->sn_assoc_change.sac_state);
           break;
       }
       break;
@@ -507,6 +549,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
   sctp->tsn = 1234;
+  pthread_mutex_init(&sctp->send_mutex, NULL);
 #if CONFIG_USE_USRSCTP
   int ret = -1;
   usrsctp_sysctl_set_sctp_ecn_enable(0);
@@ -641,13 +684,17 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 void sctp_destroy_association(Sctp* sctp) {
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
+    /* Acquire mutex before closing to prevent race with ongoing sends */
+    pthread_mutex_lock(&sctp->send_mutex);
     /* Set socket to non-blocking to prevent close from blocking */
     usrsctp_set_non_blocking(sctp->sock, 1);
     usrsctp_close(sctp->sock);
     sctp->sock = NULL;
+    pthread_mutex_unlock(&sctp->send_mutex);
   }
   if (sctp) {
     usrsctp_deregister_address(sctp);
+    pthread_mutex_destroy(&sctp->send_mutex);
   }
 #endif
 }

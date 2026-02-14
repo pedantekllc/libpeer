@@ -1,6 +1,8 @@
 #ifndef SCTP_H_
 #define SCTP_H_
 
+#include <pthread.h>
+
 #include "config.h"
 #include "dtls_srtp.h"
 #include "utils.h"
@@ -158,6 +160,9 @@ typedef struct Sctp {
   DtlsSrtp* dtls_srtp;
   int stream_count;
   SctpStreamEntry stream_table[SCTP_MAX_STREAMS];
+
+  /* Thread safety for usrsctp operations */
+  pthread_mutex_t send_mutex;
 
   /* datachannel */
   void (*onmessage)(char* msg, size_t len, void* userdata, uint16_t sid);
