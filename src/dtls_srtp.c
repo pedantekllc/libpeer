@@ -22,12 +22,12 @@
  * the same Common Name (CN) but different public keys from the same browser.
  * See: https://bugzilla.mozilla.org/show_bug.cgi?id=1397177
  *
- * To work around this, we generate ONE certificate at startup and share it
- * across all PeerConnections. Each connection still has its own SSL context
- * and unique SRTP session keys (derived during each DTLS handshake), so there
- * is no security impact - only the certificate/public key is shared.
+ * Two mitigations:
+ * 1. Share ONE certificate across all PeerConnections within a process.
+ * 2. Use a random CN per process so different devices don't collide.
  *
- * This is standard practice for WebRTC media servers (Janus, mediasoup, etc).
+ * Each connection still has its own SSL context and unique SRTP session keys
+ * (derived during each DTLS handshake), so there is no security impact.
  */
 static struct {
   int initialized;
@@ -95,8 +95,17 @@ int dtls_srtp_init_cert(void) {
   mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
   mbedtls_x509write_crt_set_subject_key(&crt, &g_shared_cert.pkey);
   mbedtls_x509write_crt_set_issuer_key(&crt, &g_shared_cert.pkey);
-  mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
-  mbedtls_x509write_crt_set_issuer_name(&crt, "CN=dtls_srtp");
+
+  /* Use a unique CN per process to work around Firefox bug 1397177.
+   * Firefox rejects multiple DTLS certs with the same CN but different keys. */
+  unsigned char cn_rand[8];
+  mbedtls_ctr_drbg_random(&g_shared_cert.ctr_drbg, cn_rand, sizeof(cn_rand));
+  char cn_name[64];
+  snprintf(cn_name, sizeof(cn_name), "CN=%02x%02x%02x%02x%02x%02x%02x%02x",
+           cn_rand[0], cn_rand[1], cn_rand[2], cn_rand[3],
+           cn_rand[4], cn_rand[5], cn_rand[6], cn_rand[7]);
+  mbedtls_x509write_crt_set_subject_name(&crt, cn_name);
+  mbedtls_x509write_crt_set_issuer_name(&crt, cn_name);
 
 #if CONFIG_MBEDTLS_2_X
   mbedtls_mpi_init(&serial);
