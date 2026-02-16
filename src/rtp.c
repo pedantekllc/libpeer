@@ -10,6 +10,7 @@
 typedef enum RtpH264Type {
 
   NALU = 23,
+  STAP_A = 24,
   FU_A = 28,
 
 } RtpH264Type;
@@ -26,6 +27,12 @@ typedef struct FuHeader {
   uint8_t e : 1;
   uint8_t s : 1;
 } FuHeader;
+
+typedef struct NaluInfo {
+  uint8_t* data;
+  size_t size;
+  uint8_t type;
+} NaluInfo;
 
 #define RTP_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader))
 #define FU_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader) - sizeof(FuHeader) - sizeof(NaluHeader))
@@ -116,6 +123,49 @@ static int rtp_encoder_encode_h264_fu_a(RtpEncoder* rtp_encoder, uint8_t* buf, s
   return 0;
 }
 
+/* Bundle multiple small NAL units into a single STAP-A RTP packet (RFC 6184 §5.7.1).
+ *
+ * Chrome's H.264 depacketizer incorrectly sets is_first_packet_in_frame=true for
+ * every single-NAL RTP packet, breaking multi-slice frame assembly. STAP-A avoids
+ * this by delivering all NALUs in one packet, so frame boundaries are unambiguous.
+ * See: https://issues.webrtc.org/issues/346608838 */
+static int rtp_encoder_encode_h264_stap_a(RtpEncoder* rtp_encoder, NaluInfo* nalus, int nalu_count) {
+  RtpPacket* rtp_packet = (RtpPacket*)rtp_encoder->buf;
+
+  rtp_packet->header.version = 2;
+  rtp_packet->header.padding = 0;
+  rtp_packet->header.extension = 0;
+  rtp_packet->header.csrccount = 0;
+  rtp_packet->header.type = rtp_encoder->type;
+  rtp_packet->header.seq_number = htons(rtp_encoder->seq_number++);
+  rtp_packet->header.timestamp = htonl(rtp_encoder->timestamp);
+  rtp_packet->header.ssrc = htonl(rtp_encoder->ssrc);
+  rtp_packet->header.markerbit = 1;  /* Single packet = entire access unit */
+
+  /* STAP-A header: F=0, NRI=max of all NALUs, Type=24 */
+  uint8_t max_nri = 0;
+  for (int i = 0; i < nalu_count; i++) {
+    uint8_t nri = (nalus[i].data[0] >> 5) & 0x03;
+    if (nri > max_nri) max_nri = nri;
+  }
+
+  uint8_t* p = rtp_packet->payload;
+  *p++ = (max_nri << 5) | STAP_A;
+
+  /* Each NALU: 2-byte big-endian size prefix + NALU data */
+  for (int i = 0; i < nalu_count; i++) {
+    uint16_t ns = (uint16_t)nalus[i].size;
+    *p++ = (ns >> 8) & 0xFF;
+    *p++ = ns & 0xFF;
+    memcpy(p, nalus[i].data, nalus[i].size);
+    p += nalus[i].size;
+  }
+
+  size_t total = (size_t)(p - rtp_packet->payload);
+  rtp_encoder->on_packet(rtp_encoder->buf, total + sizeof(RtpHeader), rtp_encoder->user_data);
+  return 0;
+}
+
 static uint8_t* h264_find_nalu(uint8_t* buf_start, uint8_t* buf_end) {
   uint8_t* p = buf_start + 2;
 
@@ -143,12 +193,6 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
   int has_vcl_nalu = 0;
 
   /* First pass: collect all NALUs and find the last one */
-  typedef struct {
-    uint8_t* data;
-    size_t size;
-    uint8_t type;
-  } NaluInfo;
-
   NaluInfo nalus[64];  /* max 64 NALUs per access unit */
   int nalu_count = 0;
 
@@ -176,14 +220,29 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
       has_vcl_nalu = 1;
   }
 
-  /* Second pass: encode each NALU into RTP packets */
-  for (int i = 0; i < nalu_count; i++) {
-    int is_last = (i == nalu_count - 1);
+  /* Check if all NALUs fit in a single STAP-A packet.
+   * STAP-A overhead: 1 byte header + (2 byte size prefix per NALU). */
+  size_t stap_a_size = 1;
+  int all_fit_stap_a = (nalu_count > 1);
+  for (int i = 0; i < nalu_count && all_fit_stap_a; i++) {
+    stap_a_size += 2 + nalus[i].size;
+    if (stap_a_size > RTP_PAYLOAD_SIZE)
+      all_fit_stap_a = 0;
+  }
 
-    if (nalus[i].size <= RTP_PAYLOAD_SIZE) {
-      rtp_encoder_encode_h264_single(rtp_encoder, nalus[i].data, nalus[i].size, is_last);
-    } else {
-      rtp_encoder_encode_h264_fu_a(rtp_encoder, nalus[i].data, nalus[i].size, is_last);
+  if (all_fit_stap_a) {
+    /* Bundle all NALUs into one STAP-A packet */
+    rtp_encoder_encode_h264_stap_a(rtp_encoder, nalus, nalu_count);
+  } else {
+    /* Second pass: encode each NALU individually */
+    for (int i = 0; i < nalu_count; i++) {
+      int is_last = (i == nalu_count - 1);
+
+      if (nalus[i].size <= RTP_PAYLOAD_SIZE) {
+        rtp_encoder_encode_h264_single(rtp_encoder, nalus[i].data, nalus[i].size, is_last);
+      } else {
+        rtp_encoder_encode_h264_fu_a(rtp_encoder, nalus[i].data, nalus[i].size, is_last);
+      }
     }
   }
 
