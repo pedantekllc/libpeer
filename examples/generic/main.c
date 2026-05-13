@@ -132,7 +132,13 @@ int main(int argc, char* argv[]) {
       if (curr_time - video_time > 40) {
         video_time = curr_time;
         if ((buf = reader_get_video_frame(&size)) != NULL) {
-          peer_connection_send_video(g_pc, buf, size);
+          /* Example uses monotonic now() as the capture time — the
+           * reader doesn't expose a real PTS. Production callers with
+           * a capture pipeline should pass the frame's actual PTS in ns. */
+          struct timespec ts;
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+          peer_connection_send_video(g_pc, buf, size, now_ns);
           // need to free the buffer
           free(buf);
           buf = NULL;

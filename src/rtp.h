@@ -94,7 +94,15 @@ struct RtpEncoder {
   uint16_t seq_number;
   uint32_t ssrc;
   uint32_t timestamp;
+  /* Audio-only: how many RTP-clock ticks each packet represents
+   * (e.g. PCMA 20ms → 160 ticks). Auto-applied in rtp_encoder_encode
+   * for audio codecs. Unused for video, which gets its timestamp set
+   * per call from the caller-provided capture time.                  */
   uint32_t timestamp_increment;
+  /* RTP clock rate for this stream (90000 for video, sample-rate for
+   * audio). Used to convert caller-provided capture_time_ns into RTP
+   * ticks on the video path.                                         */
+  uint32_t clock_rate_hz;
   uint8_t buf[CONFIG_MTU + 128];
 };
 
@@ -102,7 +110,23 @@ int rtp_packet_validate(uint8_t* packet, size_t size);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 
-int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size);
+/**
+ * Packetise and emit an access unit / audio packet.
+ *
+ * @param capture_time_ns  Monotonic capture timestamp in nanoseconds.
+ *   - Video (H.264): set the RTP timestamp to capture_time_ns converted
+ *     to the 90kHz RTP clock. Receivers play frames at the wall-clock
+ *     pace dictated by these timestamps — drift between encoder rate
+ *     and real time stays bounded at "one frame".
+ *   - Audio (PCMA/PCMU/Opus): ignored. Audio timestamps auto-increment
+ *     by samples-per-packet because the audio sample clock is the
+ *     authoritative timebase. Caller may pass 0.
+ *
+ * Absolute value doesn't matter to receivers; only deltas within an
+ * SSRC do, so any consistent monotonic source works (CLOCK_MONOTONIC,
+ * gettimeofday, capture pipeline PTS converted to ns, …).
+ */
+int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size, uint64_t capture_time_ns);
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 

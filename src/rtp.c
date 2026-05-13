@@ -246,11 +246,14 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
     }
   }
 
-  /* Increment timestamp once per access unit if it contained VCL NALUs */
-  if (has_vcl_nalu) {
-    rtp_encoder->timestamp += rtp_encoder->timestamp_increment;
-  }
-
+  /* Video timestamp is set by rtp_encoder_encode() from the caller's
+   * capture_time_ns BEFORE this function runs, so we don't increment
+   * here — that was the old fixed-rate behaviour that drifted against
+   * any non-exactly-30fps producer. has_vcl_nalu detection is still
+   * useful for callers that want to know whether this access unit
+   * advanced media time, but the RTP layer itself no longer cares.
+   */
+  (void)has_vcl_nalu;
   return 0;
 }
 
@@ -278,29 +281,37 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
   rtp_encoder->user_data = user_data;
   rtp_encoder->timestamp = 0;
   rtp_encoder->seq_number = 0;
+  rtp_encoder->timestamp_increment = 0;
+  rtp_encoder->clock_rate_hz = 0;
 
   switch (codec) {
     case CODEC_H264:
       rtp_encoder->type = PT_H264;
       rtp_encoder->ssrc = SSRC_H264;
-      rtp_encoder->timestamp_increment = 90000 / 30;  // 30 FPS.
+      /* No timestamp_increment for video — see header doc. The clock
+       * rate matters because we convert caller-supplied capture_time_ns
+       * into RTP ticks via (ns * rate / 1e9).                           */
+      rtp_encoder->clock_rate_hz = 90000;
       rtp_encoder->encode_func = rtp_encoder_encode_h264;
       break;
     case CODEC_PCMA:
       rtp_encoder->type = PT_PCMA;
       rtp_encoder->ssrc = SSRC_PCMA;
+      rtp_encoder->clock_rate_hz = 8000;
       rtp_encoder->timestamp_increment = CONFIG_AUDIO_DURATION * 8000 / 1000;
       rtp_encoder->encode_func = rtp_encoder_encode_generic;
       break;
     case CODEC_PCMU:
       rtp_encoder->type = PT_PCMU;
       rtp_encoder->ssrc = SSRC_PCMU;
+      rtp_encoder->clock_rate_hz = 8000;
       rtp_encoder->timestamp_increment = CONFIG_AUDIO_DURATION * 8000 / 1000;
       rtp_encoder->encode_func = rtp_encoder_encode_generic;
       break;
     case CODEC_OPUS:
       rtp_encoder->type = PT_OPUS;
       rtp_encoder->ssrc = SSRC_OPUS;
+      rtp_encoder->clock_rate_hz = 48000;
       rtp_encoder->timestamp_increment = CONFIG_AUDIO_DURATION * 48000 / 1000;
       rtp_encoder->encode_func = rtp_encoder_encode_generic;
       break;
@@ -309,7 +320,20 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
   }
 }
 
-int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size) {
+int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size, uint64_t capture_time_ns) {
+  /* Video path: stamp RTP timestamp from the caller's capture time so
+   * the receiver plays frames at the wall-clock pace they were produced,
+   * regardless of how off-nominal the encoder's actual rate is.
+   *
+   * Audio path: capture_time_ns is ignored; the encode_func auto-
+   * increments timestamp by samples-per-packet (the sample clock is
+   * already the authoritative timebase and produces monotonic, regular
+   * timestamps with no rate drift to correct for).
+   */
+  if (rtp_encoder->type == PT_H264) {
+    /* (ns * rate) overflows uint64_t only past ~6 thousand years, fine. */
+    rtp_encoder->timestamp = (uint32_t)((capture_time_ns * rtp_encoder->clock_rate_hz) / 1000000000ULL);
+  }
   return rtp_encoder->encode_func(rtp_encoder, (uint8_t*)buf, size);
 }
 

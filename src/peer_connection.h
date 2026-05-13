@@ -124,7 +124,23 @@ int peer_connection_datachannel_send_binary(PeerConnection* pc, const uint8_t* d
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t bytes);
 
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes);
+/**
+ * Send an H.264 access unit on the video transceiver.
+ *
+ * @param capture_time_ns  Monotonic nanoseconds at which this frame was
+ *   captured / produced by the encoder pipeline. Used to derive the RTP
+ *   timestamp at the receiver's 90kHz clock — drives playout pacing.
+ *   See rtp_encoder_encode() doc for the full rationale.
+ *
+ *   Recommended sources, in preference order:
+ *     1. A real capture-pipeline PTS converted to nanoseconds.
+ *     2. clock_gettime(CLOCK_MONOTONIC) at the moment of encode.
+ *     3. gettimeofday-derived ns (less robust to NTP jumps).
+ *
+ *   The absolute value doesn't matter to receivers; consistency across
+ *   frames on the same SSRC does.
+ */
+int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns);
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 

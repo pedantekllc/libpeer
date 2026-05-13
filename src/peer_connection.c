@@ -401,15 +401,17 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
     // LOGE("dtls_srtp not connected");
     return -1;
   }
-  return rtp_encoder_encode(&pc->artp_encoder, buf, len);
+  /* Audio timestamps come from the encoder's sample counter — capture_time_ns
+   * is ignored for audio codecs. Pass 0 for clarity.                         */
+  return rtp_encoder_encode(&pc->artp_encoder, buf, len, 0);
 }
 
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len) {
+int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
     // LOGE("dtls_srtp not connected");
     return -1;
   }
-  return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
+  return rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
 }
 
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
