@@ -408,10 +408,52 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
-    // LOGE("dtls_srtp not connected");
+    static int last_state_logged = -999;
+    if (pc->state != last_state_logged) {
+      LOGW("[ts-debug] send_video skipped: pc->state=%d (was %d)", pc->state, last_state_logged);
+      last_state_logged = pc->state;
+    }
     return -1;
   }
-  return rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
+  {
+    static uint32_t debug_count = 0;
+    static uint64_t last_cap_ns = 0;
+    static uint32_t last_rtp_ts = 0;
+    static int last_state_logged_ok = -1;
+    static uint64_t encode_total_ns = 0;
+    static uint64_t encode_max_ns = 0;
+    debug_count++;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t dt = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
+                + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+    encode_total_ns += dt;
+    if (dt > encode_max_ns) encode_max_ns = dt;
+
+    uint32_t rtp_ts_now = pc->vrtp_encoder.timestamp;
+    if (last_state_logged_ok != pc->state) {
+      LOGW("[ts-debug] send_video OK: pc->state=COMPLETED");
+      last_state_logged_ok = pc->state;
+    }
+    if (debug_count % 30 == 0 && last_cap_ns != 0) {
+      uint64_t cap_dt_ns = capture_time_ns - last_cap_ns;
+      uint32_t rtp_dt = rtp_ts_now - last_rtp_ts;
+      double cap_dt_ms = cap_dt_ns / 1e6 / 30.0;
+      double rtp_dt_per_call = (double)rtp_dt / 30.0;
+      double encode_avg_ms = (double)encode_total_ns / debug_count / 1e6;
+      double encode_max_ms = (double)encode_max_ns / 1e6;
+      LOGI("[ts-debug] libpeer send_video #%u  cap_dt=%.3fms/frame  "
+           "rtp_dt=%.1fticks/frame  encode_avg=%.3fms  encode_max=%.3fms",
+           debug_count, cap_dt_ms, rtp_dt_per_call, encode_avg_ms, encode_max_ms);
+    }
+    if (debug_count % 30 == 0 || debug_count == 1) {
+      last_cap_ns = capture_time_ns;
+      last_rtp_ts = rtp_ts_now;
+    }
+    return rc;
+  }
 }
 
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
