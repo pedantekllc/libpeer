@@ -59,6 +59,7 @@ struct Agent {
   Address host_addr;
   int b_host_addr;
   uint64_t binding_request_time;
+  uint32_t first_success_time;  // ms (ports_get_epoch_time) of first pair success; 0 = none yet
   AgentState state;
 
   AgentMode mode;
@@ -83,6 +84,19 @@ int agent_send(Agent* agent, const uint8_t* buf, int len);
 int agent_recv(Agent* agent, uint8_t* buf, int len);
 
 void agent_set_remote_description(Agent* agent, char* description);
+
+// Learn a peer-reflexive remote candidate from the source address of a
+// validated inbound STUN binding request, and form candidate pairs for it.
+// Lets a same-LAN connection succeed without resolving the browser's
+// obfuscated mDNS (.local) host candidate. Returns the index of the (new or
+// existing) remote candidate, or -1 if the candidate table is full.
+int agent_add_prflx_candidate(Agent* agent, Address* addr);
+
+// Returns the highest-priority candidate pair currently in the SUCCEEDED
+// state, or NULL if none have succeeded. Used to prefer a direct (host/prflx/
+// srflx) path over a relay regardless of which succeeded first or where it
+// sits in the (partially unsorted) pair array.
+IceCandidatePair* agent_best_succeeded_pair(Agent* agent);
 
 int agent_select_candidate_pair(Agent* agent);
 

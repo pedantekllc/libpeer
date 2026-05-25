@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <time.h>
 #include <unistd.h>
 #include "address.h"
 #include "socket.h"
@@ -53,7 +54,7 @@ static int mdns_add_hostname(const char* hostname, uint8_t* buf, int size) {
   buf[offset++] = 0x00;
   return offset;
 }
-static int mdns_parse_answer(uint8_t* buf, int size, Address* addr, const char* hostname) {
+int mdns_parse_answer(uint8_t* buf, int size, Address* addr, const char* hostname) {
   int flags_qr, offset;
   DnsHeader* header;
   DnsAnswer* answer;
@@ -90,7 +91,7 @@ static int mdns_parse_answer(uint8_t* buf, int size, Address* addr, const char* 
   return 0;
 }
 
-static int mdns_build_query(const char* hostname, uint8_t* buf, int size) {
+int mdns_build_query(const char* hostname, uint8_t* buf, int size) {
   int total_size, offset;
   DnsHeader* dns_header;
   DnsQuery* dns_query;
@@ -115,56 +116,88 @@ static int mdns_build_query(const char* hostname, uint8_t* buf, int size) {
   return total_size;
 }
 
+// Overall budget for resolving one .local name, and how often we re-send the
+// query within it. A browser's mDNS responder can be slow to answer right
+// after the device (or the phone) wakes, and on a busy LAN the answer can be
+// lost or arrive behind unrelated mDNS chatter — so we keep listening (without
+// a fixed packet budget) and re-query periodically until the deadline.
+#define MDNS_TOTAL_TIMEOUT_MS 2000
+#define MDNS_RESEND_INTERVAL_MS 250
+
+static uint64_t mdns_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
 int mdns_resolve_addr(const char* hostname, Address* addr) {
   Address mcast_addr = {0};
   UdpSocket udp_socket;
   uint8_t buf[256];
   char addr_string[ADDRSTRLEN];
-  struct timeval tv = {1, 0};
   fd_set rfds;
-  int maxfd, send_retry, recv_retry, size, ret;
+  int size, ret;
+  uint64_t deadline, next_send, now, wait_until, wait_ms;
 
   if (udp_socket_open(&udp_socket, AF_INET, MDNS_PORT) < 0) {
     LOGE("Failed to create socket");
-    return -1;
+    return 0;  // 0 == unresolved (callers treat non-zero as success)
   }
 
   addr_from_string(MDNS_GROUP, &mcast_addr);
   addr_set_port(&mcast_addr, MDNS_PORT);
   if (udp_socket_add_multicast_group(&udp_socket, &mcast_addr) < 0) {
     LOGE("Failed to add multicast group");
-    return -1;
+    udp_socket_close(&udp_socket);
+    return 0;
   }
 
-  maxfd = udp_socket.fd;
-  FD_ZERO(&rfds);
+  deadline = mdns_now_ms() + MDNS_TOTAL_TIMEOUT_MS;
+  next_send = 0;  // 0 forces an immediate first query below
 
-  for (send_retry = 3; send_retry > 0; send_retry--) {
-    size = mdns_build_query(hostname, buf, sizeof(buf));
-    udp_socket_sendto(&udp_socket, &mcast_addr, buf, size);
-    for (recv_retry = 5; recv_retry > 0; recv_retry--) {
-      FD_SET(udp_socket.fd, &rfds);
-      ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
-
-      if (ret < 0) {
-        LOGE("select error");
-        break;
-      } else if (ret > 0 && FD_ISSET(udp_socket.fd, &rfds)) {
-        ret = udp_socket_recvfrom(&udp_socket, NULL, buf, sizeof(buf));
-        if (!mdns_parse_answer(buf, ret, addr, hostname)) {
-          addr_to_string(addr, addr_string, sizeof(addr_string));
-          addr_set_family(addr, AF_INET);
-          LOGI("Resolved %s -> %s", hostname, addr_string);
-          udp_socket_close(&udp_socket);
-          return 1;
-        } else {
-          LOGD("timeout");
-        }
+  while ((now = mdns_now_ms()) < deadline) {
+    // (Re)send the query periodically to survive multicast loss.
+    if (now >= next_send) {
+      size = mdns_build_query(hostname, buf, sizeof(buf));
+      if (size > 0) {
+        udp_socket_sendto(&udp_socket, &mcast_addr, buf, size);
       }
+      next_send = now + MDNS_RESEND_INTERVAL_MS;
     }
+
+    // Wait for a packet, but never past the next resend or the overall
+    // deadline. Recompute the timeout each iteration rather than relying on
+    // select() decrementing tv (Linux-only behaviour).
+    wait_until = next_send < deadline ? next_send : deadline;
+    wait_ms = wait_until > now ? wait_until - now : 0;
+
+    FD_ZERO(&rfds);
+    FD_SET(udp_socket.fd, &rfds);
+    struct timeval tv = {(time_t)(wait_ms / 1000), (suseconds_t)((wait_ms % 1000) * 1000)};
+    ret = select(udp_socket.fd + 1, &rfds, NULL, NULL, &tv);
+
+    if (ret < 0) {
+      LOGE("select error");
+      break;
+    }
+    if (ret == 0 || !FD_ISSET(udp_socket.fd, &rfds)) {
+      continue;  // slice timed out; loop re-checks deadline and re-sends
+    }
+
+    ret = udp_socket_recvfrom(&udp_socket, NULL, buf, sizeof(buf));
+    if (ret > 0 && mdns_parse_answer(buf, ret, addr, hostname) == 0) {
+      addr_set_family(addr, AF_INET);
+      addr_to_string(addr, addr_string, sizeof(addr_string));
+      LOGI("Resolved %s -> %s", hostname, addr_string);
+      udp_socket_close(&udp_socket);
+      return 1;
+    }
+    // Non-matching packet (other devices' mDNS chatter): ignore and keep
+    // listening. Crucially we do NOT consume a fixed retry budget here, so
+    // noise can't starve us out before the real answer arrives.
   }
 
-  LOGI("Failed to resolve hostname");
+  LOGI("Failed to resolve hostname %s", hostname);
   udp_socket_close(&udp_socket);
   return 0;
 }

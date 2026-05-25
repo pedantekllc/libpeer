@@ -15,6 +15,12 @@ static uint8_t ice_candidate_type_preference(IceCandidateType type) {
   switch (type) {
     case ICE_CANDIDATE_TYPE_HOST:
       return 126;
+    case ICE_CANDIDATE_TYPE_PRFLX:
+      // Peer-reflexive: a directly-reachable path learned from an inbound
+      // connectivity check. Must rank above srflx (and far above relay) so
+      // a learned direct route is preferred over a TURN relay. (RFC 8445
+      // recommends 110 for prflx; host=126 > prflx=110 > srflx=100.)
+      return 110;
     case ICE_CANDIDATE_TYPE_SRFLX:
       return 100;
     case ICE_CANDIDATE_TYPE_RELAY:

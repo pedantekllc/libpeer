@@ -17,11 +17,17 @@
 #define AGENT_CONNCHECK_PERIOD 10
 #define AGENT_STUN_RECV_MAXTIMES 1000
 #define AGENT_MAX_INPROGRESS 5  // Parallel pair checking
+// After the first pair succeeds, keep checking for up to this long if a
+// strictly higher-priority pair is still in progress, so a direct (host/prflx)
+// path can win over a relay that merely answered first. Bounded so a
+// genuinely relay-only peer still connects promptly.
+#define AGENT_PAIR_SETTLE_MS 150
 
 void agent_clear_candidates(Agent* agent) {
   agent->local_candidates_count = 0;
   agent->remote_candidates_count = 0;
   agent->candidate_pairs_num = 0;
+  agent->first_success_time = 0;
 }
 
 int agent_create(Agent* agent) {
@@ -341,6 +347,56 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
 }
 
+int agent_add_prflx_candidate(Agent* agent, Address* addr) {
+  int i;
+  char addr_string[ADDRSTRLEN];
+
+  // Already known (host/srflx/relay/prflx)? Nothing to learn.
+  for (i = 0; i < agent->remote_candidates_count; i++) {
+    if (addr_equal(&agent->remote_candidates[i].addr, addr)) {
+      return i;
+    }
+  }
+
+  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
+    LOGW("Cannot learn peer-reflexive candidate: remote candidate table full");
+    return -1;
+  }
+
+  IceCandidate* prflx = &agent->remote_candidates[agent->remote_candidates_count];
+  int prflx_idx = agent->remote_candidates_count;
+  ice_candidate_create(prflx, prflx_idx, ICE_CANDIDATE_TYPE_PRFLX, addr);
+  agent->remote_candidates_count++;
+
+  addr_to_string(addr, addr_string, sizeof(addr_string));
+  LOGI("Learned peer-reflexive candidate %s:%d (slot %d)", addr_string, addr->port, prflx_idx);
+
+  // Pair it with every same-family local candidate and prime each pair for an
+  // immediate triggered check (INPROGRESS). The validated inbound request is
+  // itself proof the remote can reach us, so we confirm the reverse direction
+  // right away rather than waiting for the frozen-pair pump. Appending leaves
+  // existing pairs (and the selected/nominated_pair pointers into the array)
+  // untouched.
+  for (i = 0; i < agent->local_candidates_count; i++) {
+    if (agent->local_candidates[i].addr.family != prflx->addr.family) {
+      continue;
+    }
+    if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
+      LOGW("Cannot add peer-reflexive pair: candidate pair table full");
+      break;
+    }
+    IceCandidatePair* pair = &agent->candidate_pairs[agent->candidate_pairs_num];
+    pair->local = &agent->local_candidates[i];
+    pair->remote = prflx;
+    pair->priority = (uint64_t)agent->local_candidates[i].priority + (uint64_t)prflx->priority;
+    pair->state = ICE_CANDIDATE_STATE_INPROGRESS;
+    pair->conncheck = 0;
+    agent->candidate_pairs_num++;
+  }
+
+  return prflx_idx;
+}
+
 void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
   StunMessage msg;
   StunHeader* header;
@@ -352,6 +408,11 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
         agent->binding_request_time = ports_get_epoch_time();
+        // Browsers hide their host candidate behind an mDNS .local name in the
+        // SDP, but their connectivity checks still arrive from the real
+        // address. Learn it as a peer-reflexive candidate so we can establish a
+        // direct path without resolving mDNS at all.
+        agent_add_prflx_candidate(agent, addr);
       }
       break;
     default:
@@ -503,6 +564,29 @@ static void agent_send_binding_to_pair(Agent* agent, IceCandidatePair* pair) {
   agent_socket_send(agent, &pair->remote->addr, msg.buf, msg.size);
 }
 
+IceCandidatePair* agent_best_succeeded_pair(Agent* agent) {
+  IceCandidatePair* best = NULL;
+  for (int i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED &&
+        (best == NULL || agent->candidate_pairs[i].priority > best->priority)) {
+      best = &agent->candidate_pairs[i];
+    }
+  }
+  return best;
+}
+
+// True if any pair with priority strictly greater than `threshold` is still
+// being checked — i.e. a better path might yet succeed.
+static int agent_higher_priority_pending(Agent* agent, uint64_t threshold) {
+  for (int i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS &&
+        agent->candidate_pairs[i].priority > threshold) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int agent_connectivity_check(Agent* agent) {
   uint8_t buf[1400];
   int i;
@@ -515,53 +599,60 @@ int agent_connectivity_check(Agent* agent) {
       inprogress_count++;
       // Send on first check (conncheck==0) and every PERIOD thereafter
       if (agent->candidate_pairs[i].conncheck % AGENT_CONNCHECK_PERIOD == 0) {
-        LOGI("Sending binding request to pair %d (conncheck=%d)", i, agent->candidate_pairs[i].conncheck);
         agent_send_binding_to_pair(agent, &agent->candidate_pairs[i]);
       }
       agent->candidate_pairs[i].conncheck++;  // Increment AFTER the send decision
     }
   }
 
-  if (inprogress_count == 0) {
-    LOGI("No pairs in progress - total pairs=%d", agent->candidate_pairs_num);
-    return -1;
-  }
-
-  // Drain all pending packets from the socket (up to 10 per iteration)
+  // Drain pending packets first so responses can flip pairs to SUCCEEDED
+  // before we evaluate which pair to commit to.
   while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
     recv_count++;
   }
 
-  // Check if any pair succeeded
-  for (i = 0; i < agent->candidate_pairs_num; i++) {
-    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      agent->selected_pair = &agent->candidate_pairs[i];
-      agent->nominated_pair = &agent->candidate_pairs[i];
-      LOGI("Pair %d succeeded (priority: %llu)", i, (unsigned long long)agent->candidate_pairs[i].priority);
-      return 0;
+  // Prefer the highest-priority succeeded pair, not whichever happened to
+  // succeed first or sits earliest in the (partially unsorted) array. Relay
+  // has the lowest priority, so any direct host/prflx/srflx success wins.
+  IceCandidatePair* best = agent_best_succeeded_pair(agent);
+  if (best != NULL) {
+    if (agent->first_success_time == 0) {
+      agent->first_success_time = ports_get_epoch_time();
     }
+    agent->selected_pair = best;
+    agent->nominated_pair = best;
+
+    // Settle window: if a strictly higher-priority pair is still in progress
+    // (e.g. the direct path while a relay answered first), don't commit yet —
+    // give it a bounded chance to win so we keep media off the relay.
+    if (agent_higher_priority_pending(agent, best->priority) &&
+        (uint32_t)(ports_get_epoch_time() - agent->first_success_time) < AGENT_PAIR_SETTLE_MS) {
+      return -1;
+    }
+
+    LOGI("Selected pair (priority: %llu, remote candidate type: %d)",
+         (unsigned long long)best->priority, best->remote->type);
+    return 0;
   }
 
+  if (inprogress_count == 0) {
+    LOGI("No pairs in progress - total pairs=%d", agent->candidate_pairs_num);
+  }
   return -1;
 }
 
 int agent_select_candidate_pair(Agent* agent) {
   int i;
   int inprogress_count = 0;
-  int frozen_started = 0;
-  static int call_count = 0;
-  call_count++;
+  int succeeded_count = 0;
 
-  if (call_count <= 3 || agent->candidate_pairs_num == 0) {
-    LOGI("agent_select_candidate_pair called (count=%d, pairs_num=%d)", call_count, agent->candidate_pairs_num);
-  }
-
-  // First pass: check for success and count in-progress pairs
+  // First pass: count in-progress pairs and time out stale ones. We do NOT
+  // commit on the first success here — selection happens after the second
+  // pass (below) so a higher-priority pair still has a chance to start and be
+  // preferred over a relay that answered first.
   for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      agent->selected_pair = &agent->candidate_pairs[i];
-      agent->nominated_pair = &agent->candidate_pairs[i];
-      return 0;
+      succeeded_count++;
     } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
       inprogress_count++;
       // Check for timeout (conncheck is incremented in agent_connectivity_check)
@@ -573,7 +664,9 @@ int agent_select_candidate_pair(Agent* agent) {
     }
   }
 
-  // Second pass: start more pairs if we have room (parallel checking)
+  // Second pass: start frozen pairs if we have room (parallel checking). Kept
+  // running even after a pair has succeeded so a higher-priority (direct) pair
+  // still gets started and a chance to win the settle window.
   for (i = 0; i < agent->candidate_pairs_num && inprogress_count < AGENT_MAX_INPROGRESS; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
       agent->candidate_pairs[i].conncheck = 0;
@@ -582,15 +675,19 @@ int agent_select_candidate_pair(Agent* agent) {
         agent->nominated_pair = &agent->candidate_pairs[i];
       }
       inprogress_count++;
-      frozen_started++;
       LOGD("Started pair %d (priority: %llu)", i, (unsigned long long)agent->candidate_pairs[i].priority);
     }
   }
 
-  if (frozen_started > 0) {
-    LOGD("Started %d new pairs, %d total in progress", frozen_started, inprogress_count);
+  // Provisionally track the best succeeded pair so outbound checks/sends use
+  // it; the actual commit to CONNECTED is gated by agent_connectivity_check.
+  IceCandidatePair* best = agent_best_succeeded_pair(agent);
+  if (best != NULL) {
+    agent->selected_pair = best;
+    agent->nominated_pair = best;
   }
 
-  // Return 0 if we have pairs to check, -1 if all failed
-  return (inprogress_count > 0) ? 0 : -1;
+  // Return 0 while there's still something to evaluate, -1 only when every
+  // pair has failed (no successes and nothing in progress).
+  return (succeeded_count > 0 || inprogress_count > 0) ? 0 : -1;
 }
