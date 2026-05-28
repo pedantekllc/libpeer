@@ -232,6 +232,7 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   dtls_srtp->user_data = user_data;
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
+  pthread_mutex_init(&dtls_srtp->ssl_mutex, NULL);
 
   /* Initialize per-connection mbedtls structures (SSL context, config, etc.)
    * but NOT cert/pkey/entropy/ctr_drbg - those are shared */
@@ -297,6 +298,7 @@ void dtls_srtp_deinit(DtlsSrtp* dtls_srtp) {
   /* Free per-connection SSL context and config */
   mbedtls_ssl_free(&dtls_srtp->ssl);
   mbedtls_ssl_config_free(&dtls_srtp->conf);
+  pthread_mutex_destroy(&dtls_srtp->ssl_mutex);
 
   /* NOTE: We do NOT free cert, pkey, entropy, or ctr_drbg here because
    * they are part of the shared g_shared_cert structure, not per-connection.
@@ -568,10 +570,25 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
   int ret;
 
+  /* See ssl_mutex comment in dtls_srtp.h — mbedtls's ssl_context is not
+   * thread-safe in this build, so all access is serialized. Without this,
+   * usrsctp's timer thread (calling us via sctp_outgoing_data_cb to emit
+   * DATA chunks) races pc_task (calling dtls_srtp_read) on the same ssl
+   * ctx. */
+  pthread_mutex_lock(&dtls_srtp->ssl_mutex);
   do {
     ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
-
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
+
+  /* Anything but a positive byte count is a real failure to encrypt+send.
+   * The caller (sctp_outgoing_data_cb on the data-channel path) used to
+   * discard this return value, masking DTLS-level failures as silent data
+   * loss; surface it loudly. */
+  if (ret <= 0) {
+    LOGE("dtls_srtp_write: mbedtls_ssl_write returned %d (0x%04x) for %zu bytes",
+         ret, (unsigned)(ret < 0 ? -ret : 0), len);
+  }
   return ret;
 }
 
@@ -580,11 +597,31 @@ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
 
   memset(buf, 0, len);
 
+  pthread_mutex_lock(&dtls_srtp->ssl_mutex);
+  /* Only loop on WANT_WRITE (mbedtls wants to push out an internal record).
+   * WANT_READ means "no more bytes available from BIO recv right now" — at
+   * steady-state that's the normal exit when we've consumed the cached wire
+   * packet, so we must not spin (BIO recv would just keep returning WANT_READ
+   * because the dispatch loop hasn't fed us a fresh packet yet). The outer
+   * dispatch in peer_connection_loop is the natural retry: it iterates per
+   * agent_recv packet and calls dtls_srtp_read fresh each time. */
   do {
     ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
+  } while (ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
 
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+  /* Normal end-of-data: BIO had no more bytes to give. Caller treats 0
+   * as "no plaintext extracted this call" and moves on. */
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ) return 0;
 
+  /* Anything else negative is an actual decrypt/protocol failure. The
+   * dispatch loop checks `ret > 0` and silently skips otherwise, so log
+   * it here or the failure mode (corrupt record, bad MAC, TIMEOUT from a
+   * misbehaving BIO recv) is invisible. */
+  if (ret < 0) {
+    LOGE("dtls_srtp_read: mbedtls_ssl_read returned %d (0x%04x)",
+         ret, (unsigned)(-ret));
+  }
   return ret;
 }
 

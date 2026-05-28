@@ -1,6 +1,7 @@
 #ifndef DTLS_SRTP_H_
 #define DTLS_SRTP_H_
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -68,6 +69,17 @@ typedef struct DtlsSrtp {
   char actual_remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
 
   void* user_data;
+
+  /* mbedtls's ssl_context is NOT thread-safe (MBEDTLS_THREADING_C is disabled
+   * in third_party/mbedtls/include/mbedtls/mbedtls_config.h). usrsctp's internal
+   * timer thread can call our conn_output → dtls_srtp_write at the same time the
+   * pc_task thread runs dtls_srtp_read on the same `ssl` context. Without this
+   * mutex, concurrent ssl_read/ssl_write corrupt mbedtls's state machine
+   * silently — outbound DATA chunks get queued but never crypted to the wire
+   * (4MB sndbuf fills, no packets cross), even though small handshake messages
+   * sent from a single thread still work. Locking around every ssl_read/write
+   * eliminates the race. */
+  pthread_mutex_t ssl_mutex;
 
 } DtlsSrtp;
 

@@ -89,7 +89,17 @@ static uint32_t sctp_get_checksum(Sctp* sctp, const uint8_t* buf, size_t len) {
 static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t tos, uint8_t set_df) {
   Sctp* sctp = (Sctp*)userdata;
 
-  dtls_srtp_write(sctp->dtls_srtp, buf, len);
+  /* This callback runs from a usrsctp internal thread whenever the SCTP
+   * stack wants to emit a packet on the wire (DATA chunks, SACKs, heartbeats,
+   * cookies). Anything we don't surface here turns silent SCTP-level failure
+   * into "the sender's send buffer fills to its cap and never drains" with
+   * no log to point at the cause — exactly the symptom that took a long
+   * time to chase down before we added this. */
+  int ret = dtls_srtp_write(sctp->dtls_srtp, buf, len);
+  if (ret <= 0) {
+    LOGE("sctp_outgoing_data_cb: dtls_srtp_write failed (ret=%d) for %zu-byte SCTP packet — outbound chunk dropped",
+         ret, len);
+  }
   return 0;
 }
 
@@ -535,6 +545,22 @@ static int sctp_incoming_data_cb(struct socket* sock, union sctp_sockstore addr,
 void sctp_usrsctp_init() {
 #if CONFIG_USE_USRSCTP
   usrsctp_init(0, sctp_outgoing_data_cb, NULL);
+  /* The data-channel sender is app-limited: it bursts a whole HLS segment into
+   * the 4MB send buffer, then idles waiting for the next browser request. usrsctp
+   * starts each association's cwnd at sctp_initial_cwnd (default 3 MTU), clamps it
+   * to max_burst (default 4 MTU), and resets cwnd back to that floor after every
+   * idle gap (sctp_cc_functions.c). So cwnd never escapes ~4 packets and, since
+   * throughput = cwnd/RTT, transfers crater on any real-RTT link (LAN/WiFi) while
+   * staying invisible at ~0-RTT localhost. Raise the initial window and lift the
+   * burst clamp so the post-idle floor is large instead of ~5KB. cwnd (MTUs) /
+   * RTT sets the ceiling; 256 MTU ≈ 307KB → ~38 MB/s at 8ms RTT in theory, which
+   * is past the Pi's WiFi link (~12.75 MB/s measured) and encrypt CPU — so the
+   * window stops being the bottleneck and the link/CPU becomes it. Netem A/B at
+   * +8ms RTT: 4→3.67, 64→8.91, 256→12.83, 512→15.15 MB/s (asymptoting to the
+   * ~20MB/s host processing cap). 256 chosen: saturates real WiFi without 512's
+   * 614KB bursts that risk loss on a lossy path. SCTP still backs off on loss. */
+  usrsctp_sysctl_set_sctp_initial_cwnd(256);
+  usrsctp_sysctl_set_sctp_max_burst_default(256);
 #endif
 }
 
@@ -580,13 +606,21 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
     usrsctp_setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     LOGI("SCTP buffers set to %d bytes", bufsize);
 
-#if 0
+    /* Pin SCTP path MTU to fit inside our DTLS-over-UDP MTU.
+     * BENCH EVIDENCE: with PMTUD enabled (default) and SCTP picking its own
+     * path MTU, app messages larger than ~1200 bytes that get fragmented into
+     * multiple SCTP DATA chunks stall on the receive side — the fragments
+     * never reassemble, sender's 4 MB sndbuf fills and stays. Sub-MTU
+     * messages (chunk≤1200) reach the peer fine, end-to-end. The fix is to
+     * tell usrsctp the path MTU explicitly so its fragmentation matches the
+     * DTLS record size that actually fits in our 1300-byte UDP buffer
+     * (CONFIG_MTU). SPP_PMTUD_DISABLE is required for spp_pathmtu to take
+     * effect; otherwise usrsctp re-discovers MTU and ignores the value. */
     struct sctp_paddrparams peer_param;
     memset(&peer_param, 0, sizeof peer_param);
     peer_param.spp_flags = SPP_PMTUD_DISABLE;
     peer_param.spp_pathmtu = 1200;
-    usrsctp_setsockopt(s, IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS, &peer_param, sizeof peer_param);
-#endif
+    usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS, &peer_param, sizeof peer_param);
 
     struct sctp_assoc_value av;
     av.assoc_id = SCTP_ALL_ASSOC;

@@ -111,6 +111,24 @@ static void write_uint24_be(uint8_t* p, uint32_t val) {
   p[2] = val & 0xFF;
 }
 
+/* peer_connection_dtls_srtp_recv — the mbedtls BIO recv callback.
+ *
+ * Contract with mbedtls (callers MUST NOT relax this — getting it wrong is
+ * silent and ends in MBEDTLS_ERR_SSL_TIMEOUT loops):
+ *
+ *   - Return > 0  ........... bytes copied into buf for ONE DTLS record. mbedtls
+ *                             may call us again inside the same ssl_read if it
+ *                             needs more bytes (continuation / next record).
+ *   - Return MBEDTLS_ERR_SSL_WANT_READ  ... no data available right now; mbedtls
+ *                             treats this as "poll again later" via its timer.
+ *   - Any other negative .... hard error; mbedtls aborts the read.
+ *
+ * Cache invariant: pc->agent_ret/pc->agent_buf hold ONE wire packet that the
+ * outer dispatch loop in peer_connection_loop just stashed via agent_recv.
+ * This callback serves it ONCE and then clears pc->agent_ret. Without that
+ * clear, mbedtls re-reads the same record on every internal read and (at
+ * steady-state bulk traffic) the decrypted SCTP DATA chunks never reach the
+ * application — the sender's send buffer fills to its 4 MB cap and stays. */
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
   int recv_max = 0;
   int ret = -1;
@@ -119,10 +137,11 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   dtls_fragment_state_t* frag = pc->frag_state;
   uint8_t recv_buf[2048];
 
-  /* Check if there's already buffered data from agent */
-  if (pc->agent_ret > 0 && pc->agent_ret <= len) {
-    memcpy(buf, pc->agent_buf, pc->agent_ret);
-    return pc->agent_ret;
+  if (pc->agent_ret > 0 && (size_t)pc->agent_ret <= len) {
+    int n = pc->agent_ret;
+    memcpy(buf, pc->agent_buf, n);
+    pc->agent_ret = 0;  /* single-shot: see contract above */
+    return n;
   }
 
   while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
@@ -262,7 +281,13 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     /* Don't increment recv_max here - we're actively reassembling */
   }
 
-  return ret;
+  /* No data available right now: tell mbedtls to retry rather than treating
+   * this as a hard error. Returning a raw negative (the original `ret = -1`)
+   * collapsed into MBEDTLS_ERR_SSL_TIMEOUT inside the DTLS record reader and
+   * caused steady-state ssl_read calls to drop the just-decrypted SCTP DATA
+   * payload. WANT_READ is the documented "no data, please poll again later"
+   * contract for the mbedtls BIO recv callback. */
+  return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -595,12 +620,26 @@ int peer_connection_loop(PeerConnection* pc) {
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
 
         } else if (dtls_srtp_probe(pc->agent_buf)) {
-          int ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
-          LOGD("Got DTLS data %d", ret);
-
-          if (ret > 0) {
-            sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
-          }
+          /* Drain ssl_read until WANT_READ (returned as 0). mbedtls returns
+           * ONE plaintext record per ssl_read call but a single UDP datagram
+           * can carry multiple DTLS records — without the drain loop, every
+           * record after the first in the same packet gets silently dropped
+           * (it sits in mbedtls's internal buffer until the next BIO_recv
+           * overwrites it). */
+          int ret;
+          do {
+            ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
+            LOGD("Got DTLS data %d", ret);
+            if (ret > 0) {
+              sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
+            } else if (ret < 0) {
+              /* dtls_srtp_read itself logs the mbedtls code; this LOGW marks
+               * the corresponding inbound wire packet so the two can be
+               * correlated when triaging silent drops. */
+              LOGW("DTLS dispatch: dropping %d-byte wire packet (decrypt failed)",
+                   pc->agent_ret);
+            }
+          } while (ret > 0);
 
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
