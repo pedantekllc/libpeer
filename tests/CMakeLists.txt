@@ -15,4 +15,5 @@ target_link_libraries(test_peer_connection cjson)
 target_link_libraries(test_dc_fragment cjson)
 target_link_libraries(bench_datachannel cjson)
 target_link_libraries(bench_dc_net cjson)
+target_link_libraries(bench_dc_pool cjson)
 

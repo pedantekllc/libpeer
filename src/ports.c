@@ -60,6 +60,15 @@ int ports_get_host_addr(Address* addr, const char* iface_prefix) {
     return -1;
   }
 
+  /* Optional ICE host-candidate filter: pin candidate gathering to a single
+   * local IP. Set LIBPEER_BIND_IP=10.42.0.1 to force the eth path on a host
+   * with both eth and wlan in the same DNS-resolvable space (the Pi/Mac
+   * lab setup we benchmark on). Without it, ICE picks whichever interface
+   * getifaddrs returns first — which is typically the WiFi link on a Pi 3
+   * B+, silently sending bulk traffic over the slower link even when the
+   * intended TCP rendezvous targeted the eth address. */
+  const char* bind_ip = getenv("LIBPEER_BIND_IP");
+
   for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
     if (ifa->ifa_addr == NULL) {
       continue;
@@ -86,6 +95,13 @@ int ports_get_host_addr(Address* addr, const char* iface_prefix) {
       if ((ifa->ifa_flags & IFF_LOOPBACK) == IFF_LOOPBACK) {
         continue;
       }
+    }
+
+    if (bind_ip && ifa->ifa_addr->sa_family == AF_INET) {
+      char ipstr[INET_ADDRSTRLEN];
+      struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+      inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+      if (strcmp(ipstr, bind_ip) != 0) continue;
     }
 
     switch (ifa->ifa_addr->sa_family) {
