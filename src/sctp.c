@@ -656,6 +656,25 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
     init_msg.sinit_max_instreams = 300;
     usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_INITMSG, &init_msg, sizeof init_msg);
 
+    /* SCTP-over-DTLS: skip the SCTP CRC32C computation. The DTLS record's
+     * AEAD tag (Poly1305 / GCM) already authenticates every byte the SCTP
+     * checksum would cover, so the checksum is redundant work — and it's a
+     * lot of work: profiling on Pi 3 B+ Cortex-A53 showed usrsctp's
+     * software CRC32C (sctp_crc32c_sb8_64_bit) as the single largest
+     * userspace hotspot at ~12% of cycles, more than the actual ChaCha20-
+     * Poly1305 crypto. RFC 9653 standardizes this opt-out for transports
+     * that wrap SCTP in a layer providing equivalent integrity (DTLS being
+     * the canonical case). Both peers negotiate during INIT/INIT-ACK; if
+     * either side hasn't enabled it, SCTP falls back to computing the CRC
+     * — so this is forward-compatible with older receivers. Chrome and
+     * Firefox both enable this for their WebRTC datachannels. */
+    uint32_t edmid = SCTP_EDMID_LOWER_LAYER_DTLS;
+    if (usrsctp_setsockopt(sock, IPPROTO_SCTP, SCTP_ACCEPT_ZERO_CHECKSUM,
+                           &edmid, sizeof(edmid)) < 0) {
+      LOGW("SCTP_ACCEPT_ZERO_CHECKSUM not supported by this usrsctp build "
+           "(error %d) — falling back to software CRC32C", errno);
+    }
+
     struct sockaddr_conn sconn;
     memset(&sconn, 0, sizeof(sconn));
     sconn.sconn_family = AF_CONN;

@@ -554,6 +554,13 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
   mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
 
+  /* Log the negotiated DTLS cipher right after the handshake finishes (the
+   * later ssl_session_reset path clears this). */
+  {
+    const char* suite = mbedtls_ssl_get_ciphersuite(&dtls_srtp->ssl);
+    LOGI("DTLS negotiated cipher: %s", suite ? suite : "(unknown)");
+  }
+
   return ret;
 }
 
