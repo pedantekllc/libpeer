@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "agent.h"
@@ -37,6 +38,7 @@ struct PeerConnection {
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
+  void (*on_remb)(uint32_t bitrate_bps, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
   uint8_t agent_buf[CONFIG_MTU];
@@ -55,8 +57,31 @@ struct PeerConnection {
   dtls_fragment_state_t* frag_state;
 };
 
+/* Absolute send time in 6.18-fixed-point seconds, low 24 bits (RFC abs-send-
+ * time). Monotonic source: only inter-packet DELTAS matter to the receiver's
+ * delay-gradient estimator, and the 24-bit field wraps ~64s (handled by the
+ * estimator). No wall-clock / NTP needed for the BWE path. */
+static uint32_t peer_connection_abs_send_time_24(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint64_t secs = (uint64_t)ts.tv_sec;
+  uint64_t frac = ((uint64_t)ts.tv_nsec << 18) / 1000000000ULL;  /* < 2^18 */
+  return (uint32_t)(((secs << 18) + frac) & 0x00FFFFFFULL);
+}
+
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  /* abs-send-time insertion DISABLED (`0 &&` keeps it dead-but-referenced).
+   * Enabling it breaks decode: the emulator live-decode E2E reproduces ~74%
+   * packetsLost / framesReceived=0 (NOT an MTU/size issue — reserving 8B in the
+   * packetizer budget didn't change it). Root cause still open: the extension's
+   * interaction with libsrtp protect or Chrome's negotiation/depacketize.
+   * Debug from the local repro: e2e/webrtc-diagnostic.spec.ts "P-frames decode".
+   * Keep OFF until framesDecoded>0 there. */
+  if (0 && size >= 12 && (data[1] & 0x7f) == PT_H264) {
+    size = rtp_insert_abs_send_time(data, size, RTP_EXT_ID_ABS_SEND_TIME,
+                                    peer_connection_abs_send_time_24());
+  }
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
 }
@@ -307,27 +332,33 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
 
     switch (rtcp_header->type) {
       case RTCP_RR:
-        LOGD("RTCP_PR");
+        LOGD("RTCP_RR");
+        /* Receiver-report loss → the rate controller's emergency brake. Parse
+         * THIS report block (buf + pos), not buf — compound RTCP puts later
+         * packets past pos. fraction-lost is the top byte of the first word. */
         if (rtcp_header->rc > 0) {
-// TODO: REMB, GCC ...etc
-#if 0
-          RtcpRr rtcp_rr = rtcp_parse_rr(buf);
+          RtcpRr rtcp_rr = rtcp_parse_rr(buf + pos);
           uint32_t fraction = ntohl(rtcp_rr.report_block[0].flcnpl) >> 24;
           uint32_t total = ntohl(rtcp_rr.report_block[0].flcnpl) & 0x00FFFFFF;
-          if(pc->on_receiver_packet_loss && fraction > 0) {
-
-            pc->on_receiver_packet_loss((float)fraction/256.0, total, pc->config.user_data);
+          if (pc->on_receiver_packet_loss && fraction > 0) {
+            pc->on_receiver_packet_loss((float)fraction / 256.0f, total, pc->config.user_data);
           }
-#endif
         }
         break;
       case RTCP_PSFB: {
         int fmt = rtcp_header->rc;
         LOGD("RTCP_PSFB %d", fmt);
-        // PLI and FIR
         if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
+          /* PLI (1) / FIR (4): request a keyframe. */
           pc->config.on_request_keyframe(pc->config.user_data);
+        } else if (fmt == 15 && pc->on_remb) {
+          /* goog-remb (AFB, fmt 15): the browser's bandwidth estimate → the
+           * rate controller. */
+          uint32_t bps = 0;
+          if (rtcp_parse_remb(buf + pos, len - pos, &bps) && bps > 0)
+            pc->on_remb(bps, pc->config.user_data);
         }
+        break;
       }
       default:
         break;
@@ -844,6 +875,11 @@ void peer_connection_on_connected(PeerConnection* pc, void (*on_connected)(void*
 void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata)) {
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
+}
+
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb)(uint32_t bitrate_bps, void* userdata)) {
+  pc->on_remb = on_remb;
 }
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {

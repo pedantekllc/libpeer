@@ -106,6 +106,22 @@ struct RtpEncoder {
   uint8_t buf[CONFIG_MTU + 128];
 };
 
+/* RFC 8285 one-byte header-extension id for abs-send-time. We are the offerer,
+ * so this is the id we advertise in sdp.c (a=extmap:3 …abs-send-time) and stamp
+ * on outgoing video RTP. Keep in sync with the literal in sdp_append_h264(). */
+#define RTP_EXT_ID_ABS_SEND_TIME 3
+
+/* Insert a one-byte RFC 8285 header extension carrying abs-send-time into an
+ * already-built RTP packet (12-byte header + payload, contiguous, CSRC=0). Used
+ * by the send path so the browser's REMB estimator sees per-packet send time.
+ *
+ * `ast24` is absolute send time in 6.18-fixed-point seconds, low 24 bits.
+ * Shifts the payload right 8 bytes, writes [0xBE 0xDE][len=1][id|2][3B ast],
+ * sets the X bit, and returns the NEW packet length. No-op (returns `size`
+ * unchanged) if the packet is < 12 bytes or already has X set. Caller must
+ * guarantee >= 8 bytes of headroom past `size` in the buffer.               */
+size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24);
+
 int rtp_packet_validate(uint8_t* packet, size_t size);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);

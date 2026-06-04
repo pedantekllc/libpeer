@@ -160,6 +160,14 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
                                              void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
 
 /**
+ * @brief register callback for the browser's REMB (goog-remb) bandwidth
+ *        estimate, in bits/sec. Fires on each RTCP AFB (PT=206, fmt=15)
+ *        carrying "REMB". Drives the send-rate controller (browser-side BWE).
+ */
+void peer_connection_on_remb(PeerConnection* pc,
+                             void (*on_remb)(uint32_t bitrate_bps, void* userdata));
+
+/**
  * @brief Set the callback function to handle onicecandidate event.
  * @param A PeerConnection.
  * @param A callback function to handle onicecandidate event.

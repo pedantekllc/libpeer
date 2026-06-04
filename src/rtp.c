@@ -37,6 +37,25 @@ typedef struct NaluInfo {
 #define RTP_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader))
 #define FU_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader) - sizeof(FuHeader) - sizeof(NaluHeader))
 
+size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24) {
+  /* Need a fixed header present; never double-insert (X already set). */
+  if (size < 12 || (data[0] & 0x10))
+    return size;
+  const size_t hdr = 12;  /* our packets always have CSRC count 0 */
+  /* Make room for the 8-byte extension block between header and payload. */
+  memmove(data + hdr + 8, data + hdr, size - hdr);
+  data[hdr + 0] = 0xBE;  /* one-byte ext profile 0xBEDE */
+  data[hdr + 1] = 0xDE;
+  data[hdr + 2] = 0x00;  /* extension length = 1 32-bit word of data */
+  data[hdr + 3] = 0x01;
+  data[hdr + 4] = (uint8_t)(((ext_id & 0x0F) << 4) | 0x02);  /* id | (len-1=2 → 3 bytes) */
+  data[hdr + 5] = (uint8_t)((ast24 >> 16) & 0xFF);
+  data[hdr + 6] = (uint8_t)((ast24 >> 8) & 0xFF);
+  data[hdr + 7] = (uint8_t)(ast24 & 0xFF);
+  data[0] |= 0x10;  /* set the X (extension) bit */
+  return size + 8;
+}
+
 int rtp_packet_validate(uint8_t* packet, size_t size) {
   if (size < 12)
     return 0;
