@@ -38,8 +38,15 @@ typedef struct NaluInfo {
 #define FU_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader) - sizeof(FuHeader) - sizeof(NaluHeader))
 
 size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24) {
-  /* Need a fixed header present; never double-insert (X already set). */
-  if (size < 12 || (data[0] & 0x10))
+  /* Need a fixed header present. We do NOT skip when the X bit is already set:
+   * the packetizers never emit a real header extension, but the FU-A path sets
+   * extension=0 only ONCE before its fragment loop and reuses rtp_encoder->buf,
+   * so once we set X on the first fragment that bit persists into fragments
+   * 2..N. Guarding on X there would send them with X=1 and NO extension (the
+   * FU payload misread as an extension header → undecodable, ~75% loss). The
+   * caller invokes this exactly once per packet, so always (re)build the
+   * extension from a clean 12-byte-header assumption. */
+  if (size < 12)
     return size;
   const size_t hdr = 12;  /* our packets always have CSRC count 0 */
   /* Make room for the 8-byte extension block between header and payload. */

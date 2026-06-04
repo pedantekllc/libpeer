@@ -31,10 +31,13 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  /* goog-remb + abs-send-time extmap DISABLED until the abs-send-time wire
-   * format is proven in the live-decode E2E (see peer_connection_outgoing_rtp_packet).
-   * sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
-   * sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"); */
+  /* goog-remb + abs-send-time (id 3, == RTP_EXT_ID_ABS_SEND_TIME). Asks the
+   * browser to run receive-side BWE and report it via RTCP AFB(REMB); the
+   * abs-send-time header ext (stamped per packet in peer_connection_outgoing_rtp_packet)
+   * is the per-packet send time its estimator needs. We deliberately do NOT
+   * offer transport-cc, so the browser falls back to REMB (ratecore §0/D1). */
+  sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
+  sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");

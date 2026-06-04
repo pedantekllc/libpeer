@@ -71,14 +71,14 @@ static uint32_t peer_connection_abs_send_time_24(void) {
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
-  /* abs-send-time insertion DISABLED (`0 &&` keeps it dead-but-referenced).
-   * Enabling it breaks decode: the emulator live-decode E2E reproduces ~74%
-   * packetsLost / framesReceived=0 (NOT an MTU/size issue — reserving 8B in the
-   * packetizer budget didn't change it). Root cause still open: the extension's
-   * interaction with libsrtp protect or Chrome's negotiation/depacketize.
-   * Debug from the local repro: e2e/webrtc-diagnostic.spec.ts "P-frames decode".
-   * Keep OFF until framesDecoded>0 there. */
-  if (0 && size >= 12 && (data[1] & 0x7f) == PT_H264) {
+  /* Stamp abs-send-time on every outgoing VIDEO RTP packet (PT_H264=96) so the
+   * browser's REMB estimator sees per-packet send time. Inserted at this single
+   * send chokepoint (the scarred packetizers stay untouched) and BEFORE
+   * srtp_protect so the extension is authenticated; libsrtp2 finds the payload
+   * after the extension. rtp_insert_abs_send_time always (re)builds the
+   * extension — see the FU-A buffer-reuse note there. Verified by the live-decode
+   * E2E (framesDecoded>0, zero loss). */
+  if (size >= 12 && (data[1] & 0x7f) == PT_H264) {
     size = rtp_insert_abs_send_time(data, size, RTP_EXT_ID_ABS_SEND_TIME,
                                     peer_connection_abs_send_time_24());
   }
