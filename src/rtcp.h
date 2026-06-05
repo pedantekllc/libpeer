@@ -94,4 +94,22 @@ RtcpRr rtcp_parse_rr(uint8_t* packet);
  * vector tested in test_rtp_ext.c. */
 int rtcp_parse_remb(const uint8_t* pkt, size_t len, uint32_t* out_bps);
 
+/* Build an RTCP Sender Report (PT=200, RFC 3550 §6.4.1) into `buf`.
+ * `buf` must be at least 28 bytes.  Returns 28 (the fixed SR size).
+ *
+ * Parameters:
+ *   ssrc          : sender SSRC of the media stream
+ *   ntp_ts        : 64-bit NTP wall-clock timestamp (high32=seconds since 1900,
+ *                   low32=fraction)  — call unix_ns_to_ntp() to produce this
+ *   rtp_ts        : RTP timestamp a frame captured "now" would carry; MUST use
+ *                   the SAME formula as the wire RTP timestamps so the browser's
+ *                   RTP↔NTP mapping is correct: (mono_ns * 90000 / 1e9)
+ *   packets_sent  : cumulative RTP packets sent for this SSRC
+ *   octets_sent   : cumulative RTP payload octets sent for this SSRC
+ *
+ * The result is a plain (unencrypted) RTCP packet; caller must SRTP-protect it
+ * via dtls_srtp_encrypt_rctp_packet() before sending.                          */
+int rtcp_build_sr(uint8_t* buf, uint32_t ssrc, uint64_t ntp_ts, uint32_t rtp_ts,
+                  uint32_t packets_sent, uint32_t octets_sent);
+
 #endif  // RTCP_H_

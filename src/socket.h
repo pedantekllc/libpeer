@@ -15,6 +15,14 @@ typedef struct TcpSocket {
 
 int udp_socket_open(UdpSocket* udp_socket, int family, int port);
 
+/* Pin an already-open socket to a single interface via SO_BINDTODEVICE so all
+ * traffic ingresses/egresses on that NIC regardless of the routing table.
+ * ifname NULL/empty is a no-op (returns 0). On non-Linux platforms (no
+ * SO_BINDTODEVICE) this is a no-op returning 0 — single-homed dev hosts don't
+ * need it. Returns 0 on success/no-op, negative on a real bind failure (e.g.
+ * missing CAP_NET_RAW). */
+int udp_socket_bind_iface(UdpSocket* udp_socket, const char* ifname);
+
 int udp_socket_bind(UdpSocket* udp_socket, int port);
 
 void udp_socket_close(UdpSocket* udp_socket);

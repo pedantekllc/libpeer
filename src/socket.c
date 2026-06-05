@@ -94,6 +94,26 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   return 0;
 }
 
+int udp_socket_bind_iface(UdpSocket* udp_socket, const char* ifname) {
+  if (!ifname || ifname[0] == '\0' || udp_socket->fd < 0) {
+    return 0;
+  }
+#ifdef SO_BINDTODEVICE
+  if (setsockopt(udp_socket->fd, SOL_SOCKET, SO_BINDTODEVICE, ifname,
+                 strlen(ifname)) < 0) {
+    LOGE("SO_BINDTODEVICE(%s) failed: %s (need CAP_NET_RAW?)", ifname,
+         strerror(errno));
+    return -1;
+  }
+  LOGI("socket %d pinned to interface %s", udp_socket->fd, ifname);
+  return 0;
+#else
+  /* No SO_BINDTODEVICE (e.g. macOS dev host). Single-homed; nothing to pin. */
+  (void)udp_socket;
+  return 0;
+#endif
+}
+
 void udp_socket_close(UdpSocket* udp_socket) {
   if (udp_socket->fd > 0) {
     close(udp_socket->fd);

@@ -37,30 +37,108 @@ typedef struct NaluInfo {
 #define RTP_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader))
 #define FU_PAYLOAD_SIZE (CONFIG_MTU - sizeof(RtpHeader) - sizeof(FuHeader) - sizeof(NaluHeader))
 
-size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24) {
-  /* Need a fixed header present. We do NOT skip when the X bit is already set:
-   * the packetizers never emit a real header extension, but the FU-A path sets
+/* NTP epoch offset: seconds between 1900-01-01 and 1970-01-01. */
+#define NTP_EPOCH_OFFSET_S 2208988800ULL
+
+uint64_t unix_ns_to_ntp(uint64_t unix_ns) {
+  uint64_t unix_sec  = unix_ns / 1000000000ULL;
+  uint64_t frac_ns   = unix_ns % 1000000000ULL;
+  uint64_t ntp_sec   = unix_sec + NTP_EPOCH_OFFSET_S;
+  /* NTP fraction: frac_ns * 2^32 / 1e9.  Compute as (frac_ns << 32) / 1e9
+   * but avoid 128-bit by doing (frac_ns * 4294967296ULL) / 1000000000ULL;
+   * max frac_ns < 1e9 so product < 4.3e18, fits in uint64_t.              */
+  uint64_t ntp_frac  = (frac_ns * 4294967296ULL) / 1000000000ULL;
+  return (ntp_sec << 32) | (ntp_frac & 0xFFFFFFFFULL);
+}
+
+size_t rtp_insert_extensions(uint8_t* data, size_t size, uint32_t ast24,
+                             int has_capture_time, uint64_t capture_ntp) {
+  /* Need a fixed 12-byte header present (CSRC=0 assumed throughout).
+   *
+   * We do NOT skip when the X bit is already set: the FU-A packetizer sets
    * extension=0 only ONCE before its fragment loop and reuses rtp_encoder->buf,
-   * so once we set X on the first fragment that bit persists into fragments
-   * 2..N. Guarding on X there would send them with X=1 and NO extension (the
-   * FU payload misread as an extension header → undecodable, ~75% loss). The
-   * caller invokes this exactly once per packet, so always (re)build the
-   * extension from a clean 12-byte-header assumption. */
+   * so once we set X on fragment 1 that bit persists into fragments 2..N.
+   * Guarding on X there would send them with X=1 and NO extension (the FU
+   * payload misread as an extension header → ~75% loss / undecodable frames).
+   * The caller invokes this exactly once per packet from the single send
+   * chokepoint, so always rebuild from a clean 12-byte-header assumption.   */
   if (size < 12)
     return size;
-  const size_t hdr = 12;  /* our packets always have CSRC count 0 */
-  /* Make room for the 8-byte extension block between header and payload. */
-  memmove(data + hdr + 8, data + hdr, size - hdr);
-  data[hdr + 0] = 0xBE;  /* one-byte ext profile 0xBEDE */
-  data[hdr + 1] = 0xDE;
-  data[hdr + 2] = 0x00;  /* extension length = 1 32-bit word of data */
-  data[hdr + 3] = 0x01;
-  data[hdr + 4] = (uint8_t)(((ext_id & 0x0F) << 4) | 0x02);  /* id | (len-1=2 → 3 bytes) */
-  data[hdr + 5] = (uint8_t)((ast24 >> 16) & 0xFF);
-  data[hdr + 6] = (uint8_t)((ast24 >> 8) & 0xFF);
-  data[hdr + 7] = (uint8_t)(ast24 & 0xFF);
-  data[0] |= 0x10;  /* set the X (extension) bit */
-  return size + 8;
+
+  const size_t hdr = 12;  /* CSRC=0, so payload starts at byte 12 */
+
+  if (!has_capture_time) {
+    /* ── single element: abs-send-time (id 3, 3 bytes) ────────────────────
+     * Extension block layout (8 bytes):
+     *   [0..1] 0xBEDE          profile
+     *   [2..3] 0x0001          length = 1 word
+     *   [4]    (3<<4)|2=0x32   id | (len-1)
+     *   [5..7] ast24 BE        3-byte timestamp
+     */
+    memmove(data + hdr + 8, data + hdr, size - hdr);
+    data[hdr + 0] = 0xBE;
+    data[hdr + 1] = 0xDE;
+    data[hdr + 2] = 0x00;
+    data[hdr + 3] = 0x01;  /* 1 word */
+    data[hdr + 4] = (uint8_t)((RTP_EXT_ID_ABS_SEND_TIME << 4) | 0x02);
+    data[hdr + 5] = (uint8_t)((ast24 >> 16) & 0xFF);
+    data[hdr + 6] = (uint8_t)((ast24 >> 8)  & 0xFF);
+    data[hdr + 7] = (uint8_t)( ast24        & 0xFF);
+    data[0] |= 0x10;
+    return size + 8;
+  }
+
+  /* ── two elements: abs-send-time (id 3, 3 B) + abs-capture-time (id 4, 8 B)
+   *
+   * Element 1: 1 + 3 = 4 bytes   (id=3, len-1=2)
+   * Element 2: 1 + 8 = 9 bytes   (id=4, len-1=7)
+   * Total data: 13 bytes → pad to next multiple of 4 → 16 bytes = 4 words
+   * Ext block total: 4 (profile+len) + 16 = 20 bytes, length field = 4 words
+   *
+   * Byte map:
+   *   [0..1] 0xBEDE
+   *   [2..3] 0x0004          length = 4 words (16-byte data region)
+   *   [4]    0x32            id=3 | (len-1=2)
+   *   [5..7] ast24 BE
+   *   [8]    0x47            id=4 | (len-1=7)
+   *   [9..12] capture_ntp high 32 bits BE
+   *   [13..16] capture_ntp low 32 bits BE
+   *   [17..19] 0x00 0x00 0x00  padding to word boundary
+   */
+  memmove(data + hdr + 20, data + hdr, size - hdr);
+  data[hdr +  0] = 0xBE;
+  data[hdr +  1] = 0xDE;
+  data[hdr +  2] = 0x00;
+  data[hdr +  3] = 0x04;  /* 4 words = 16-byte data region (13 bytes + 3 pad) */
+  /* element 1: abs-send-time */
+  data[hdr +  4] = (uint8_t)((RTP_EXT_ID_ABS_SEND_TIME << 4) | 0x02);
+  data[hdr +  5] = (uint8_t)((ast24 >> 16) & 0xFF);
+  data[hdr +  6] = (uint8_t)((ast24 >> 8)  & 0xFF);
+  data[hdr +  7] = (uint8_t)( ast24        & 0xFF);
+  /* element 2: abs-capture-time (8-byte NTP) */
+  data[hdr +  8] = (uint8_t)((RTP_EXT_ID_ABS_CAPTURE_TIME << 4) | 0x07);
+  data[hdr +  9] = (uint8_t)((capture_ntp >> 56) & 0xFF);
+  data[hdr + 10] = (uint8_t)((capture_ntp >> 48) & 0xFF);
+  data[hdr + 11] = (uint8_t)((capture_ntp >> 40) & 0xFF);
+  data[hdr + 12] = (uint8_t)((capture_ntp >> 32) & 0xFF);
+  data[hdr + 13] = (uint8_t)((capture_ntp >> 24) & 0xFF);
+  data[hdr + 14] = (uint8_t)((capture_ntp >> 16) & 0xFF);
+  data[hdr + 15] = (uint8_t)((capture_ntp >>  8) & 0xFF);
+  data[hdr + 16] = (uint8_t)( capture_ntp        & 0xFF);
+  /* 3 padding bytes to reach 16-byte data region (3 words) */
+  data[hdr + 17] = 0x00;
+  data[hdr + 18] = 0x00;
+  data[hdr + 19] = 0x00;
+  data[0] |= 0x10;
+  return size + 20;
+}
+
+size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24) {
+  /* Legacy wrapper — ext_id is ignored (always uses RTP_EXT_ID_ABS_SEND_TIME = 3);
+   * parameter kept for API stability.  Calls the multi-element writer with a single
+   * element; see rtp_insert_extensions() for the FU-A / no-X-guard rationale.      */
+  (void)ext_id;
+  return rtp_insert_extensions(data, size, ast24, 0, 0);
 }
 
 int rtp_packet_validate(uint8_t* packet, size_t size) {

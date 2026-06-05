@@ -81,6 +81,14 @@ typedef struct PeerConfiguration {
   void (*on_request_keyframe)(void* userdata);
   void* user_data;
 
+  /* Optional: pin ICE to a single local interface (e.g. "eth0"). When set, the
+   * host candidate is gathered from this interface's address AND the UDP
+   * sockets are SO_BINDTODEVICE-bound to it, so both the advertised candidate
+   * and the egress media leave on this NIC regardless of the routing table.
+   * Empty string = legacy behaviour (CONFIG_IFACE_PREFIX / first interface).
+   * 16 == IFNAMSIZ. */
+  char bind_iface[16];
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;
@@ -141,6 +149,12 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t
  *   frames on the same SSRC does.
  */
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns);
+
+/* Latest capture reference: the most recent frame's on-wire RTP timestamp and
+ * its capture NTP (the same (RTP, NTP) pair the RTCP SR uses). Lets the app
+ * publish a data-channel clock-map for browsers that can't read abs-capture-time
+ * (Firefox). Returns 0 and fills the out-params, or -1 if no frame sent yet. */
+int peer_connection_get_capture_ref(PeerConnection* pc, uint32_t* rtp, uint64_t* ntp);
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
 

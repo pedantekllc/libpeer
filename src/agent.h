@@ -56,6 +56,11 @@ struct Agent {
 
   UdpSocket udp_sockets[2];
 
+  /* Optional interface to pin ICE to (copied from PeerConfiguration.bind_iface
+   * before agent_create). Empty = legacy first-interface behaviour. 16 ==
+   * IFNAMSIZ. */
+  char bind_iface[16];
+
   Address host_addr;
   int b_host_addr;
   uint64_t binding_request_time;

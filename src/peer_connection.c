@@ -22,6 +22,11 @@
     pc->state = curr_state;                                           \
   }
 
+/* RTCP SR interval: 1 second (ms).  Shorter than the RFC 5 s default so
+ * Chrome's RTP↔NTP estimator converges fast and captureTime is populated
+ * within the first couple of seconds of a stream.                        */
+#define RTCP_SR_INTERVAL_MS 1000
+
 /* Forward declaration for fragment state */
 typedef struct dtls_fragment_state_s dtls_fragment_state_t;
 
@@ -55,6 +60,32 @@ struct PeerConnection {
 
   /* Per-connection DTLS fragment reassembly state */
   dtls_fragment_state_t* frag_state;
+
+  /* ── Glass-to-glass latency: abs-capture-time + RTCP SR ───────────────── */
+
+  /* NTP capture time of the current video frame, stashed in send_video() and
+   * read by the send chokepoint for the frame's first packet.               */
+  uint64_t cur_frame_capture_ntp;
+
+  /* Last RTP timestamp seen at the send chokepoint.  A change from the
+   * previous value marks the first packet of a new access unit.            */
+  uint32_t last_rtp_ts;
+
+  /* RTCP SR counters — cumulative across the connection lifetime.           */
+  uint32_t sr_packets_sent;  /* RTP packets sent for video SSRC */
+  uint32_t sr_octets_sent;   /* RTP payload octets sent (wraps at 2^32) */
+
+  /* Wall-clock ms of the last SR send (from ports_get_epoch_time()).        */
+  uint32_t last_sr_ms;
+
+  /* SR reference pair, refreshed every frame in send_video: the most recent
+   * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
+   * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
+   * the same timebase as the RTP timestamps the receiver actually sees and
+   * consistent with abs-capture-time — required when the capture clock isn't
+   * CLOCK_MONOTONIC (e.g. the emulator's synthetic frame clock).            */
+  uint32_t sr_ref_rtp;
+  uint64_t sr_ref_ntp;
 };
 
 /* Absolute send time in 6.18-fixed-point seconds, low 24 bits (RFC abs-send-
@@ -72,15 +103,36 @@ static uint32_t peer_connection_abs_send_time_24(void) {
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
   /* Stamp abs-send-time on every outgoing VIDEO RTP packet (PT_H264=96) so the
-   * browser's REMB estimator sees per-packet send time. Inserted at this single
-   * send chokepoint (the scarred packetizers stay untouched) and BEFORE
-   * srtp_protect so the extension is authenticated; libsrtp2 finds the payload
-   * after the extension. rtp_insert_abs_send_time always (re)builds the
-   * extension — see the FU-A buffer-reuse note there. Verified by the live-decode
-   * E2E (framesDecoded>0, zero loss). */
+   * browser's REMB estimator sees per-packet send time.  On the first packet of
+   * each access unit (detected by RTP-timestamp change) also add abs-capture-time
+   * so Chrome can compute skew-free glass-to-glass latency.
+   *
+   * All insertions happen here — a single send chokepoint — BEFORE srtp_protect
+   * so the extension is authenticated.  rtp_insert_extensions always rebuilds the
+   * extension block from a clean 12-byte-header assumption (no X-bit guard): the
+   * FU-A packetizer sets extension=0 once before its fragment loop and reuses the
+   * encoder buffer, so a stale X bit from fragment 1 persists into 2..N; guarding
+   * on X there would forward X=1 packets with no real extension → ~75% loss.
+   * Verified by the live-decode E2E (framesDecoded>0, zero loss).               */
   if (size >= 12 && (data[1] & 0x7f) == PT_H264) {
-    size = rtp_insert_abs_send_time(data, size, RTP_EXT_ID_ABS_SEND_TIME,
-                                    peer_connection_abs_send_time_24());
+    /* Extract the RTP timestamp from the packet (bytes 4..7, big-endian). */
+    uint32_t rtp_ts = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16)
+                    | ((uint32_t)data[6] <<  8) |  (uint32_t)data[7];
+    int is_first_packet = (rtp_ts != pc->last_rtp_ts);
+    pc->last_rtp_ts = rtp_ts;
+
+    size = rtp_insert_extensions(data, size,
+                                 peer_connection_abs_send_time_24(),
+                                 is_first_packet,
+                                 pc->cur_frame_capture_ntp);
+
+    /* Track cumulative counters for RTCP SR.  Payload length = total packet
+     * size minus the 12-byte RTP fixed header (the extension is already part
+     * of the packet at this point, but SR octet count counts only payload
+     * octets per RFC 3550 §6.4.1; subtract the header only, not the ext).  */
+    pc->sr_packets_sent++;
+    if (size > 12)
+      pc->sr_octets_sent += (uint32_t)(size - 12);
   }
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
@@ -412,6 +464,10 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   memcpy(&pc->config, config, sizeof(PeerConfiguration));
 
+  /* Propagate the optional interface pin into the agent BEFORE agent_create so
+   * the UDP sockets are SO_BINDTODEVICE-bound at open time. */
+  memcpy(pc->agent.bind_iface, pc->config.bind_iface, sizeof(pc->agent.bind_iface));
+
   agent_create(&pc->agent);
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
@@ -470,6 +526,32 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
       last_state_logged = pc->state;
     }
     return -1;
+  }
+  /* Derive the frame's capture WALL-CLOCK (→ abs-capture-time) and refresh the
+   * SR reference pair. capture_time_ns is the frame's timestamp; on a real
+   * sensor it is CLOCK_MONOTONIC, so latency = (mono_now − capture) is a small
+   * positive number and capture_realtime = now − latency is exact. Some sources
+   * (notably the emulator) stamp frames with a synthetic stream-relative clock
+   * that is NOT comparable to CLOCK_MONOTONIC; an implausible latency detects
+   * that and we fall back to "captured ≈ now" (a valid wall-clock; g2g then
+   * omits only the small capture→send delay). Without this guard a foreign
+   * clock produces a years-off NTP and the browser computes nonsense g2g. */
+  {
+    struct timespec rt, mono;
+    clock_gettime(CLOCK_REALTIME,  &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    int64_t rt_ns   = (int64_t)rt.tv_sec   * 1000000000LL + rt.tv_nsec;
+    int64_t mono_ns = (int64_t)mono.tv_sec * 1000000000LL + mono.tv_nsec;
+    int64_t latency_ns = mono_ns - (int64_t)capture_time_ns;
+    int64_t capture_realtime_ns = (latency_ns >= 0 && latency_ns < 5000000000LL)
+                                    ? rt_ns - latency_ns
+                                    : rt_ns;
+    pc->cur_frame_capture_ntp = unix_ns_to_ntp((uint64_t)capture_realtime_ns);
+    /* SR reference: this frame's on-wire RTP timestamp paired with its capture
+     * NTP — a true (RTP, NTP) point in the wire timebase, consistent with both
+     * the per-packet RTP timestamps and abs-capture-time. */
+    pc->sr_ref_rtp = (uint32_t)((capture_time_ns * 90000ULL) / 1000000000ULL);
+    pc->sr_ref_ntp = pc->cur_frame_capture_ntp;
   }
   {
     static uint32_t debug_count = 0;
@@ -694,6 +776,41 @@ int peer_connection_loop(PeerConnection* pc) {
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
       }
 
+      /* ── Periodic RTCP Sender Report ───────────────────────────────────
+       * Send ~1 s SR for the video SSRC.  The SR's NTP↔RTP mapping lets
+       * Chrome's RemoteNtpTimeEstimator cancel inter-machine clock skew so
+       * requestVideoFrameCallback.captureTime is skew-free.
+       * Only emitted if we've sent at least one RTP packet (sr_packets_sent > 0)
+       * so we don't flood before the stream starts.                           */
+      {
+        uint32_t now_ms = ports_get_epoch_time();
+        if (pc->sr_packets_sent > 0 &&
+            (pc->last_sr_ms == 0 || (now_ms - pc->last_sr_ms) >= RTCP_SR_INTERVAL_MS)) {
+          pc->last_sr_ms = now_ms;
+
+          /* Use the most recent frame's (RTP, NTP) reference captured in
+           * send_video. This is a true point in the WIRE RTP timebase paired
+           * with its capture wall-clock, so the receiver's RTP↔NTP estimator
+           * stays consistent with the per-packet RTP timestamps and with
+           * abs-capture-time — even when the capture clock isn't CLOCK_MONOTONIC.
+           * (Independently sampling clock_gettime here desynced the mapping from
+           * the wire whenever capture_time_ns came from a foreign clock.)      */
+          uint64_t ntp_now    = pc->sr_ref_ntp;
+          uint32_t rtp_ts_now = pc->sr_ref_rtp;
+
+          uint8_t sr_buf[28 + SRTP_MAX_TRAILER_LEN + 4];
+          int sr_len = rtcp_build_sr(sr_buf, SSRC_H264, ntp_now, rtp_ts_now,
+                                     pc->sr_packets_sent, pc->sr_octets_sent);
+          dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, sr_buf, &sr_len);
+          if (sr_len > 0) {
+            agent_send(&pc->agent, sr_buf, (size_t)sr_len);
+            LOGD("RTCP SR sent: ntp=0x%016llx rtp_ts=%u pkts=%u octets=%u",
+                 (unsigned long long)ntp_now, rtp_ts_now,
+                 pc->sr_packets_sent, pc->sr_octets_sent);
+          }
+        }
+      }
+
       break;
     case PEER_CONNECTION_FAILED:
       break;
@@ -880,6 +997,14 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
 void peer_connection_on_remb(PeerConnection* pc,
                              void (*on_remb)(uint32_t bitrate_bps, void* userdata)) {
   pc->on_remb = on_remb;
+}
+
+int peer_connection_get_capture_ref(PeerConnection* pc, uint32_t* rtp, uint64_t* ntp) {
+  if (!pc || !rtp || !ntp || pc->sr_ref_ntp == 0)
+    return -1;  /* no video frame sent yet → no reference */
+  *rtp = pc->sr_ref_rtp;
+  *ntp = pc->sr_ref_ntp;
+  return 0;
 }
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {

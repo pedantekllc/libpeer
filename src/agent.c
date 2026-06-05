@@ -37,6 +37,9 @@ int agent_create(Agent* agent) {
     return ret;
   }
   LOGI("create IPv4 UDP socket: %d", agent->udp_sockets[0].fd);
+  /* Pin to the chosen NIC so egress media follows the advertised candidate
+   * (no-op when bind_iface is empty / on platforms without SO_BINDTODEVICE). */
+  udp_socket_bind_iface(&agent->udp_sockets[0], agent->bind_iface);
 
 #if CONFIG_IPV6
   if ((ret = udp_socket_open(&agent->udp_sockets[1], AF_INET6, 0)) < 0) {
@@ -44,6 +47,7 @@ int agent_create(Agent* agent) {
     return ret;
   }
   LOGI("create IPv6 UDP socket: %d", agent->udp_sockets[1].fd);
+  udp_socket_bind_iface(&agent->udp_sockets[1], agent->bind_iface);
 #endif
 
   agent_clear_candidates(agent);
@@ -132,7 +136,16 @@ static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, in
 
 static int agent_create_host_addr(Agent* agent) {
   int i, j;
-  const char* iface_prefx[] = {CONFIG_IFACE_PREFIX};
+  /* When the agent is pinned to an interface, gather the host candidate from
+   * exactly that NIC (its name is also an exact-match prefix for
+   * ports_get_host_addr). Otherwise fall back to the legacy compile-time
+   * prefix list / first-interface behaviour. */
+  const char* legacy_prefx[] = {CONFIG_IFACE_PREFIX};
+  const char* pinned_prefx[] = {agent->bind_iface};
+  const char** iface_prefx = (agent->bind_iface[0] != '\0') ? pinned_prefx : legacy_prefx;
+  const int iface_prefx_count = (agent->bind_iface[0] != '\0')
+                                    ? (int)(sizeof(pinned_prefx) / sizeof(pinned_prefx[0]))
+                                    : (int)(sizeof(legacy_prefx) / sizeof(legacy_prefx[0]));
   IceCandidate* ice_candidate;
   int addr_type[] = { AF_INET,
 #if CONFIG_IPV6
@@ -141,7 +154,7 @@ static int agent_create_host_addr(Agent* agent) {
   };
 
   for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
-    for (j = 0; j < sizeof(iface_prefx) / sizeof(iface_prefx[0]); j++) {
+    for (j = 0; j < iface_prefx_count; j++) {
       ice_candidate = agent->local_candidates + agent->local_candidates_count;
       // only copy port and family to addr of ice candidate
       ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_HOST,

@@ -38,6 +38,7 @@ void sdp_append_h264(char* sdp) {
    * offer transport-cc, so the browser falls back to REMB (ratecore §0/D1). */
   sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
   sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time");
+  sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
