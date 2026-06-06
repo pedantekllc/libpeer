@@ -19,6 +19,7 @@ endif()
 project(peer)
 
 option(ENABLE_TESTS "Enable tests" OFF)
+option(ENABLE_EXAMPLES "Build standalone example executables" ON)
 option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(ADDRESS_SANITIZER "Build with AddressSanitizer." OFF)
 option(MEMORY_SANITIZER "Build with MemorySanitizer." OFF)
@@ -62,7 +63,13 @@ endif()
 add_definitions("-Wunused-variable -Werror=sequence-point -Werror=pointer-sign -Werror=return-type -Werror=sizeof-pointer-memaccess -Wincompatible-pointer-types -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
 
 add_subdirectory(src)
-add_subdirectory(examples)
+# Examples are standalone demo executables that link libpeer. With
+# LOG_REDIRECT=1 (the camera build) they'd fail to link — peer_log is provided
+# by the host app, not libpeer — so the embed-sdk build disables them. They are
+# not needed by the camera/runtime; default stays ON for standalone libpeer.
+if(ENABLE_EXAMPLES)
+  add_subdirectory(examples)
+endif()
 
 if(ENABLE_TESTS)
   add_subdirectory(tests)

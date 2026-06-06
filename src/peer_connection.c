@@ -575,18 +575,18 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
       LOGW("[ts-debug] send_video OK: pc->state=COMPLETED");
       last_state_logged_ok = pc->state;
     }
-    if (debug_count % 30 == 0 && last_cap_ns != 0) {
+    if (debug_count % 300 == 0 && last_cap_ns != 0) {  /* ~10s @ 30fps */
       uint64_t cap_dt_ns = capture_time_ns - last_cap_ns;
       uint32_t rtp_dt = rtp_ts_now - last_rtp_ts;
-      double cap_dt_ms = cap_dt_ns / 1e6 / 30.0;
-      double rtp_dt_per_call = (double)rtp_dt / 30.0;
+      double cap_dt_ms = cap_dt_ns / 1e6 / 300.0;
+      double rtp_dt_per_call = (double)rtp_dt / 300.0;
       double encode_avg_ms = (double)encode_total_ns / debug_count / 1e6;
       double encode_max_ms = (double)encode_max_ns / 1e6;
       LOGI("[ts-debug] libpeer send_video #%u  cap_dt=%.3fms/frame  "
            "rtp_dt=%.1fticks/frame  encode_avg=%.3fms  encode_max=%.3fms",
            debug_count, cap_dt_ms, rtp_dt_per_call, encode_avg_ms, encode_max_ms);
     }
-    if (debug_count % 30 == 0 || debug_count == 1) {
+    if (debug_count % 300 == 0 || debug_count == 1) {
       last_cap_ns = capture_time_ns;
       last_rtp_ts = rtp_ts_now;
     }
