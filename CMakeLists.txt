@@ -105,6 +105,12 @@ ExternalProject_Add(usrsctp
   CMAKE_ARGS
     -DCMAKE_C_FLAGS="-fPIC"
     -Dsctp_build_programs=off
+    # usrsctp defaults sctp_werror=ON (blanket -Werror). Under an optimizing
+    # cross toolchain (e.g. Bootlin GCC 13 at -Os in a buildroot Release build)
+    # -Wformat-truncation fires inside usrsctp's own sources and the blanket
+    # -Werror makes it fatal. usrsctp is third-party; don't let its warnings
+    # break our build. Disable it explicitly.
+    -Dsctp_werror=0
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
 )
