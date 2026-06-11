@@ -58,7 +58,7 @@
 #endif
 
 #ifndef CONFIG_MAX_NALU_SIZE
-#define CONFIG_MAX_NALU_SIZE (10 * 1024)  // 10KB
+#define CONFIG_MAX_NALU_SIZE (2 * 1024 * 1024)  // 2MB — must hold one whole H.264 NALU; a 4K IDR (RTSP-ingest gateway) is hundreds of KB, far over the old 10KB
 #endif
 
 #define CONFIG_IPV6 0

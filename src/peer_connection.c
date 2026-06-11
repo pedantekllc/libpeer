@@ -496,6 +496,8 @@ void peer_connection_destroy(PeerConnection* pc) {
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
+    rtp_decoder_deinit(&pc->vrtp_decoder);
+    rtp_decoder_deinit(&pc->artp_decoder);
     if (pc->frag_state) {
       free(pc->frag_state);
     }
