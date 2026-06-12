@@ -11,6 +11,7 @@
 #endif
 
 void sdp_append_h264(char* sdp);
+void sdp_append_h264_fec(char* sdp);
 
 void sdp_append_pcma(char* sdp);
 

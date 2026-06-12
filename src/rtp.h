@@ -26,7 +26,13 @@ typedef enum RtpPayloadType {
   PT_PCMA = 8,
   PT_G722 = 9,
   PT_H264 = 96,
-  PT_OPUS = 111
+  PT_OPUS = 111,
+  /* RED (RFC 2198) + ULPFEC (RFC 5109) — send-side FEC for video. Dynamic
+   * PTs we offer in sdp_append_h264_fec(); the browser answers with the
+   * offerer's numbers. Media rides inside RED; FEC packets share the SSRC
+   * and sequence space. */
+  PT_RED = 118,
+  PT_ULPFEC = 119
 
 } RtpPayloadType;
 

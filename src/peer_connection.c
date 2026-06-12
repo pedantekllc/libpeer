@@ -87,6 +87,20 @@ struct PeerConnection {
   double pacer_budget_bytes;      /* current bucket level (may go negative)   */
   struct timespec pacer_last;     /* last refill time (CLOCK_MONOTONIC)       */
 
+  /* ── ULPFEC/RED send state (see PeerConfiguration.fec) ────────────────────
+   * All touched only on the send path (per-lane send worker). The chokepoint
+   * owns the outgoing sequence space when FEC is on (media + FEC interleave
+   * on one SSRC), so it re-stamps every header from out_seq. */
+  uint16_t out_seq;
+  int      fec_group_cnt;            /* media packets in the open group      */
+  uint16_t fec_snbase;               /* seq of the group's first packet      */
+  size_t   fec_maxlen;               /* protection length = max(len - 12)    */
+  uint8_t  fec_hdr_xor[2];           /* XOR: byte0&0x3F (P|X|CC), byte1 (M|PT)*/
+  uint8_t  fec_ts_xor[4];            /* XOR of media timestamps              */
+  uint16_t fec_len_xor;              /* XOR of media payload lengths         */
+  uint8_t  fec_last_hdr[12];         /* last media fixed header (TS/SSRC src)*/
+  uint8_t  fec_xor[CONFIG_MTU + 128];/* XOR of media bytes [12..]            */
+
   /* SR reference pair, refreshed every frame in send_video: the most recent
    * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
    * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
@@ -156,6 +170,127 @@ void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
   if (pc) pc->pacer_bps = bps;
 }
 
+/* Final transmit tail shared by media and FEC packets: SRTP protect, pace,
+ * send. (The pre-SRTP form is what FEC protects, so XOR accumulation happens
+ * before this is called.) */
+static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t size) {
+  dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
+  peer_connection_pace(pc, size);
+  agent_send(&pc->agent, data, size);
+}
+
+/* One XOR repair packet per this many media packets (or at frame end with at
+ * least 2 accumulated). Repairs any SINGLE loss within the group. */
+#define FEC_GROUP_SIZE 6
+
+/* Accumulate one media packet (its FINAL pre-SRTP form: header + extensions +
+ * payload, PT still the media PT, seq already final) into the open FEC group.
+ * Field layout per RFC 5109 §7.4: the FEC header recovers P/X/CC/M/PT/TS/len
+ * by XOR; the level-0 payload XOR covers everything after the fixed 12-byte
+ * header. */
+static void peer_connection_fec_accumulate(PeerConnection* pc, const uint8_t* data, size_t size) {
+  if (size < 12) return;
+  size_t plen = size - 12;
+  if (plen > sizeof(pc->fec_xor)) plen = sizeof(pc->fec_xor);
+
+  if (pc->fec_group_cnt == 0) {
+    pc->fec_snbase = (uint16_t)((data[2] << 8) | data[3]);
+    pc->fec_maxlen = 0;
+    pc->fec_len_xor = 0;
+    memset(pc->fec_hdr_xor, 0, sizeof(pc->fec_hdr_xor));
+    memset(pc->fec_ts_xor, 0, sizeof(pc->fec_ts_xor));
+    memset(pc->fec_xor, 0, sizeof(pc->fec_xor));
+  }
+
+  pc->fec_hdr_xor[0] ^= data[0] & 0x3F;          /* P, X, CC                  */
+  pc->fec_hdr_xor[1] ^= data[1];                 /* M, PT                     */
+  for (int i = 0; i < 4; i++) pc->fec_ts_xor[i] ^= data[4 + i];
+  pc->fec_len_xor ^= (uint16_t)plen;
+  /* XOR the post-header bytes, but with MUTABLE header extensions zeroed —
+   * libwebrtc's receiver zeroes abs-send-time (ext id 3) before FEC decode
+   * (RtpPacket::ZeroMutableExtensions, webrtc bug 7859), so parity computed
+   * over the live value yields corrupt recoveries. Our extension block layout
+   * is fixed (built by rtp_insert_extensions): 0xBEDE at [12], abs-send-time
+   * element data at [17..19]. abs-capture-time (id 4) is NOT mutable. */
+  size_t skip_lo = 0, skip_hi = 0;
+  if ((data[0] & 0x10) && size >= 20 &&
+      data[12] == 0xBE && data[13] == 0xDE &&
+      (data[16] >> 4) == 3 /* RTP_EXT_ID_ABS_SEND_TIME */) {
+    skip_lo = 17 - 12;   /* offsets relative to byte 12 */
+    skip_hi = 20 - 12;
+  }
+  for (size_t i = 0; i < plen; i++) {
+    uint8_t b = data[12 + i];
+    if (skip_hi && i >= skip_lo && i < skip_hi) b = 0;
+    pc->fec_xor[i] ^= b;
+  }
+  if (plen > pc->fec_maxlen) pc->fec_maxlen = plen;
+  memcpy(pc->fec_last_hdr, data, 12);
+  pc->fec_group_cnt++;
+}
+
+/* Emit the repair packet for the open group (RED-encapsulated ULPFEC on the
+ * same SSRC, next sequence number) and reset the group. */
+static void peer_connection_fec_flush(PeerConnection* pc) {
+  int cnt = pc->fec_group_cnt;
+  if (cnt < 2) { pc->fec_group_cnt = 0; return; }
+
+  uint8_t buf[12 + 1 + 10 + 4 + sizeof(pc->fec_xor)];
+  uint16_t seq = pc->out_seq++;
+
+  /* RTP header: V=2, M=0, PT=RED; TS/SSRC from the last protected packet. */
+  buf[0] = 0x80;
+  buf[1] = PT_RED;
+  buf[2] = (uint8_t)(seq >> 8);
+  buf[3] = (uint8_t)(seq & 0xFF);
+  memcpy(buf + 4, pc->fec_last_hdr + 4, 4);   /* timestamp */
+  memcpy(buf + 8, pc->fec_last_hdr + 8, 4);   /* SSRC      */
+
+  size_t off = 12;
+  buf[off++] = PT_ULPFEC & 0x7F;              /* RED header: F=0, block PT   */
+
+  /* FEC header (10 bytes, RFC 5109 §7.3): E=0, L=0 (16-bit mask). */
+  buf[off++] = pc->fec_hdr_xor[0];            /* E|L=0 | P|X|CC recovery     */
+  buf[off++] = pc->fec_hdr_xor[1];            /* M | PT recovery             */
+  buf[off++] = (uint8_t)(pc->fec_snbase >> 8);
+  buf[off++] = (uint8_t)(pc->fec_snbase & 0xFF);
+  memcpy(buf + off, pc->fec_ts_xor, 4); off += 4;
+  buf[off++] = (uint8_t)(pc->fec_len_xor >> 8);
+  buf[off++] = (uint8_t)(pc->fec_len_xor & 0xFF);
+
+  /* Level 0 header: protection length + mask (bit i of the 16 = snbase+i,
+   * MSB first; the group is consecutive). */
+  uint16_t mask = (uint16_t)(((1u << cnt) - 1u) << (16 - cnt));
+  buf[off++] = (uint8_t)(pc->fec_maxlen >> 8);
+  buf[off++] = (uint8_t)(pc->fec_maxlen & 0xFF);
+  buf[off++] = (uint8_t)(mask >> 8);
+  buf[off++] = (uint8_t)(mask & 0xFF);
+
+  memcpy(buf + off, pc->fec_xor, pc->fec_maxlen);
+  off += pc->fec_maxlen;
+
+  pc->fec_group_cnt = 0;
+  peer_connection_xmit_rtp(pc, buf, off);
+}
+
+/* RED-encapsulate a media packet in place: 1-byte RED header (F=0 | media PT)
+ * inserted at the start of the payload (after header + extensions), RTP PT
+ * rewritten to RED. Returns the new size. */
+static size_t peer_connection_red_wrap(uint8_t* data, size_t size) {
+  size_t hdr = 12;
+  if (data[0] & 0x10) {                        /* X bit: skip extension block */
+    if (size < hdr + 4) return size;
+    uint16_t words = (uint16_t)((data[hdr + 2] << 8) | data[hdr + 3]);
+    hdr += 4 + 4u * words;
+  }
+  if (size < hdr) return size;
+  memmove(data + hdr + 1, data + hdr, size - hdr);
+  uint8_t media_pt = data[1] & 0x7F;
+  data[hdr] = media_pt;                        /* F=0 | block PT              */
+  data[1] = (data[1] & 0x80) | PT_RED;
+  return size + 1;
+}
+
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
   /* Stamp abs-send-time on every outgoing VIDEO RTP packet (PT_H264=96) so the
@@ -190,9 +325,33 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     if (size > 12)
       pc->sr_octets_sent += (uint32_t)(size - 12);
   }
-  dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
-  peer_connection_pace(pc, size);
-  agent_send(&pc->agent, data, size);
+  if (pc->config.fec && size >= 12 && (data[1] & 0x7F) == PT_H264) {
+    /* FEC path: the chokepoint owns the sequence space (media + repair
+     * packets interleave on one SSRC), so re-stamp the encoder's seq. */
+    uint16_t seq = pc->out_seq++;
+    data[2] = (uint8_t)(seq >> 8);
+    data[3] = (uint8_t)(seq & 0xFF);
+    int frame_end = (data[1] & 0x80) != 0;     /* marker = last pkt of AU    */
+
+    peer_connection_fec_accumulate(pc, data, size);   /* pre-RED media form  */
+    size = peer_connection_red_wrap(data, size);
+    peer_connection_xmit_rtp(pc, data, size);
+
+    /* CRITICAL: the FU-A packetizer REUSES this buffer for the next fragment
+     * and rewrites payload/seq/marker but NOT the PT byte (same buffer-reuse
+     * trap the extensions comment above describes). Leaving PT=RED here makes
+     * every subsequent fragment skip this branch and go out unstamped/unwrapped
+     * on the encoder's own seq space — two interleaved sequence spaces, and
+     * the receiver rejects nearly everything. Restore the media PT. */
+    data[1] = (uint8_t)((frame_end ? 0x80 : 0x00) | PT_H264);
+
+    if (pc->fec_group_cnt >= FEC_GROUP_SIZE ||
+        (frame_end && pc->fec_group_cnt >= 2)) {
+      peer_connection_fec_flush(pc);
+    }
+    return;
+  }
+  peer_connection_xmit_rtp(pc, data, size);
 }
 
 /*
@@ -982,7 +1141,10 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
 
   if (pc->config.video_codec == CODEC_H264) {
-    sdp_append_h264(pc->sdp);
+    if (pc->config.fec)
+      sdp_append_h264_fec(pc->sdp);
+    else
+      sdp_append_h264(pc->sdp);
   }
 
   switch (pc->config.audio_codec) {

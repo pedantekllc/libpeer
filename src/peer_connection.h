@@ -100,6 +100,16 @@ typedef struct PeerConfiguration {
    * Runtime updates via peer_connection_set_pacer_bps(). */
   uint32_t pacer_bps;
 
+  /* Send-side forward error correction for video: ULPFEC (RFC 5109) over RED
+   * (RFC 2198), the FEC all major browsers can receive. Media is RED-
+   * encapsulated; one XOR repair packet is emitted per group of
+   * FEC_GROUP_SIZE media packets (or at frame end), sharing the video SSRC
+   * and sequence space. Repairs random single losses per group without RTX
+   * round trips — this fork sends no retransmissions, so without FEC every
+   * lost packet costs a PLI -> fresh keyframe. ~15-20%% bandwidth overhead
+   * when enabled. 0 = off (default). */
+  uint8_t fec;
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;
