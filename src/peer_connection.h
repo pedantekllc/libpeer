@@ -110,6 +110,14 @@ typedef struct PeerConfiguration {
    * when enabled. 0 = off (default). */
   uint8_t fec;
 
+  /* RTX retransmissions (RFC 4588): keep a short history of sent video RTP
+   * packets and answer the receiver's RTCP Generic NACKs with retransmits on
+   * a dedicated SSRC/PT (negotiated via rtx/apt + ssrc-group:FID — both
+   * Chrome and Firefox use it by default). Without it every lost packet
+   * costs a PLI -> full keyframe. ~770KB history per peer when enabled.
+   * 0 = off. */
+  uint8_t rtx;
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;

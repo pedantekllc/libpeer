@@ -32,7 +32,11 @@ typedef enum RtpPayloadType {
    * offerer's numbers. Media rides inside RED; FEC packets share the SSRC
    * and sequence space. */
   PT_RED = 118,
-  PT_ULPFEC = 119
+  PT_ULPFEC = 119,
+  /* RTX retransmissions (RFC 4588): separate SSRC (RTX_SSRC), own sequence
+   * space, payload = 2-byte OSN + original payload. Offered as
+   * "a=rtpmap:97 rtx/90000" + "a=fmtp:97 apt=96" + ssrc-group:FID. */
+  PT_RTX = 97
 
 } RtpPayloadType;
 

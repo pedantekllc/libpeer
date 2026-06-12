@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,22 @@
 
 /* Forward declaration for fragment state */
 typedef struct dtls_fragment_state_s dtls_fragment_state_t;
+
+/* ── RTX retransmission machinery (RFC 4588) ──────────────────────────────── */
+
+#define RTX_SSRC          2u     /* media is a=ssrc:1; FID-paired in the SDP  */
+#define RTX_HISTORY_SLOTS 512    /* ~0.5-2.5s of video at typical rates       */
+#define RTX_SLOT_BYTES    (CONFIG_MTU + 128)
+/* Don't answer repeat-NACKs for the same seq more often than this. */
+#define RTX_MIN_RESEND_MS 40
+
+typedef struct {
+  uint16_t seq;            /* media seq stored here (slot = seq % SLOTS)      */
+  uint16_t len;            /* 0 = empty                                       */
+  uint32_t last_resend_ms; /* monotonic ms of last retransmit of this seq     */
+  uint8_t  data[RTX_SLOT_BYTES];   /* final pre-SRTP media packet             */
+} rtx_slot_t;
+
 
 struct PeerConnection {
   PeerConfiguration config;
@@ -101,6 +118,14 @@ struct PeerConnection {
   uint8_t  fec_last_hdr[12];         /* last media fixed header (TS/SSRC src)*/
   uint8_t  fec_xor[CONFIG_MTU + 128];/* XOR of media bytes [12..]            */
 
+  /* ── RTX retransmission state (see PeerConfiguration.rtx) ─────────────────
+   * History is WRITTEN by the send path (per-lane send worker, at the
+   * chokepoint) and READ by the NACK handler (reactor thread, inside
+   * incoming_rtcp) — guarded by rtx_mtx. */
+  rtx_slot_t* rtx_history;           /* RTX_HISTORY_SLOTS slots; NULL = off  */
+  pthread_mutex_t rtx_mtx;
+  uint16_t rtx_seq;                  /* RTX stream's own sequence space      */
+
   /* SR reference pair, refreshed every frame in send_video: the most recent
    * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
    * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
@@ -121,6 +146,22 @@ static uint32_t peer_connection_abs_send_time_24(void) {
   uint64_t secs = (uint64_t)ts.tv_sec;
   uint64_t frac = ((uint64_t)ts.tv_nsec << 18) / 1000000000ULL;  /* < 2^18 */
   return (uint32_t)(((secs << 18) + frac) & 0x00FFFFFFULL);
+}
+
+static uint32_t rtx_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint32_t)((uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull);
+}
+
+/* Payload offset = fixed header + extension block (CSRC always 0 here). */
+static size_t rtp_payload_offset(const uint8_t* data, size_t size) {
+  size_t hdr = 12;
+  if (size >= 16 && (data[0] & 0x10)) {
+    uint16_t words = (uint16_t)((data[hdr + 2] << 8) | data[hdr + 3]);
+    hdr += 4 + 4u * words;
+  }
+  return hdr <= size ? hdr : size;
 }
 
 /* Burst allowance: a dozen MTUs may leave back-to-back before pacing kicks in,
@@ -177,6 +218,73 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   peer_connection_pace(pc, size);
   agent_send(&pc->agent, data, size);
+}
+
+/* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
+ * retransmission. Send-worker thread; the NACK reader holds the same mutex. */
+static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size) {
+  if (!pc->rtx_history || size < 12 || size > RTX_SLOT_BYTES) return;
+  uint16_t seq = (uint16_t)((data[2] << 8) | data[3]);
+  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
+  pthread_mutex_lock(&pc->rtx_mtx);
+  slot->seq = seq;
+  slot->len = (uint16_t)size;
+  slot->last_resend_ms = 0;
+  memcpy(slot->data, data, size);
+  pthread_mutex_unlock(&pc->rtx_mtx);
+}
+
+/* Answer one NACKed sequence number with an RTX packet (RFC 4588: original
+ * header with RTX SSRC/PT/seq, payload = 2-byte OSN + original payload).
+ * Reactor thread — sends directly, NEVER through the pacer (a pacer sleep
+ * here would stall signaling for every peer). */
+static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
+  uint8_t buf[RTX_SLOT_BYTES + 2 + 64];   /* +OSN +SRTP trailer slack */
+  size_t out_len = 0;
+
+  pthread_mutex_lock(&pc->rtx_mtx);
+  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
+  if (slot->len >= 12 && slot->seq == seq) {
+    uint32_t now = rtx_now_ms();
+    if (slot->last_resend_ms == 0 || now - slot->last_resend_ms >= RTX_MIN_RESEND_MS) {
+      slot->last_resend_ms = now;
+      size_t off = rtp_payload_offset(slot->data, slot->len);
+      /* header + extensions verbatim, then OSN, then original payload */
+      memcpy(buf, slot->data, off);
+      buf[off]     = (uint8_t)(seq >> 8);          /* OSN */
+      buf[off + 1] = (uint8_t)(seq & 0xFF);
+      memcpy(buf + off + 2, slot->data + off, slot->len - off);
+      out_len = slot->len + 2;
+      /* rewrite identity: RTX PT (marker preserved), own seq, RTX SSRC */
+      uint16_t rseq = pc->rtx_seq++;
+      buf[1] = (uint8_t)((buf[1] & 0x80) | PT_RTX);
+      buf[2] = (uint8_t)(rseq >> 8);
+      buf[3] = (uint8_t)(rseq & 0xFF);
+      buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = RTX_SSRC;
+    }
+  }
+  pthread_mutex_unlock(&pc->rtx_mtx);
+
+  if (out_len > 0) {
+    dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
+    agent_send(&pc->agent, buf, out_len);
+  }
+}
+
+/* Parse one RTCP Generic NACK (RTPFB fmt=1) and retransmit every named seq.
+ * FCI = N x { PID(16) | BLP(16) }: PID itself plus each set BLP bit (PID+i+1). */
+static void peer_connection_handle_nack(PeerConnection* pc, const uint8_t* fb, size_t len) {
+  if (!pc->config.rtx || !pc->rtx_history || len < 16) return;
+  size_t fci = 12;                       /* hdr(4) + sender ssrc + media ssrc */
+  while (fci + 4 <= len) {
+    uint16_t pid = (uint16_t)((fb[fci] << 8) | fb[fci + 1]);
+    uint16_t blp = (uint16_t)((fb[fci + 2] << 8) | fb[fci + 3]);
+    peer_connection_rtx_resend(pc, pid);
+    for (int i = 0; i < 16; i++) {
+      if (blp & (1u << i)) peer_connection_rtx_resend(pc, (uint16_t)(pid + i + 1));
+    }
+    fci += 4;
+  }
 }
 
 /* One XOR repair packet per this many media packets (or at frame end with at
@@ -350,6 +458,9 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
       peer_connection_fec_flush(pc);
     }
     return;
+  }
+  if (pc->rtx_history && size >= 12 && (data[1] & 0x7F) == PT_H264) {
+    peer_connection_rtx_store(pc, data, size);
   }
   peer_connection_xmit_rtp(pc, data, size);
 }
@@ -613,6 +724,15 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
           }
         }
         break;
+      case RTCP_RTPFB: {
+        /* Transport-layer FB; fmt 1 = Generic NACK -> RTX retransmits. */
+        if (rtcp_header->rc == 1) {
+          size_t fb_len = 4u * ntohs(rtcp_header->length) + 4u;
+          if (pos + fb_len <= len)
+            peer_connection_handle_nack(pc, buf + pos, fb_len);
+        }
+        break;
+      }
       case RTCP_PSFB: {
         int fmt = rtcp_header->rc;
         LOGD("RTCP_PSFB %d", fmt);
@@ -683,6 +803,14 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   /* Send pacer initial rate (0 = off); see PeerConfiguration.pacer_bps. */
   pc->pacer_bps = pc->config.pacer_bps;
 
+  /* RTX: history ring + lock (skipped entirely when disabled). */
+  pthread_mutex_init(&pc->rtx_mtx, NULL);
+  if (pc->config.rtx) {
+    pc->rtx_history = calloc(RTX_HISTORY_SLOTS, sizeof(rtx_slot_t));
+    if (!pc->rtx_history)
+      LOGW("rtx history alloc failed - retransmissions disabled for this peer");
+  }
+
   /* Propagate the optional interface pin into the agent BEFORE agent_create so
    * the UDP sockets are SO_BINDTODEVICE-bound at open time. */
   memcpy(pc->agent.bind_iface, pc->config.bind_iface, sizeof(pc->agent.bind_iface));
@@ -720,6 +848,8 @@ void peer_connection_destroy(PeerConnection* pc) {
     if (pc->frag_state) {
       free(pc->frag_state);
     }
+    free(pc->rtx_history);
+    pthread_mutex_destroy(&pc->rtx_mtx);
     free(pc);
     pc = NULL;
   }
@@ -1143,6 +1273,8 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   if (pc->config.video_codec == CODEC_H264) {
     if (pc->config.fec)
       sdp_append_h264_fec(pc->sdp);
+    else if (pc->config.rtx && pc->rtx_history)
+      sdp_append_h264_rtx(pc->sdp);
     else
       sdp_append_h264(pc->sdp);
   }
