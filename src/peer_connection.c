@@ -78,6 +78,15 @@ struct PeerConnection {
   /* Wall-clock ms of the last SR send (from ports_get_epoch_time()).        */
   uint32_t last_sr_ms;
 
+  /* ── Send pacer (see PeerConfiguration.pacer_bps) ─────────────────────────
+   * Token bucket drained at the send chokepoint. All state below is touched
+   * ONLY on the send path's thread (per-lane send worker); pacer_bps itself
+   * is also written by the controller thread via the setter (benign aligned-
+   * word race). */
+  uint32_t pacer_bps;             /* 0 = pacing disabled                      */
+  double pacer_budget_bytes;      /* current bucket level (may go negative)   */
+  struct timespec pacer_last;     /* last refill time (CLOCK_MONOTONIC)       */
+
   /* SR reference pair, refreshed every frame in send_video: the most recent
    * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
    * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
@@ -98,6 +107,53 @@ static uint32_t peer_connection_abs_send_time_24(void) {
   uint64_t secs = (uint64_t)ts.tv_sec;
   uint64_t frac = ((uint64_t)ts.tv_nsec << 18) / 1000000000ULL;  /* < 2^18 */
   return (uint32_t)(((secs << 18) + frac) & 0x00FFFFFFULL);
+}
+
+/* Burst allowance: a dozen MTUs may leave back-to-back before pacing kicks in,
+ * so small frames (P-frames of a few packets) are never delayed at all. */
+#define PACER_BURST_BYTES 16384.0
+/* Per-packet sleep cap — guards against a pathological/zeroed rate stalling a
+ * send worker for seconds. 50 ms at 1300 B implies a ~200 kbps floor. */
+#define PACER_MAX_SLEEP_S 0.05
+
+/*
+ * Token-bucket send pacer. Refill at pacer_bps, spend per packet; when the
+ * bucket goes negative, sleep until it would be level again. Runs on the
+ * per-lane send worker, so a sleep delays only THIS peer's packets (the frame
+ * thread already handed the access unit off via the lane ring).
+ */
+static void peer_connection_pace(PeerConnection* pc, size_t bytes) {
+  uint32_t bps = pc->pacer_bps;
+  if (bps == 0) return;
+
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (pc->pacer_last.tv_sec == 0 && pc->pacer_last.tv_nsec == 0) {
+    pc->pacer_last = now;
+    pc->pacer_budget_bytes = PACER_BURST_BYTES;
+  }
+  double elapsed = (double)(now.tv_sec - pc->pacer_last.tv_sec) +
+                   (double)(now.tv_nsec - pc->pacer_last.tv_nsec) / 1e9;
+  pc->pacer_last = now;
+
+  pc->pacer_budget_bytes += elapsed * (double)bps / 8.0;
+  if (pc->pacer_budget_bytes > PACER_BURST_BYTES)
+    pc->pacer_budget_bytes = PACER_BURST_BYTES;
+
+  pc->pacer_budget_bytes -= (double)bytes;
+  if (pc->pacer_budget_bytes < 0) {
+    double wait_s = -pc->pacer_budget_bytes * 8.0 / (double)bps;
+    if (wait_s > PACER_MAX_SLEEP_S) wait_s = PACER_MAX_SLEEP_S;
+    struct timespec ts;
+    ts.tv_sec = (time_t)wait_s;
+    ts.tv_nsec = (long)((wait_s - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+    /* The deficit is repaid by the elapsed-time refill on the next call. */
+  }
+}
+
+void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
+  if (pc) pc->pacer_bps = bps;
 }
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -135,6 +191,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
       pc->sr_octets_sent += (uint32_t)(size - 12);
   }
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
+  peer_connection_pace(pc, size);
   agent_send(&pc->agent, data, size);
 }
 
@@ -463,6 +520,9 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   }
 
   memcpy(&pc->config, config, sizeof(PeerConfiguration));
+
+  /* Send pacer initial rate (0 = off); see PeerConfiguration.pacer_bps. */
+  pc->pacer_bps = pc->config.pacer_bps;
 
   /* Propagate the optional interface pin into the agent BEFORE agent_create so
    * the UDP sockets are SO_BINDTODEVICE-bound at open time. */

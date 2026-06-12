@@ -89,9 +89,24 @@ typedef struct PeerConfiguration {
    * 16 == IFNAMSIZ. */
   char bind_iface[16];
 
+  /* Optional send pacer: cap the instantaneous outgoing RTP rate to this many
+   * bits/sec by sleeping between packets at the send chokepoint (token bucket
+   * with a small burst allowance). Without it, one large access unit (a 4K
+   * keyframe = hundreds of packets) is blasted back-to-back at line rate and
+   * overflows shallow downstream queues (Wi-Fi APs) — bursty loss that NACK
+   * recovery then amplifies. Pace at a MULTIPLE of the stream rate (libwebrtc
+   * uses ~2.5x): pacing smooths bursts, it must not throttle below the
+   * encoder's output. 0 = disabled (legacy line-rate bursts).
+   * Runtime updates via peer_connection_set_pacer_bps(). */
+  uint32_t pacer_bps;
+
 } PeerConfiguration;
 
 typedef struct PeerConnection PeerConnection;
+
+/* Update the send pacer rate at runtime (0 = disable). Written by the
+ * controller thread, read by the send path — a benign aligned-word race. */
+void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps);
 
 const char* peer_connection_state_to_string(PeerConnectionState state);
 
