@@ -126,6 +126,14 @@ struct PeerConnection {
   pthread_mutex_t rtx_mtx;
   uint16_t rtx_seq;                  /* RTX stream's own sequence space      */
 
+  /* Serialises every srtp_protect/_rtcp + agent_send on this connection.
+   * libsrtp sessions are NOT thread-safe, and three threads transmit: the
+   * per-lane send worker (media), the reactor (RTX retransmits + RTCP SR).
+   * Unguarded concurrency here corrupts the SRTP stream state — observed as
+   * a SIGSEGV on the gateway under Wi-Fi NACK storms. The pacer sleep stays
+   * OUTSIDE this lock so the reactor never waits on a pace. */
+  pthread_mutex_t send_mtx;
+
   /* SR reference pair, refreshed every frame in send_video: the most recent
    * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
    * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
@@ -215,9 +223,13 @@ void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
  * send. (The pre-SRTP form is what FEC protects, so XOR accumulation happens
  * before this is called.) */
 static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t size) {
+  /* Pace BEFORE taking the send lock (sleeps must never hold it); budget on
+   * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
+  peer_connection_pace(pc, size + 10);
+  pthread_mutex_lock(&pc->send_mtx);
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
-  peer_connection_pace(pc, size);
   agent_send(&pc->agent, data, size);
+  pthread_mutex_unlock(&pc->send_mtx);
 }
 
 /* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
@@ -266,8 +278,10 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_unlock(&pc->rtx_mtx);
 
   if (out_len > 0) {
+    pthread_mutex_lock(&pc->send_mtx);
     dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
     agent_send(&pc->agent, buf, out_len);
+    pthread_mutex_unlock(&pc->send_mtx);
   }
 }
 
@@ -805,6 +819,7 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   /* RTX: history ring + lock (skipped entirely when disabled). */
   pthread_mutex_init(&pc->rtx_mtx, NULL);
+  pthread_mutex_init(&pc->send_mtx, NULL);
   if (pc->config.rtx) {
     pc->rtx_history = calloc(RTX_HISTORY_SLOTS, sizeof(rtx_slot_t));
     if (!pc->rtx_history)
@@ -850,6 +865,7 @@ void peer_connection_destroy(PeerConnection* pc) {
     }
     free(pc->rtx_history);
     pthread_mutex_destroy(&pc->rtx_mtx);
+    pthread_mutex_destroy(&pc->send_mtx);
     free(pc);
     pc = NULL;
   }
@@ -1152,6 +1168,7 @@ int peer_connection_loop(PeerConnection* pc) {
           uint8_t sr_buf[28 + SRTP_MAX_TRAILER_LEN + 4];
           int sr_len = rtcp_build_sr(sr_buf, SSRC_H264, ntp_now, rtp_ts_now,
                                      pc->sr_packets_sent, pc->sr_octets_sent);
+          pthread_mutex_lock(&pc->send_mtx);
           dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, sr_buf, &sr_len);
           if (sr_len > 0) {
             agent_send(&pc->agent, sr_buf, (size_t)sr_len);
@@ -1159,6 +1176,7 @@ int peer_connection_loop(PeerConnection* pc) {
                  (unsigned long long)ntp_now, rtp_ts_now,
                  pc->sr_packets_sent, pc->sr_octets_sent);
           }
+          pthread_mutex_unlock(&pc->send_mtx);
         }
       }
 
