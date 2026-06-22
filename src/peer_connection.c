@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -830,6 +831,9 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
    * the UDP sockets are SO_BINDTODEVICE-bound at open time. */
   memcpy(pc->agent.bind_iface, pc->config.bind_iface, sizeof(pc->agent.bind_iface));
 
+  /* Propagate the optional fixed media port (0 = ephemeral). */
+  pc->agent.media_port = pc->config.media_port;
+
   agent_create(&pc->agent);
 
   memset(&pc->sctp, 0, sizeof(pc->sctp));
@@ -1046,6 +1050,8 @@ int peer_connection_loop(PeerConnection* pc) {
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
+  LOGI("peer_connection_loop: state=%d", pc->state);
+
   switch (pc->state) {
     case PEER_CONNECTION_NEW:
       break;
@@ -1063,6 +1069,7 @@ int peer_connection_loop(PeerConnection* pc) {
        * This is critical for multi-client support - mbedtls uses the transport ID
        * (derived from this address) to distinguish between simultaneous DTLS sessions.
        * Without a unique transport ID per client, cookies and sessions get confused. */
+      LOGI("Starting DTLS handshake (PEER_CONNECTION_CONNECTED)");
       int dtls_ret = dtls_srtp_handshake(&pc->dtls_srtp, &pc->agent.selected_pair->remote->addr);
       if (dtls_ret == 0) {
         LOGD("DTLS-SRTP handshake done");
@@ -1317,6 +1324,38 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   pc->b_local_description_created = 1;
 
   agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
+
+  /* Inject an extra host candidate when host_candidate_override is set (e.g.
+   * "127.0.0.1:PORT" so a browser on the Docker host can reach the mapped
+   * port without needing STUN/TURN).  The override candidate shares the same
+   * UDP socket — the port in the string must match the socket's bound port. */
+  if (pc->config.host_candidate_override[0] != '\0') {
+    char override_ip[ADDRSTRLEN];
+    int  override_port = 0;
+    const char* colon = strrchr(pc->config.host_candidate_override, ':');
+    if (colon && colon != pc->config.host_candidate_override) {
+      size_t ip_len = (size_t)(colon - pc->config.host_candidate_override);
+      if (ip_len < sizeof(override_ip)) {
+        memcpy(override_ip, pc->config.host_candidate_override, ip_len);
+        override_ip[ip_len] = '\0';
+        override_port = atoi(colon + 1);
+      }
+    }
+    if (override_port > 0) {
+      Address override_addr;
+      memset(&override_addr, 0, sizeof(override_addr));
+      override_addr.family = AF_INET;
+      override_addr.sin.sin_family = AF_INET;
+      override_addr.sin.sin_addr.s_addr = inet_addr(override_ip);
+      override_addr.sin.sin_port = htons((uint16_t)override_port);
+      override_addr.port = override_port;
+      IceCandidate* cand = pc->agent.local_candidates + pc->agent.local_candidates_count;
+      ice_candidate_create(cand, pc->agent.local_candidates_count, ICE_CANDIDATE_TYPE_HOST, &override_addr);
+      pc->agent.local_candidates_count++;
+      LOGI("Added host candidate override: %s:%d", override_ip, override_port);
+    }
+  }
+
   for (int i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
     if (pc->config.ice_servers[i].urls) {
       LOGI("ice server: %s", pc->config.ice_servers[i].urls);

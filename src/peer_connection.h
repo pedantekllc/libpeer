@@ -89,6 +89,19 @@ typedef struct PeerConfiguration {
    * 16 == IFNAMSIZ. */
   char bind_iface[16];
 
+  /* Optional: bind the media UDP socket to this specific port instead of an
+   * OS-assigned ephemeral port.  0 = ephemeral (legacy).  Use this to pre-map
+   * a fixed host port (e.g. -p 127.0.0.1:PORT:PORT/udp in Docker) that an
+   * external viewer can reach. */
+  uint16_t media_port;
+
+  /* Optional extra host candidate to inject into the SDP offer/answer in
+   * addition to the locally-detected host address.  Format: "IP:PORT" where
+   * IP is the externally-reachable address (e.g. "127.0.0.1:PORT" on Docker
+   * so the browser on the host reaches the container's mapped port).
+   * Empty string = no extra candidate (legacy). */
+  char host_candidate_override[64];
+
   /* Optional send pacer: cap the instantaneous outgoing RTP rate to this many
    * bits/sec by sleeping between packets at the send chokepoint (token bucket
    * with a small burst allowance). Without it, one large access unit (a 4K

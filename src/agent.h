@@ -61,6 +61,10 @@ struct Agent {
    * IFNAMSIZ. */
   char bind_iface[16];
 
+  /* Optional fixed port to bind the media UDP socket to (0 = ephemeral).
+   * Copied from PeerConfiguration.media_port before agent_create. */
+  uint16_t media_port;
+
   Address host_addr;
   int b_host_addr;
   uint64_t binding_request_time;

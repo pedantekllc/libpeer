@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "address.h"
@@ -443,8 +444,20 @@ static void dtls_srtp_key_derivation_cb(void* context,
 #endif
 }
 
+/* Wall-clock deadline for the DTLS handshake.  The mbedtls retransmit timer
+ * only fires after the server has *sent* something (it guards the reply to
+ * its own flight, not the initial ClientHello wait).  Without a separate
+ * wall-clock bound the server-role peer_connection_loop blocks indefinitely
+ * if the browser ICE never completes and no ClientHello arrives — freezing
+ * the reactor thread for the entire test/session lifetime. */
+#define DTLS_HANDSHAKE_TIMEOUT_S 15
+
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   int ret;
+
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += DTLS_HANDSHAKE_TIMEOUT_S;
 
   // Use per-connection timer instead of static to support multiple simultaneous handshakes
   mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
@@ -460,6 +473,15 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   do {
     ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
 
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (now.tv_sec > deadline.tv_sec ||
+          (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+        LOGE("DTLS handshake timed out after %d seconds (no ClientHello from browser)", DTLS_HANDSHAKE_TIMEOUT_S);
+        return MBEDTLS_ERR_SSL_TIMEOUT;
+      }
+    }
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 
   return ret;

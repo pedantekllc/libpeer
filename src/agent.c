@@ -15,7 +15,7 @@
 #define AGENT_POLL_TIMEOUT 1
 #define AGENT_CONNCHECK_MAX 100
 #define AGENT_CONNCHECK_PERIOD 10
-#define AGENT_STUN_RECV_MAXTIMES 1000
+#define AGENT_STUN_RECV_MAXTIMES 5000
 #define AGENT_MAX_INPROGRESS 5  // Parallel pair checking
 // After the first pair succeeds, keep checking for up to this long if a
 // strictly higher-priority pair is still in progress, so a direct (host/prflx)
@@ -32,11 +32,13 @@ void agent_clear_candidates(Agent* agent) {
 
 int agent_create(Agent* agent) {
   int ret;
-  if ((ret = udp_socket_open(&agent->udp_sockets[0], AF_INET, 0)) < 0) {
+  /* Use the configured fixed port (0 = ephemeral). */
+  if ((ret = udp_socket_open(&agent->udp_sockets[0], AF_INET, agent->media_port)) < 0) {
     LOGE("Failed to create UDP socket.");
     return ret;
   }
-  LOGI("create IPv4 UDP socket: %d", agent->udp_sockets[0].fd);
+  LOGI("create IPv4 UDP socket: %d (port %d)", agent->udp_sockets[0].fd,
+       agent->udp_sockets[0].bind_addr.port);
   /* Pin to the chosen NIC so egress media follows the advertised candidate
    * (no-op when bind_iface is empty / on platforms without SO_BINDTODEVICE). */
   udp_socket_bind_iface(&agent->udp_sockets[0], agent->bind_iface);
@@ -244,9 +246,9 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     return -1;
   }
 
-  agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
   if (ret <= 0) {
-    LOGD("Failed to receive TURN Binding Response.");
+    LOGD("Failed to receive TURN Allocate Response (authenticated).");
     return ret;
   }
 
@@ -426,6 +428,30 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         // address. Learn it as a peer-reflexive candidate so we can establish a
         // direct path without resolving mDNS at all.
         agent_add_prflx_candidate(agent, addr);
+        /* RFC 8445 §7.3.1.4 triggered check: when we are CONTROLLING and ICE
+         * has already been nominated (nominated_pair != NULL), the remote peer
+         * may still be in the CHECKING state and has not yet received our
+         * USE_CANDIDATE STUN request (race: our ICE completed before the
+         * remote started its checks).  Send a triggered binding REQUEST to
+         * the incoming address so the browser can complete its ICE nomination
+         * and advance from CHECKING → CONNECTED.  Without this, the browser
+         * times out in CHECKING (~15 s) and the WebRTC connection never opens. */
+        if (agent->mode == AGENT_MODE_CONTROLLING && agent->nominated_pair != NULL) {
+          StunMessage req;
+          memset(&req, 0, sizeof(req));
+          /* Temporarily point nominated_pair to the peer-reflexive entry so
+           * agent_create_binding_request() uses the right priority value.
+           * The message is sent directly to addr, not via the pair's remote. */
+          IceCandidatePair* saved_nom = agent->nominated_pair;
+          agent_create_binding_request(agent, &req);
+          agent->nominated_pair = saved_nom;
+          agent_socket_send(agent, addr, req.buf, req.size);
+          {
+            char trig_addr[ADDRSTRLEN];
+            addr_to_string(addr, trig_addr, sizeof(trig_addr));
+            LOGD("Sent triggered USE_CANDIDATE check to %s:%u", trig_addr, addr->port);
+          }
+        }
       }
       break;
     default:
