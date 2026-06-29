@@ -96,7 +96,14 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
 
   // a=candidate:448736988 1 udp 2122260223 172.17.0.1 49250 typ host generation 0 network-id 1 network-cost 50
   // a=candidate:udpcandidate 1 udp 120 192.168.1.102 8000 typ host
-  if (sscanf(candidate_start, "%s %d %s %" PRIu32 " %s %" PRIu32 " typ %s",
+  //
+  // Field widths are MANDATORY: this parses an untrusted candidate string that
+  // arrives over signaling from the browser/peer. An unbounded "%s" overflows
+  // the fixed destination buffers (foundation[33], transport[33],
+  // addrstring[ADDRSTRLEN], type[16]) on any over-long token, smashing the
+  // stack and crashing the whole process (SIGSEGV inside vfscanf). The widths
+  // below are each (buffer size - 1) so sscanf always leaves room for its NUL.
+  if (sscanf(candidate_start, "%32s %d %32s %" PRIu32 " %45s %" PRIu32 " typ %15s",
              candidate->foundation,
              &candidate->component,
              candidate->transport,
