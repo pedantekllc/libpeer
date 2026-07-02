@@ -796,6 +796,19 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
   return pc->state;
 }
 
+/* Milliseconds since the last inbound STUN binding request from the peer — a
+ * spec-appropriate (RFC 7675) liveness signal, distinct from the PC state
+ * machine (which can sit in COMPLETED after a peer has silently gone). Returns
+ * UINT64_MAX if none seen yet. Higher-level watchdogs use this to tell a
+ * live-but-signalling-quiet stream (consent still flowing) from a dead peer.
+ * The clock (ports_get_epoch_time, uint32 ms, wrap-correct for deltas) stays
+ * internal to libpeer. */
+uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc) {
+  if (pc->agent.binding_request_time == 0) return UINT64_MAX;
+  uint32_t age = (uint32_t)ports_get_epoch_time() - (uint32_t)pc->agent.binding_request_time;
+  return (uint64_t)age;
+}
+
 void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }

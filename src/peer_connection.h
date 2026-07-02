@@ -143,6 +143,11 @@ const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
 
+/* Milliseconds since the last inbound STUN binding request from the peer
+ * (RFC 7675 liveness; UINT64_MAX if none). A live stream refreshes it
+ * ~continuously via consent; a dead peer stops. For higher-level idle watchdogs. */
+uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc);
+
 void* peer_connection_get_sctp(PeerConnection* pc);
 
 PeerConnection* peer_connection_create(PeerConfiguration* config);

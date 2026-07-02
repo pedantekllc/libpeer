@@ -67,6 +67,12 @@ struct Agent {
 
   Address host_addr;
   int b_host_addr;
+  /* Epoch-ms of the last inbound STUN binding request from the peer (its consent
+   * checks, arriving continuously on an established connection). This is a
+   * spec-appropriate liveness signal (RFC 7675: liveness/consent is renewed by
+   * STUN, NOT by received media — media can be replayed/spoofed). Drives the
+   * keepalive timeout and is exposed via peer_connection_get_last_stun_rx_time()
+   * for higher-level watchdogs (e.g. the sigcore GC). */
   uint64_t binding_request_time;
   uint32_t first_success_time;  // ms (ports_get_epoch_time) of first pair success; 0 = none yet
   AgentState state;
