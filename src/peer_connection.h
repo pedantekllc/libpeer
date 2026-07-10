@@ -148,7 +148,20 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc);
  * ~continuously via consent; a dead peer stops. For higher-level idle watchdogs. */
 uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc);
 
+/* Fill `buf` with a compact one-line session diagnostic (state, sctp-connected,
+ * STUN-consent age, inbound packet tallies, selected ICE pair + bound iface).
+ * Always-on; the caller (sigshell) logs it per-camera so a bug report shows why
+ * a session wedged — e.g. inData=0 stunAgeMs huge = dead browser→device path. */
+void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len);
+
 void* peer_connection_get_sctp(PeerConnection* pc);
+
+/* Test-only: arm dropping the next `count` server DTLS final flights, to
+ * reproduce the lost-final-flight wedge in e2e (count>=2 also forces the
+ * proactive-retransmit recovery path). Driven by the SDK's "drop_dtls_flight"
+ * MQTT control action (SDK_LOCAL_TEST_DRIVER only) — never called on a real
+ * device. */
+void peer_connection_test_arm_flight_drop(int count);
 
 PeerConnection* peer_connection_create(PeerConfiguration* config);
 

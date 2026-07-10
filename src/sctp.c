@@ -86,8 +86,21 @@ static uint32_t sctp_get_checksum(Sctp* sctp, const uint8_t* buf, size_t len) {
   return crc;
 }
 
+/* TEMP INSTRUMENT (concurrent-SCTP wedge): log handshake chunk flow per
+ * association so a wedged handshake's cause is visible — INIT(1)/INIT_ACK(2)/
+ * ABORT(6)/SHUTDOWN(7)/SHUTDOWN_ACK(8)/COOKIE_ECHO(10)/COOKIE_ACK(11). Repeated
+ * TX INIT with no RX INIT_ACK = retransmitting but reply lost; a single TX INIT
+ * with no retransmit = timer starvation. Remove once the fix is verified. */
+static void sctp_dbg_chunk(const char* dir, Sctp* sctp, const void* buf, size_t len) {
+  if (len < 13) return;
+  uint8_t ct = ((const uint8_t*)buf)[12];
+  if (ct == 1 || ct == 2 || ct == 6 || ct == 7 || ct == 8 || ct == 10 || ct == 11)
+    LOGI("SCTP-%s a=%p chunk=%u len=%zu", dir, (void*)sctp, ct, len);
+}
+
 static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t tos, uint8_t set_df) {
   Sctp* sctp = (Sctp*)userdata;
+  sctp_dbg_chunk("TX", sctp, buf, len);
 
   /* This callback runs from a usrsctp internal thread whenever the SCTP
    * stack wants to emit a packet on the wire (DATA chunks, SACKs, heartbeats,
@@ -255,6 +268,7 @@ void sctp_incoming_data(Sctp* sctp, char* buf, size_t len) {
     return;
 
 #if CONFIG_USE_USRSCTP
+  sctp_dbg_chunk("RX", sctp, buf, len);
   sctp_handle_sctp_packet(sctp, buf, len);
   usrsctp_conninput(sctp, buf, len, 0);
 #else
@@ -486,11 +500,11 @@ static void sctp_process_notification(Sctp* sctp, union sctp_notification* notif
 
   switch (notification->sn_header.sn_type) {
     case SCTP_ASSOC_CHANGE:
-      LOGI("SCTP_ASSOC_CHANGE: state=%u", notification->sn_assoc_change.sac_state);
+      LOGI("SCTP_ASSOC_CHANGE: a=%p state=%u", (void*)sctp, notification->sn_assoc_change.sac_state);
 
       switch (notification->sn_assoc_change.sac_state) {
         case SCTP_COMM_UP:
-          LOGI("SCTP_COMM_UP - association established");
+          LOGI("SCTP_COMM_UP - association established a=%p", (void*)sctp);
           sctp->connected = 1;
           if (sctp->onopen) {
             sctp->onopen(sctp->userdata);
@@ -571,6 +585,7 @@ void sctp_usrsctp_deinit() {
 }
 
 int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
+  LOGI("SCTP-LIFE create a=%p", (void*)sctp);   /* TEMP INSTRUMENT (wedge triage) */
   sctp->dtls_srtp = dtls_srtp;
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
@@ -735,6 +750,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 }
 
 void sctp_destroy_association(Sctp* sctp) {
+  LOGI("SCTP-LIFE destroy a=%p connected=%d", (void*)sctp, sctp ? sctp->connected : -1);  /* TEMP INSTRUMENT */
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
     /* Acquire mutex before closing to prevent race with ongoing sends */

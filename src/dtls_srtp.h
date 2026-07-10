@@ -109,6 +109,11 @@ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len);
 
 int dtls_srtp_read(DtlsSrtp* dtls_srtp, uint8_t* buf, size_t len);
 
+/* Re-send the server's last DTLS handshake flight (CCS+Finished). Used to
+ * recover from a lost final flight when a peer keeps retransmitting its own
+ * flight after we've completed. See dtls_srtp.c for the RFC 6347 §4.2.4 note. */
+int dtls_srtp_resend(DtlsSrtp* dtls_srtp);
+
 void dtls_srtp_sctp_to_dtls(DtlsSrtp* dtls_srtp, uint8_t* packet, int bytes);
 
 int dtls_srtp_probe(uint8_t* buf);

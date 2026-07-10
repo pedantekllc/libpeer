@@ -135,6 +135,14 @@ struct PeerConnection {
    * OUTSIDE this lock so the reactor never waits on a pace. */
   pthread_mutex_t send_mtx;
 
+  /* Per-peer inbound tallies at the agent layer (see peer_connection_get_session_diag).
+   * data = DTLS/RTP/RTCP packets (agent_recv>0); stun = STUN handled internally
+   * (agent_recv==0). A wedged peer with data=0 stun=0 receives NOTHING (dead
+   * browser→device path); stun>0 data=0 = the path carries STUN but not media. */
+  uint32_t in_data_pkts;
+  uint32_t in_stun_pkts;
+  uint32_t sctp_nc_logs;   /* rate-limit counter for the "sctp not connected" flood */
+
   /* SR reference pair, refreshed every frame in send_video: the most recent
    * frame's ON-WIRE RTP timestamp and its capture NTP. The Sender Report uses
    * THIS pair (not an independently-sampled clock) so its RTP↔NTP mapping is in
@@ -186,6 +194,19 @@ static size_t rtp_payload_offset(const uint8_t* data, size_t size) {
  * per-lane send worker, so a sleep delays only THIS peer's packets (the frame
  * thread already handed the access unit off via the lane ring).
  */
+/* TEMP INSTRUMENT (send_ms decomposition): per-send-worker-thread accumulators.
+ * xmit_rtp runs synchronously inside send_video on the lane's send worker, so
+ * __thread isolates each lane. send_video resets them, xmit_rtp accumulates the
+ * three segments (pacer sleep / send_mtx acquire wait / locked encrypt+send),
+ * send_video logs the split when a send is slow. Tells us where a 100ms send
+ * goes: pace, mutex contention, or the socket. Remove once the tail is fixed. */
+static __thread uint64_t sb_pace_ns, sb_lockwait_ns, sb_srtp_ns, sb_send_ns;
+static __thread int      sb_pkts;
+static inline uint64_t sb_mono_ns(void) {
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static void peer_connection_pace(PeerConnection* pc, size_t bytes) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
@@ -226,11 +247,21 @@ void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
 static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t size) {
   /* Pace BEFORE taking the send lock (sleeps must never hold it); budget on
    * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
+  uint64_t t0 = sb_mono_ns();
   peer_connection_pace(pc, size + 10);
+  uint64_t t1 = sb_mono_ns();
   pthread_mutex_lock(&pc->send_mtx);
+  uint64_t t2 = sb_mono_ns();
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
+  uint64_t t2b = sb_mono_ns();
   agent_send(&pc->agent, data, size);
+  uint64_t t3 = sb_mono_ns();
   pthread_mutex_unlock(&pc->send_mtx);
+  sb_pace_ns += t1 - t0;         /* TEMP INSTRUMENT: pacer sleep        */
+  sb_lockwait_ns += t2 - t1;     /* TEMP INSTRUMENT: send_mtx acquire   */
+  sb_srtp_ns += t2b - t2;        /* TEMP INSTRUMENT: SRTP encrypt       */
+  sb_send_ns += t3 - t2b;        /* TEMP INSTRUMENT: agent_send/sendto  */
+  sb_pkts++;
 }
 
 /* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
@@ -709,9 +740,29 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
+/* Test-only: armed by peer_connection_test_arm_flight_drop(count) (wired to the
+ * SDK_LOCAL_TEST_DRIVER MQTT control action "drop_dtls_flight", compiled out of
+ * production). Drops the next `count` server DTLS final flights — each begins
+ * with a ChangeCipherSpec, content_type 0x14 — deterministically reproducing the
+ * lost-final-flight wedge in e2e without flaky netem loss. count=1 loses the
+ * original flight (recovered by the peer's retransmit); count>=2 also loses the
+ * reactive resend, forcing the device's proactive retransmit timer to recover
+ * (the field case where resends themselves are lost on wifi). Never set on a
+ * real device. */
+static volatile int g_test_drop_remaining = 0;
+void peer_connection_test_arm_flight_drop(int count) { g_test_drop_remaining = count; }
+
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+
+  if (g_test_drop_remaining > 0 && len > 0 &&
+      buf[0] == 0x14 /* ChangeCipherSpec = start of the server's final flight */) {
+    g_test_drop_remaining--;
+    LOGW("TEST: dropping server DTLS final flight (CCS, len=%zu, %d left) — simulating loss",
+         len, g_test_drop_remaining);
+    return (int)len;  /* lie to mbedtls: report the datagram as sent */
+  }
 
   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
   return agent_send(&pc->agent, buf, len);
@@ -727,14 +778,18 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
     switch (rtcp_header->type) {
       case RTCP_RR:
         LOGD("RTCP_RR");
-        /* Receiver-report loss → the rate controller's emergency brake. Parse
-         * THIS report block (buf + pos), not buf — compound RTCP puts later
-         * packets past pos. fraction-lost is the top byte of the first word. */
+        /* Receiver-report loss → the rate controller's loss EWMA + emergency
+         * brake. Parse THIS report block (buf + pos), not buf — compound RTCP
+         * puts later packets past pos. fraction-lost is the top byte of the
+         * first word. Report EVERY RR including fraction==0: the ratecore loss
+         * EWMA only decays when it is fed clean intervals, so suppressing zeros
+         * makes it a one-way ratchet that stays pinned at a historical (or
+         * other-viewer) loss value forever, permanently throttling the grant. */
         if (rtcp_header->rc > 0) {
           RtcpRr rtcp_rr = rtcp_parse_rr(buf + pos);
           uint32_t fraction = ntohl(rtcp_rr.report_block[0].flcnpl) >> 24;
           uint32_t total = ntohl(rtcp_rr.report_block[0].flcnpl) & 0x00FFFFFF;
-          if (pc->on_receiver_packet_loss && fraction > 0) {
+          if (pc->on_receiver_packet_loss) {
             pc->on_receiver_packet_loss((float)fraction / 256.0f, total, pc->config.user_data);
           }
         }
@@ -807,6 +862,24 @@ uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc) {
   if (pc->agent.binding_request_time == 0) return UINT64_MAX;
   uint32_t age = (uint32_t)ports_get_epoch_time() - (uint32_t)pc->agent.binding_request_time;
   return (uint64_t)age;
+}
+
+void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len) {
+  if (!pc || !buf || len == 0) return;
+  char local[ADDRSTRLEN + 8] = "-";
+  int ltype = -1, rtype = -1;
+  IceCandidatePair* sp = pc->agent.selected_pair;
+  if (sp && sp->local) {
+    addr_to_string_with_port(&sp->local->addr, local, sizeof(local));
+    ltype = (int)sp->local->type;
+  }
+  if (sp && sp->remote) rtype = (int)sp->remote->type;
+  snprintf(buf, len,
+      "state=%d sctp=%d stunAgeMs=%llu inData=%u inStun=%u ncFloods=%u pair=%s ltype=%d rtype=%d iface=%s",
+      (int)pc->state, sctp_is_connected(&pc->sctp),
+      (unsigned long long)peer_connection_get_last_stun_rx_age_ms(pc),
+      pc->in_data_pkts, pc->in_stun_pkts, pc->sctp_nc_logs,
+      local, ltype, rtype, pc->config.bind_iface[0] ? pc->config.bind_iface : "-");
 }
 
 void* peer_connection_get_sctp(PeerConnection* pc) {
@@ -904,11 +977,6 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
-    static int last_state_logged = -999;
-    if (pc->state != last_state_logged) {
-      LOGW("[ts-debug] send_video skipped: pc->state=%d (was %d)", pc->state, last_state_logged);
-      last_state_logged = pc->state;
-    }
     return -1;
   }
   /* Derive the frame's capture WALL-CLOCK (→ abs-capture-time) and refresh the
@@ -937,45 +1005,22 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
     pc->sr_ref_rtp = (uint32_t)((capture_time_ns * 90000ULL) / 1000000000ULL);
     pc->sr_ref_ntp = pc->cur_frame_capture_ntp;
   }
-  {
-    static uint32_t debug_count = 0;
-    static uint64_t last_cap_ns = 0;
-    static uint32_t last_rtp_ts = 0;
-    static int last_state_logged_ok = -1;
-    static uint64_t encode_total_ns = 0;
-    static uint64_t encode_max_ns = 0;
-    debug_count++;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    uint64_t dt = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
-                + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
-    encode_total_ns += dt;
-    if (dt > encode_max_ns) encode_max_ns = dt;
-
-    uint32_t rtp_ts_now = pc->vrtp_encoder.timestamp;
-    if (last_state_logged_ok != pc->state) {
-      LOGW("[ts-debug] send_video OK: pc->state=COMPLETED");
-      last_state_logged_ok = pc->state;
-    }
-    if (debug_count % 300 == 0 && last_cap_ns != 0) {  /* ~10s @ 30fps */
-      uint64_t cap_dt_ns = capture_time_ns - last_cap_ns;
-      uint32_t rtp_dt = rtp_ts_now - last_rtp_ts;
-      double cap_dt_ms = cap_dt_ns / 1e6 / 300.0;
-      double rtp_dt_per_call = (double)rtp_dt / 300.0;
-      double encode_avg_ms = (double)encode_total_ns / debug_count / 1e6;
-      double encode_max_ms = (double)encode_max_ns / 1e6;
-      LOGI("[ts-debug] libpeer send_video #%u  cap_dt=%.3fms/frame  "
-           "rtp_dt=%.1fticks/frame  encode_avg=%.3fms  encode_max=%.3fms",
-           debug_count, cap_dt_ms, rtp_dt_per_call, encode_avg_ms, encode_max_ms);
-    }
-    if (debug_count % 300 == 0 || debug_count == 1) {
-      last_cap_ns = capture_time_ns;
-      last_rtp_ts = rtp_ts_now;
-    }
-    return rc;
+  /* TEMP INSTRUMENT (send_ms decomposition): reset the per-thread segment
+   * accumulators, run the send, and if it was slow log where the time went. */
+  sb_pace_ns = sb_lockwait_ns = sb_srtp_ns = sb_send_ns = 0;
+  sb_pkts = 0;
+  uint64_t sv_t0 = sb_mono_ns();
+  int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
+  uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
+  if (total_ms >= 30) {
+    LOGI("sendbreak len=%zu pkts=%d total_ms=%llu pace_ms=%llu lockwait_ms=%llu srtp_ms=%llu sock_ms=%llu",
+         len, sb_pkts, (unsigned long long)total_ms,
+         (unsigned long long)(sb_pace_ns / 1000000ull),
+         (unsigned long long)(sb_lockwait_ns / 1000000ull),
+         (unsigned long long)(sb_srtp_ns / 1000000ull),
+         (unsigned long long)(sb_send_ns / 1000000ull));
   }
+  return rc;
 }
 
 int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t len) {
@@ -984,7 +1029,8 @@ int peer_connection_datachannel_send(PeerConnection* pc, char* message, size_t l
 
 int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size_t len, uint16_t sid) {
   if (!sctp_is_connected(&pc->sctp)) {
-    LOGE("sctp not connected");
+    if ((pc->sctp_nc_logs++ % 500) == 0)   /* rate-limit: don't roll the log buffer */
+      LOGE("sctp not connected a=%p (x%u)", (void*)&pc->sctp, pc->sctp_nc_logs);
     return -1;
   }
   if (pc->config.datachannel == DATA_CHANNEL_STRING)
@@ -995,7 +1041,8 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
 
 int peer_connection_datachannel_send_binary(PeerConnection* pc, const uint8_t* data, size_t len) {
   if (!sctp_is_connected(&pc->sctp)) {
-    LOGE("sctp not connected");
+    if ((pc->sctp_nc_logs++ % 500) == 0)   /* rate-limit: don't roll the log buffer */
+      LOGE("sctp not connected a=%p (x%u)", (void*)&pc->sctp, pc->sctp_nc_logs);
     return -1;
   }
   /* Always use PPID_BINARY regardless of datachannel config */
@@ -1010,7 +1057,8 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   int rtrn = -1;
 
   if (!sctp_is_connected(&pc->sctp)) {
-    LOGE("sctp not connected");
+    if ((pc->sctp_nc_logs++ % 500) == 0)   /* rate-limit: don't roll the log buffer */
+      LOGE("sctp not connected a=%p (x%u)", (void*)&pc->sctp, pc->sctp_nc_logs);
     return rtrn;
   }
 
@@ -1063,7 +1111,12 @@ int peer_connection_loop(PeerConnection* pc) {
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
 
-  LOGI("peer_connection_loop: state=%d", pc->state);
+  /* Per-iteration — must stay LOGD (like agent_recv/RTCP/DTLS below), else it
+   * floods every connected session: the loop runs ~75 Hz per PeerConnection, so
+   * on a live device this one INFO line was 64–97% of the whole log buffer,
+   * shrinking the retained window to ~1 min and adding sync-log overhead on the
+   * Pi 3. State transitions are already logged by STATE_CHANGED. */
+  LOGD("peer_connection_loop: state=%d", pc->state);
 
   switch (pc->state) {
     case PEER_CONNECTION_NEW:
@@ -1109,12 +1162,36 @@ int peer_connection_loop(PeerConnection* pc) {
       while ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) >= 0) {
         if (pc->agent_ret == 0) {
           /* STUN packet was handled internally, continue draining */
+          pc->in_stun_pkts++;
           continue;
         }
+        pc->in_data_pkts++;
 
         LOGD("agent_recv %d", pc->agent_ret);
 
-        if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
+        if (pc->agent_buf[0] == 0x14 /* CCS */ || pc->agent_buf[0] == 0x16 /* handshake */) {
+          /* A ChangeCipherSpec or handshake record arriving AFTER we reached
+           * COMPLETED means the PEER's DTLS handshake did not finish: it is
+           * retransmitting its last flight because it never received OUR final
+           * flight (CCS+Finished lost in transit). This MUST be checked before
+           * rtp_packet_validate — that classifier only inspects the RTP payload-
+           * type bits and mis-claims a DTLS record (its 2nd byte 0xfe makes
+           * pt==126, which passes `>= 96`), so a handshake retransmit would
+           * otherwise be decoded as RTP and dropped, never reaching this
+           * recovery. Real RTP/RTCP always has the version bit set (byte0 >=
+           * 0x80), so 0x14/0x16 is unambiguously DTLS. mbedtls kept our last
+           * flight for exactly this case (RFC 6347 §4.2.4) — resend it so a lost
+           * final flight self-heals instead of wedging the data channel forever
+           * (DTLS half-open, SCTP INIT retransmitted into the void, no video).
+           * Guard on datachannel + SCTP-not-up: once the peer's DTLS completes it
+           * sends app-data (0x17), not handshake records, so this goes quiet. */
+          if (pc->config.datachannel && !sctp_is_connected(&pc->sctp)) {
+            LOGW("DTLS peer retransmitting flight post-complete (ct=0x%02x), SCTP down"
+                 " — resending server final flight", pc->agent_buf[0]);
+            dtls_srtp_resend(&pc->dtls_srtp);
+          }
+
+        } else if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTCP packet");
           dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
@@ -1136,8 +1213,8 @@ int peer_connection_loop(PeerConnection* pc) {
               /* dtls_srtp_read itself logs the mbedtls code; this LOGW marks
                * the corresponding inbound wire packet so the two can be
                * correlated when triaging silent drops. */
-              LOGW("DTLS dispatch: dropping %d-byte wire packet (decrypt failed)",
-                   pc->agent_ret);
+              LOGW("DTLS dispatch: dropping %d-byte wire packet (decrypt failed) a=%p ret=%d",
+                   pc->agent_ret, (void*)&pc->sctp, ret);   /* TEMP: correlate to the wedged assoc */
             }
           } while (ret > 0);
 

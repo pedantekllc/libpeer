@@ -164,6 +164,25 @@ int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   return ret;
 }
 
+/* RFC 6347 §4.2.4 recovery: re-send the server's last handshake flight.
+ * mbedtls retains that flight after wrapup for DTLS (see the "keep last flight
+ * around" branch in mbedtls_ssl_handshake_wrapup), so this resends the exact
+ * CCS+Finished the peer is missing. Driven from peer_connection.c when a peer
+ * keeps retransmitting its own flight after we've completed (i.e. its DTLS did
+ * not finish because our final flight was lost). Serialized on ssl_mutex like
+ * every other ssl_context access in this build. */
+extern int mbedtls_ssl_resend(mbedtls_ssl_context* ssl);  /* mbedtls-internal, exported */
+int dtls_srtp_resend(DtlsSrtp* dtls_srtp) {
+  int ret;
+  pthread_mutex_lock(&dtls_srtp->ssl_mutex);
+  ret = mbedtls_ssl_resend(&dtls_srtp->ssl);
+  pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
+  if (ret != 0) {
+    LOGW("dtls_srtp_resend: mbedtls_ssl_resend returned -0x%04x", (unsigned)(-ret));
+  }
+  return ret;
+}
+
 int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
