@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
@@ -17,6 +18,36 @@
 #include <srtp2/srtp.h>
 
 #include "address.h"
+
+/* Non-blocking, step-wise DTLS handshake sentinel.
+ *
+ * dtls_srtp_handshake() (and the internal dtls_srtp_do_handshake /
+ * dtls_srtp_handshake_server / dtls_srtp_handshake_client helpers) drive AT
+ * MOST ONE mbedtls_ssl_handshake() call per invocation. When that single step
+ * returns MBEDTLS_ERR_SSL_WANT_READ/WANT_WRITE and the handshake's wall-clock
+ * deadline (DTLS_HANDSHAKE_TIMEOUT_S, dtls_srtp.c) has not yet expired, these
+ * functions return DTLS_SRTP_HS_WANT instead of looping internally.
+ *
+ * Contract for callers (peer_connection.c's PEER_CONNECTION_CONNECTED case):
+ *   0                  -> handshake complete, proceed to COMPLETED.
+ *   DTLS_SRTP_HS_WANT  -> in progress; stay in the same state and call again
+ *                         on a later peer_connection_loop() tick. Do NOT
+ *                         treat this as success or failure.
+ *   anything else (<0) -> real failure (including MBEDTLS_ERR_SSL_TIMEOUT
+ *                         once the deadline has passed) -> FAILED.
+ *
+ * Value 1 is used because it is unambiguous against both success (0) and
+ * every mbedtls error code (always negative). */
+#define DTLS_SRTP_HS_WANT 1
+
+/* dtls_srtp_handshake_server()'s per-attempt sub-state: whether the next step
+ * must (re)issue mbedtls_ssl_session_reset()+set_client_transport_id() before
+ * stepping (a fresh handshake, or immediately after a HelloVerifyRequest
+ * round), or whether it should just keep stepping the in-flight handshake. */
+typedef enum DtlsHandshakeSubState {
+  DTLS_HS_SUB_NEED_RESET = 0,
+  DTLS_HS_SUB_STEPPING,
+} DtlsHandshakeSubState;
 
 #define SRTP_MASTER_KEY_LENGTH 16
 #define SRTP_MASTER_SALT_LENGTH 14
@@ -69,6 +100,17 @@ typedef struct DtlsSrtp {
   char actual_remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
 
   void* user_data;
+
+  /* ── Step-wise / non-blocking handshake state (see DTLS_SRTP_HS_WANT above
+   * and dtls_srtp_do_handshake in dtls_srtp.c). All persistent ACROSS calls
+   * so the reactor can drive one mbedtls step per peer_connection_loop()
+   * tick without losing the wall-clock deadline or redoing one-time setup.
+   * Reset to a fresh-handshake state in dtls_srtp_init(). */
+  struct timespec hs_deadline;      /* wall-clock deadline; set ONCE per handshake attempt */
+  int hs_initialized;                /* 0/1: has the one-time mbedtls_ssl_set_bio/timer/
+                                       * export-keys-cb setup + hs_deadline been done yet
+                                       * for the CURRENT handshake attempt? */
+  DtlsHandshakeSubState hs_substate; /* server role: NEED_RESET vs STEPPING (HelloVerify) */
 
   /* mbedtls's ssl_context is NOT thread-safe (MBEDTLS_THREADING_C is disabled
    * in third_party/mbedtls/include/mbedtls/mbedtls_config.h). usrsctp's internal

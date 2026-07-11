@@ -95,7 +95,7 @@ static void sctp_dbg_chunk(const char* dir, Sctp* sctp, const void* buf, size_t 
   if (len < 13) return;
   uint8_t ct = ((const uint8_t*)buf)[12];
   if (ct == 1 || ct == 2 || ct == 6 || ct == 7 || ct == 8 || ct == 10 || ct == 11)
-    LOGI("SCTP-%s a=%p chunk=%u len=%zu", dir, (void*)sctp, ct, len);
+    LOGD("SCTP-%s a=%p chunk=%u len=%zu", dir, (void*)sctp, ct, len);
 }
 
 static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t tos, uint8_t set_df) {
@@ -585,7 +585,7 @@ void sctp_usrsctp_deinit() {
 }
 
 int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
-  LOGI("SCTP-LIFE create a=%p", (void*)sctp);   /* TEMP INSTRUMENT (wedge triage) */
+  LOGD("SCTP-LIFE create a=%p", (void*)sctp);   /* TEMP INSTRUMENT (wedge triage) */
   sctp->dtls_srtp = dtls_srtp;
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
@@ -750,7 +750,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 }
 
 void sctp_destroy_association(Sctp* sctp) {
-  LOGI("SCTP-LIFE destroy a=%p connected=%d", (void*)sctp, sctp ? sctp->connected : -1);  /* TEMP INSTRUMENT */
+  LOGD("SCTP-LIFE destroy a=%p connected=%d", (void*)sctp, sctp ? sctp->connected : -1);  /* TEMP INSTRUMENT */
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
     /* Acquire mutex before closing to prevent race with ongoing sends */

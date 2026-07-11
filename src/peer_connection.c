@@ -29,6 +29,18 @@
  * within the first couple of seconds of a stream.                        */
 #define RTCP_SR_INTERVAL_MS 1000
 
+/* TEMP INSTRUMENT (pc.loop phase decomposition): a bug report captured a
+ * single peer_connection_loop() iteration taking dur_ms=16497 for one
+ * connected peer (see the "slow pc.loop" warn in sigshell.c, which already
+ * times the loop() call as a whole but not its internals). This threshold
+ * gates a one-line-per-slow-iteration breakdown of WHERE inside the
+ * PEER_CONNECTION_COMPLETED case the time went (recv drain / DTLS resend /
+ * RTCP-in incl. NACK-driven RTX / DTLS-read drain / RTP-in / periodic RTCP SR
+ * send_mtx-wait vs. encrypt+send) — see the LOGI at the end of that case.
+ * Matches sigshell.c's SLOW_PC_LOOP_THRESHOLD_MS so both logs fire together.
+ * Remove once the multi-second tail is found. */
+#define PC_LOOP_SLOW_MS 50
+
 /* Forward declaration for fragment state */
 typedef struct dtls_fragment_state_s dtls_fragment_state_t;
 
@@ -78,6 +90,33 @@ struct PeerConnection {
 
   /* Per-connection DTLS fragment reassembly state */
   dtls_fragment_state_t* frag_state;
+
+  /* ── Orphan / half-open peer visibility (bug-report diagnostic) ──────────
+   * A peer whose DTLS handshake completed but whose SCTP association never
+   * comes up (browser refreshed away mid-handshake; the datachannel INIT it
+   * sent us was lost or it vanished before replying) sits here retransmitting
+   * its last DTLS flight forever unless something reaps it. dtls_complete_ms
+   * is the wall-clock stamp (ports_get_epoch_time — same clock as last_sr_ms
+   * above) taken the moment DTLS finishes; sctp_retransmit_count counts every
+   * "peer retransmitting flight post-complete" event (see PEER_CONNECTION_
+   * COMPLETED below) WITHOUT adding a log line per retransmit (that would
+   * reintroduce the per-iteration spam already removed elsewhere).
+   * half_open_logged latches so the "stuck half-open" LOGI fires exactly ONCE
+   * per peer, the first time it's been stuck >3s, so a bug report can see
+   * orphans accumulating at a low, readable count across a few browser
+   * refreshes instead of a flood. */
+  uint32_t dtls_complete_ms;
+  uint32_t sctp_retransmit_count;
+  int      b_half_open_logged;   /* 0/1; matches b_local_description_created style */
+
+  /* Gates the "Starting DTLS handshake" LOGI in PEER_CONNECTION_CONNECTED to
+   * fire exactly once per handshake attempt. That case is now step-wise (see
+   * dtls_srtp_handshake / DTLS_SRTP_HS_WANT) and stays CONNECTED across many
+   * peer_connection_loop() ticks while a handshake is in progress, so without
+   * this guard the line would repeat every tick (~75 Hz) for the whole
+   * handshake instead of once. Reset to 0 on every fresh CHECKING->CONNECTED
+   * transition (a new handshake attempt) below. */
+  int      b_dtls_handshake_logged;
 
   /* ── Glass-to-glass latency: abs-capture-time + RTCP SR ───────────────── */
 
@@ -264,6 +303,19 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
   sb_pkts++;
 }
 
+/* TEMP INSTRUMENT (pc.loop phase decomposition): reactor-thread-only per-call
+ * accumulators for time spent in peer_connection_rtx_resend()'s send_mtx
+ * acquire vs. the subsequent encrypt+send. peer_connection_rtx_resend is
+ * invoked nested (peer_connection_loop -> peer_connection_incoming_rtcp ->
+ * peer_connection_handle_nack -> peer_connection_rtx_resend), and only the
+ * single reactor thread ever walks that chain, so a plain __thread pair
+ * (mirroring the sb_* pattern above) is simpler than threading an
+ * accumulator pointer through three call levels. Reset at the top of the
+ * PEER_CONNECTION_COMPLETED case in peer_connection_loop(); read at the end
+ * of that case to build the "pc.loop slow" breakdown. Remove alongside the
+ * rest of the pc.loop phase timing once the tail is found. */
+static __thread uint32_t pl_rtx_lockwait_ms, pl_rtx_send_ms;
+
 /* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
  * retransmission. Send-worker thread; the NACK reader holds the same mutex. */
 static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size) {
@@ -310,10 +362,18 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_unlock(&pc->rtx_mtx);
 
   if (out_len > 0) {
+    /* TEMP INSTRUMENT (pc.loop phase decomposition): time the send_mtx
+     * acquire separately from the locked encrypt+send — see pl_rtx_lockwait_ms
+     * / pl_rtx_send_ms above. */
+    uint32_t rt0 = ports_get_epoch_time();
     pthread_mutex_lock(&pc->send_mtx);
+    uint32_t rt1 = ports_get_epoch_time();
     dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
     agent_send(&pc->agent, buf, out_len);
     pthread_mutex_unlock(&pc->send_mtx);
+    uint32_t rt2 = ports_get_epoch_time();
+    pl_rtx_lockwait_ms += (rt1 - rt0);
+    pl_rtx_send_ms += (rt2 - rt1);
   }
 }
 
@@ -578,9 +638,35 @@ static void write_uint24_be(uint8_t* p, uint32_t val) {
  * This callback serves it ONCE and then clears pc->agent_ret. Without that
  * clear, mbedtls re-reads the same record on every internal read and (at
  * steady-state bulk traffic) the decrypted SCTP DATA chunks never reach the
- * application — the sender's send buffer fills to its 4 MB cap and stays. */
+ * application — the sender's send buffer fills to its 4 MB cap and stays.
+ *
+ * NON-BLOCKING (this is the real fix for the reactor-freeze bug — the
+ * dtls_srtp.c step-wise conversion alone is not enough, because THIS
+ * function, not dtls_srtp_udp_recv in dtls_srtp.c, is the BIO recv mbedtls
+ * actually calls: peer_connection_create_sdp() overrides
+ * dtls_srtp->udp_recv/udp_send to peer_connection_dtls_srtp_recv/_send right
+ * after dtls_srtp_init(), for every PeerConnection). This function used to
+ * retry `agent_recv()` in an internal loop up to CONFIG_TLS_READ_TIMEOUT
+ * (3000) times whenever no cached packet was available (the `while
+ * (recv_max < CONFIG_TLS_READ_TIMEOUT ...)` below). agent_recv() ultimately
+ * calls agent_socket_recv(), which blocks in select() for up to
+ * AGENT_POLL_TIMEOUT (1ms) per attempt — so a SINGLE call to this function
+ * could genuinely block the calling thread for ~3000 * 1ms ≈ 3 seconds via
+ * real syscalls, not just spin. With dtls_srtp_do_handshake()'s outer retry
+ * loop removed (see dtls_srtp.c), one handshake step now calls this function
+ * only a small, bounded number of times — but each of THOSE calls could
+ * still eat up to ~3s if this internal loop were left in place, still
+ * enough to starve every other peer on the single-threaded reactor for
+ * seconds at a time. So this is now a SINGLE attempt: try agent_recv() once;
+ * if there's nothing usable, return MBEDTLS_ERR_SSL_WANT_READ immediately
+ * (bounded to agent_recv's own ~1ms select() wait) and let the next
+ * peer_connection_loop() tick — reached via dtls_srtp_do_handshake's
+ * DTLS_SRTP_HS_WANT step return — bring us back. This is safe for the
+ * ClientHello fragment-reassembly path below too: `frag` is
+ * pc->frag_state, which persists across calls, so an in-progress
+ * reassembly picks up exactly where it left off on the next call instead of
+ * blocking here waiting for the remaining fragments to arrive. */
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
   int ret = -1;
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
@@ -594,149 +680,154 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return n;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, recv_buf, sizeof(recv_buf));
-
-    if (ret <= 0) {
-      recv_max++;
-      continue;
-    }
-
-    /* Check if this is a DTLS handshake record */
-    if (ret < DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN) {
-      /* Too short to be a handshake, pass through */
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    uint8_t content_type = recv_buf[0];
-    if (content_type != DTLS_CONTENT_TYPE_HANDSHAKE) {
-      /* Not a handshake message, pass through */
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    /* Parse handshake header (starts after 13-byte record header) */
-    const uint8_t* hs = recv_buf + DTLS_RECORD_HEADER_LEN;
-    uint8_t hs_type = hs[0];
-    uint32_t hs_total_len = read_uint24_be(hs + 1);
-    uint16_t hs_msg_seq = ((uint16_t)hs[4] << 8) | hs[5];
-    uint32_t frag_offset = read_uint24_be(hs + 6);
-    uint32_t frag_len = read_uint24_be(hs + 9);
-
-    LOGD("Handshake: type=%d, total=%u, seq=%u, frag_off=%u, frag_len=%u",
-         hs_type, hs_total_len, hs_msg_seq, frag_offset, frag_len);
-
-    /* Only reassemble ClientHello (type 1) */
-    if (hs_type != DTLS_HANDSHAKE_TYPE_CLIENT_HELLO) {
-      /* Not ClientHello, pass through */
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    /* Check if this is a fragmented message */
-    if (frag_offset == 0 && frag_len == hs_total_len) {
-      /* Not fragmented, pass through */
-      LOGD("ClientHello not fragmented, passing through");
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    /* Fragmented ClientHello - need to reassemble */
-    LOGI("ClientHello fragmented: offset=%u, len=%u, total=%u", frag_offset, frag_len, hs_total_len);
-
-    /* Check if this is the start of a new message */
-    if (frag_offset == 0) {
-      /* Start new reassembly */
-      memset(frag, 0, sizeof(*frag));
-      frag->active = 1;
-      frag->total_len = hs_total_len;
-      frag->msg_seq = hs_msg_seq;
-      /* Save record header fields for reconstruction */
-      memcpy(frag->version, recv_buf + 1, 2);
-      memcpy(frag->epoch, recv_buf + 3, 2);
-      memcpy(frag->seq_num, recv_buf + 5, 6);
-      LOGI("Starting ClientHello reassembly, total_len=%u", hs_total_len);
-    }
-
-    /* Validate this fragment belongs to current reassembly */
-    if (!frag->active || hs_msg_seq != frag->msg_seq || hs_total_len != frag->total_len) {
-      LOGW("Fragment mismatch, resetting");
-      frag->active = 0;
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    /* Bounds check */
-    if (frag_offset + frag_len > frag->total_len) {
-      LOGE("Fragment exceeds total length");
-      frag->active = 0;
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    if (frag_offset + frag_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN) {
-      LOGE("Handshake message too large for reassembly buffer");
-      frag->active = 0;
-      memcpy(buf, recv_buf, ret);
-      return ret;
-    }
-
-    /* Copy fragment data (handshake payload, after 12-byte handshake header) */
-    const uint8_t* frag_data = hs + DTLS_HANDSHAKE_HEADER_LEN;
-    memcpy(frag->data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
-    frag->received_len += frag_len;
-
-    LOGI("Received fragment: offset=%u, len=%u, total_received=%u/%u",
-         frag_offset, frag_len, frag->received_len, frag->total_len);
-
-    /* Check if reassembly is complete */
-    if (frag->received_len >= frag->total_len) {
-      LOGI("ClientHello reassembly complete (%u bytes)", frag->total_len);
-
-      /* Build the complete handshake header */
-      frag->data[0] = DTLS_HANDSHAKE_TYPE_CLIENT_HELLO;
-      write_uint24_be(frag->data + 1, frag->total_len);
-      frag->data[4] = (frag->msg_seq >> 8) & 0xFF;
-      frag->data[5] = frag->msg_seq & 0xFF;
-      write_uint24_be(frag->data + 6, 0);  /* fragment_offset = 0 */
-      write_uint24_be(frag->data + 9, frag->total_len);  /* fragment_length = total */
-
-      /* Build complete DTLS record */
-      uint32_t handshake_size = DTLS_HANDSHAKE_HEADER_LEN + frag->total_len;
-      uint32_t total_record_len = DTLS_RECORD_HEADER_LEN + handshake_size;
-
-      if (total_record_len > len) {
-        LOGE("Reassembled message too large for buffer");
-        frag->active = 0;
-        return -1;
-      }
-
-      /* Build record header */
-      buf[0] = DTLS_CONTENT_TYPE_HANDSHAKE;
-      memcpy(buf + 1, frag->version, 2);
-      memcpy(buf + 3, frag->epoch, 2);
-      memcpy(buf + 5, frag->seq_num, 6);
-      buf[11] = (handshake_size >> 8) & 0xFF;
-      buf[12] = handshake_size & 0xFF;
-
-      /* Copy handshake data */
-      memcpy(buf + DTLS_RECORD_HEADER_LEN, frag->data, handshake_size);
-
-      frag->active = 0;
-      return total_record_len;
-    }
-
-    /* Not complete yet, continue receiving more fragments */
-    /* Don't increment recv_max here - we're actively reassembling */
+  /* This direct agent_recv() path only makes sense during the CONNECTED-state
+   * handshake (before the COMPLETED-state outer dispatch loop takes over
+   * pre-fetching packets into pc->agent_ret/pc->agent_buf, per the cache
+   * invariant above). Matches the defensive intent of the old loop's
+   * `&& pc->state == PEER_CONNECTION_CONNECTED` guard. */
+  if (pc->state != PEER_CONNECTION_CONNECTED) {
+    return MBEDTLS_ERR_SSL_WANT_READ;
   }
 
-  /* No data available right now: tell mbedtls to retry rather than treating
-   * this as a hard error. Returning a raw negative (the original `ret = -1`)
-   * collapsed into MBEDTLS_ERR_SSL_TIMEOUT inside the DTLS record reader and
-   * caused steady-state ssl_read calls to drop the just-decrypted SCTP DATA
-   * payload. WANT_READ is the documented "no data, please poll again later"
-   * contract for the mbedtls BIO recv callback. */
+  ret = agent_recv(&pc->agent, recv_buf, sizeof(recv_buf));
+
+  if (ret <= 0) {
+    /* ret == 0: a STUN packet (incl. any consent response) was consumed
+     * internally by agent_recv. ret < 0: nothing available this attempt.
+     * Either way there is no DTLS payload to hand back right now — tell
+     * mbedtls to retry rather than spinning here for it ourselves. */
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+
+  /* Check if this is a DTLS handshake record */
+  if (ret < DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN) {
+    /* Too short to be a handshake, pass through */
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  uint8_t content_type = recv_buf[0];
+  if (content_type != DTLS_CONTENT_TYPE_HANDSHAKE) {
+    /* Not a handshake message, pass through */
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  /* Parse handshake header (starts after 13-byte record header) */
+  const uint8_t* hs = recv_buf + DTLS_RECORD_HEADER_LEN;
+  uint8_t hs_type = hs[0];
+  uint32_t hs_total_len = read_uint24_be(hs + 1);
+  uint16_t hs_msg_seq = ((uint16_t)hs[4] << 8) | hs[5];
+  uint32_t frag_offset = read_uint24_be(hs + 6);
+  uint32_t frag_len = read_uint24_be(hs + 9);
+
+  LOGD("Handshake: type=%d, total=%u, seq=%u, frag_off=%u, frag_len=%u",
+       hs_type, hs_total_len, hs_msg_seq, frag_offset, frag_len);
+
+  /* Only reassemble ClientHello (type 1) */
+  if (hs_type != DTLS_HANDSHAKE_TYPE_CLIENT_HELLO) {
+    /* Not ClientHello, pass through */
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  /* Check if this is a fragmented message */
+  if (frag_offset == 0 && frag_len == hs_total_len) {
+    /* Not fragmented, pass through */
+    LOGD("ClientHello not fragmented, passing through");
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  /* Fragmented ClientHello - need to reassemble */
+  LOGI("ClientHello fragmented: offset=%u, len=%u, total=%u", frag_offset, frag_len, hs_total_len);
+
+  /* Check if this is the start of a new message */
+  if (frag_offset == 0) {
+    /* Start new reassembly */
+    memset(frag, 0, sizeof(*frag));
+    frag->active = 1;
+    frag->total_len = hs_total_len;
+    frag->msg_seq = hs_msg_seq;
+    /* Save record header fields for reconstruction */
+    memcpy(frag->version, recv_buf + 1, 2);
+    memcpy(frag->epoch, recv_buf + 3, 2);
+    memcpy(frag->seq_num, recv_buf + 5, 6);
+    LOGI("Starting ClientHello reassembly, total_len=%u", hs_total_len);
+  }
+
+  /* Validate this fragment belongs to current reassembly */
+  if (!frag->active || hs_msg_seq != frag->msg_seq || hs_total_len != frag->total_len) {
+    LOGW("Fragment mismatch, resetting");
+    frag->active = 0;
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  /* Bounds check */
+  if (frag_offset + frag_len > frag->total_len) {
+    LOGE("Fragment exceeds total length");
+    frag->active = 0;
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  if (frag_offset + frag_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN) {
+    LOGE("Handshake message too large for reassembly buffer");
+    frag->active = 0;
+    memcpy(buf, recv_buf, ret);
+    return ret;
+  }
+
+  /* Copy fragment data (handshake payload, after 12-byte handshake header) */
+  const uint8_t* frag_data = hs + DTLS_HANDSHAKE_HEADER_LEN;
+  memcpy(frag->data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
+  frag->received_len += frag_len;
+
+  LOGI("Received fragment: offset=%u, len=%u, total_received=%u/%u",
+       frag_offset, frag_len, frag->received_len, frag->total_len);
+
+  /* Check if reassembly is complete */
+  if (frag->received_len >= frag->total_len) {
+    LOGI("ClientHello reassembly complete (%u bytes)", frag->total_len);
+
+    /* Build the complete handshake header */
+    frag->data[0] = DTLS_HANDSHAKE_TYPE_CLIENT_HELLO;
+    write_uint24_be(frag->data + 1, frag->total_len);
+    frag->data[4] = (frag->msg_seq >> 8) & 0xFF;
+    frag->data[5] = frag->msg_seq & 0xFF;
+    write_uint24_be(frag->data + 6, 0);  /* fragment_offset = 0 */
+    write_uint24_be(frag->data + 9, frag->total_len);  /* fragment_length = total */
+
+    /* Build complete DTLS record */
+    uint32_t handshake_size = DTLS_HANDSHAKE_HEADER_LEN + frag->total_len;
+    uint32_t total_record_len = DTLS_RECORD_HEADER_LEN + handshake_size;
+
+    if (total_record_len > len) {
+      LOGE("Reassembled message too large for buffer");
+      frag->active = 0;
+      return -1;
+    }
+
+    /* Build record header */
+    buf[0] = DTLS_CONTENT_TYPE_HANDSHAKE;
+    memcpy(buf + 1, frag->version, 2);
+    memcpy(buf + 3, frag->epoch, 2);
+    memcpy(buf + 5, frag->seq_num, 6);
+    buf[11] = (handshake_size >> 8) & 0xFF;
+    buf[12] = handshake_size & 0xFF;
+
+    /* Copy handshake data */
+    memcpy(buf + DTLS_RECORD_HEADER_LEN, frag->data, handshake_size);
+
+    frag->active = 0;
+    return total_record_len;
+  }
+
+  /* Not complete yet: more fragments still needed. Rather than blocking here
+   * waiting for them (the old behavior), tell mbedtls WANT_READ and let the
+   * reactor bring us back on a later tick — frag->active stays 1 so the next
+   * call resumes this same reassembly. */
   return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
@@ -1013,7 +1104,7 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
   int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
   uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
   if (total_ms >= 30) {
-    LOGI("sendbreak len=%zu pkts=%d total_ms=%llu pace_ms=%llu lockwait_ms=%llu srtp_ms=%llu sock_ms=%llu",
+    LOGD("sendbreak len=%zu pkts=%d total_ms=%llu pace_ms=%llu lockwait_ms=%llu srtp_ms=%llu sock_ms=%llu",
          len, sb_pkts, (unsigned long long)total_ms,
          (unsigned long long)(sb_pace_ns / 1000000ull),
          (unsigned long long)(sb_lockwait_ns / 1000000ull),
@@ -1126,6 +1217,7 @@ int peer_connection_loop(PeerConnection* pc) {
       if (agent_select_candidate_pair(&pc->agent) < 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       } else if (agent_connectivity_check(&pc->agent) == 0) {
+        pc->b_dtls_handshake_logged = 0;  /* fresh handshake attempt: re-arm the once-only log below */
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
       break;
@@ -1134,11 +1226,43 @@ int peer_connection_loop(PeerConnection* pc) {
       /* Pass the selected remote candidate's address to DTLS handshake.
        * This is critical for multi-client support - mbedtls uses the transport ID
        * (derived from this address) to distinguish between simultaneous DTLS sessions.
-       * Without a unique transport ID per client, cookies and sessions get confused. */
-      LOGI("Starting DTLS handshake (PEER_CONNECTION_CONNECTED)");
+       * Without a unique transport ID per client, cookies and sessions get confused.
+       *
+       * STEP-WISE / NON-BLOCKING: dtls_srtp_handshake() performs at most one
+       * mbedtls_ssl_handshake() step per call and returns DTLS_SRTP_HS_WANT
+       * while the handshake is still in progress (see dtls_srtp.c). This case
+       * must therefore be re-entered — state stays CONNECTED — on later
+       * peer_connection_loop() ticks rather than blocking here until the
+       * handshake finishes or times out. That is what stops one peer's DTLS
+       * handshake (e.g. hung because a browser vanished mid-connect) from
+       * freezing every OTHER peer's turn on the single-threaded signaling
+       * reactor for up to DTLS_HANDSHAKE_TIMEOUT_S (15s) — previously the
+       * do/while inside dtls_srtp_do_handshake() ran entirely inside this one
+       * call before returning control here. */
+      if (!pc->b_dtls_handshake_logged) {
+        LOGI("Starting DTLS handshake (PEER_CONNECTION_CONNECTED)");
+        pc->b_dtls_handshake_logged = 1;
+      }
+
       int dtls_ret = dtls_srtp_handshake(&pc->dtls_srtp, &pc->agent.selected_pair->remote->addr);
+
+      if (dtls_ret == DTLS_SRTP_HS_WANT) {
+        /* Not done yet — stay in CONNECTED and yield back to the reactor so
+         * every other peer gets its turn this tick; we resume the handshake
+         * (dtls_srtp's internal state/deadline persist) next time we're
+         * called. */
+        break;
+      }
+
       if (dtls_ret == 0) {
         LOGD("DTLS-SRTP handshake done");
+
+        /* Half-open-peer diagnostic baseline (see the struct field comment):
+         * stamp the moment DTLS finished so a later stuck-SCTP retransmit loop
+         * can report how long this peer has been half-open. */
+        pc->dtls_complete_ms = ports_get_epoch_time();
+        pc->sctp_retransmit_count = 0;
+        pc->b_half_open_logged = 0;
 
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
@@ -1154,12 +1278,33 @@ int peer_connection_loop(PeerConnection* pc) {
       }
       break;
     }
-    case PEER_CONNECTION_COMPLETED:
+    case PEER_CONNECTION_COMPLETED: {
+      /* TEMP INSTRUMENT (pc.loop phase decomposition — see PC_LOOP_SLOW_MS
+       * above): per-phase wall-clock accumulators for THIS call of
+       * peer_connection_loop(), same clock (ports_get_epoch_time, ms) as the
+       * caller's "slow pc.loop" timer in sigshell.c. Reset every call; the
+       * pl_rtx_* pair is __thread (nested through incoming_rtcp/handle_nack)
+       * and reset here too. Logged once at the end of this case iff the
+       * case's total wall time exceeds PC_LOOP_SLOW_MS — no per-call spam. */
+      uint32_t pl_case_start_ms = ports_get_epoch_time();
+      uint32_t pl_recv_ms = 0, pl_dtls_resend_ms = 0, pl_rtcp_ms = 0,
+               pl_dtls_read_ms = 0, pl_rtp_ms = 0,
+               pl_sr_lockwait_ms = 0, pl_sr_send_ms = 0;
+      pl_rtx_lockwait_ms = 0;
+      pl_rtx_send_ms = 0;
+
       /* Drain all pending packets from the socket.
        * STUN consent requests arrive frequently (~16/sec) and we must respond
-       * to all of them. agent_recv returns 0 for STUN (handled internally),
+       * to all of them. agent_recv returns 0 for STUN (handled internally,
+       * INCLUDING any consent-response send — there is no separate STUN send
+       * call site at this level, so its cost is folded into pl_recv_ms),
        * >0 for data packets, <0 when no more data is available. */
-      while ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) >= 0) {
+      for (;;) {
+        uint32_t pl_recv_t0 = ports_get_epoch_time();
+        pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf));
+        pl_recv_ms += ports_get_epoch_time() - pl_recv_t0;
+        if (pc->agent_ret < 0) break;
+
         if (pc->agent_ret == 0) {
           /* STUN packet was handled internally, continue draining */
           pc->in_stun_pkts++;
@@ -1186,15 +1331,42 @@ int peer_connection_loop(PeerConnection* pc) {
            * Guard on datachannel + SCTP-not-up: once the peer's DTLS completes it
            * sends app-data (0x17), not handshake records, so this goes quiet. */
           if (pc->config.datachannel && !sctp_is_connected(&pc->sctp)) {
+            pc->sctp_retransmit_count++;
             LOGW("DTLS peer retransmitting flight post-complete (ct=0x%02x), SCTP down"
                  " — resending server final flight", pc->agent_buf[0]);
-            dtls_srtp_resend(&pc->dtls_srtp);
+            {
+              uint32_t pl_dr_t0 = ports_get_epoch_time();
+              dtls_srtp_resend(&pc->dtls_srtp);
+              pl_dtls_resend_ms += ports_get_epoch_time() - pl_dr_t0;
+            }
+
+            /* Orphan/half-open visibility: fire ONCE per peer, the first time
+             * it's been stuck (DTLS up, SCTP never opened) for >3s. Low-volume
+             * by design — this is what lets a bug report show orphaned peers
+             * accumulating across a handful of browser refreshes without
+             * re-introducing per-retransmit log spam (the LOGW above already
+             * fires every retransmit; this does not). */
+            if (!pc->b_half_open_logged) {
+              uint32_t age_ms = ports_get_epoch_time() - pc->dtls_complete_ms;
+              if (age_ms > 3000) {
+                LOGI("peer half-open (DTLS up, SCTP down) age_ms=%u retransmits=%u",
+                     age_ms, pc->sctp_retransmit_count);
+                pc->b_half_open_logged = 1;
+              }
+            }
           }
 
         } else if (rtcp_probe(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTCP packet");
+          uint32_t pl_rtcp_t0 = ports_get_epoch_time();
           dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
+          /* NOTE: peer_connection_incoming_rtcp may itself call
+           * peer_connection_rtx_resend() (NACK -> RTX retransmit), which
+           * accumulates into pl_rtx_lockwait_ms/pl_rtx_send_ms — so pl_rtcp_ms
+           * below is a SUPERSET that includes any nested RTX resend time; the
+           * two rtx_* fields in the final log break that portion back out. */
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
+          pl_rtcp_ms += ports_get_epoch_time() - pl_rtcp_t0;
 
         } else if (dtls_srtp_probe(pc->agent_buf)) {
           /* Drain ssl_read until WANT_READ (returned as 0). mbedtls returns
@@ -1204,6 +1376,7 @@ int peer_connection_loop(PeerConnection* pc) {
            * (it sits in mbedtls's internal buffer until the next BIO_recv
            * overwrites it). */
           int ret;
+          uint32_t pl_dread_t0 = ports_get_epoch_time();
           do {
             ret = dtls_srtp_read(&pc->dtls_srtp, pc->temp_buf, sizeof(pc->temp_buf));
             LOGD("Got DTLS data %d", ret);
@@ -1217,10 +1390,12 @@ int peer_connection_loop(PeerConnection* pc) {
                    pc->agent_ret, (void*)&pc->sctp, ret);   /* TEMP: correlate to the wedged assoc */
             }
           } while (ret > 0);
+          pl_dtls_read_ms += ports_get_epoch_time() - pl_dread_t0;
 
         } else if (rtp_packet_validate(pc->agent_buf, pc->agent_ret)) {
           LOGD("Got RTP packet");
 
+          uint32_t pl_rtp_t0 = ports_get_epoch_time();
           dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
 
           ssrc = rtp_get_ssrc(pc->agent_buf);
@@ -1229,6 +1404,7 @@ int peer_connection_loop(PeerConnection* pc) {
           } else if (ssrc == pc->remote_vssrc) {
             rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
           }
+          pl_rtp_ms += ports_get_epoch_time() - pl_rtp_t0;
 
         } else {
           LOGW("Unknown data");
@@ -1265,7 +1441,11 @@ int peer_connection_loop(PeerConnection* pc) {
           uint8_t sr_buf[28 + SRTP_MAX_TRAILER_LEN + 4];
           int sr_len = rtcp_build_sr(sr_buf, SSRC_H264, ntp_now, rtp_ts_now,
                                      pc->sr_packets_sent, pc->sr_octets_sent);
+          /* TEMP INSTRUMENT (pc.loop phase decomposition): time the send_mtx
+           * acquire separately from the locked encrypt+send. */
+          uint32_t pl_sr_t0 = ports_get_epoch_time();
           pthread_mutex_lock(&pc->send_mtx);
+          uint32_t pl_sr_t1 = ports_get_epoch_time();
           dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, sr_buf, &sr_len);
           if (sr_len > 0) {
             agent_send(&pc->agent, sr_buf, (size_t)sr_len);
@@ -1274,10 +1454,30 @@ int peer_connection_loop(PeerConnection* pc) {
                  pc->sr_packets_sent, pc->sr_octets_sent);
           }
           pthread_mutex_unlock(&pc->send_mtx);
+          uint32_t pl_sr_t2 = ports_get_epoch_time();
+          pl_sr_lockwait_ms += pl_sr_t1 - pl_sr_t0;
+          pl_sr_send_ms += pl_sr_t2 - pl_sr_t1;
+        }
+      }
+
+      /* TEMP INSTRUMENT (pc.loop phase decomposition — see PC_LOOP_SLOW_MS
+       * above): one line, only when this call of the COMPLETED case ran long,
+       * pinpointing which phase ate the time. rtcp_ms is a superset of
+       * rtx_lockwait_ms+rtx_send_ms (see the note at the RTCP branch above). */
+      {
+        uint32_t pl_total_ms = ports_get_epoch_time() - pl_case_start_ms;
+        if (pl_total_ms >= PC_LOOP_SLOW_MS) {
+          LOGI("pc.loop slow dur_ms=%u [recv=%u dtlsresend=%u rtcp=%u "
+               "rtx_lockwait=%u rtx_send=%u dtlsread=%u rtp=%u "
+               "sr_lockwait=%u sr_send=%u]",
+               pl_total_ms, pl_recv_ms, pl_dtls_resend_ms, pl_rtcp_ms,
+               pl_rtx_lockwait_ms, pl_rtx_send_ms, pl_dtls_read_ms, pl_rtp_ms,
+               pl_sr_lockwait_ms, pl_sr_send_ms);
         }
       }
 
       break;
+    }
     case PEER_CONNECTION_FAILED:
       break;
     case PEER_CONNECTION_DISCONNECTED:

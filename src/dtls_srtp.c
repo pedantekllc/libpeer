@@ -183,14 +183,22 @@ int dtls_srtp_resend(DtlsSrtp* dtls_srtp) {
   return ret;
 }
 
+/* Default BIO recv (used only when a caller keeps dtls_srtp's default
+ * udp_send/udp_recv rather than overriding them, e.g. a raw DtlsSrtp used
+ * outside peer_connection.c). udp_socket_recvfrom() is already non-blocking
+ * (it returns <= 0 immediately when nothing is queued); this must NOT spin
+ * waiting for data itself — mbedtls's WANT_READ contract is exactly "no data
+ * right now, call me again later" and the caller (dtls_srtp_do_handshake)
+ * is responsible for the retry/step scheduling. Busy-looping here would
+ * block whatever thread drives the handshake for as long as the peer stays
+ * silent, which is the freeze this non-blocking conversion eliminates. */
 int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
 
-  int ret;
-
-  while ((ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len)) <= 0) {
-    ports_sleep_ms(1);
+  int ret = udp_socket_recvfrom(udp_socket, &udp_socket->bind_addr, buf, len);
+  if (ret <= 0) {
+    return MBEDTLS_ERR_SSL_WANT_READ;
   }
 
   LOGD("dtls_srtp_udp_recv (%d)", ret);
@@ -253,6 +261,17 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
   pthread_mutex_init(&dtls_srtp->ssl_mutex, NULL);
+
+  /* Fresh handshake attempt: clear the step-wise handshake state (see
+   * DTLS_SRTP_HS_WANT in dtls_srtp.h). This is the one place a new
+   * handshake attempt begins (peer_connection_create_sdp calls
+   * dtls_srtp_reset_session() + dtls_srtp_init() every time it (re)creates
+   * an SDP offer/answer), so the wall-clock deadline and one-time BIO/timer
+   * setup MUST restart here rather than carrying over from a previous
+   * connection attempt on the same DtlsSrtp instance. */
+  memset(&dtls_srtp->hs_deadline, 0, sizeof(dtls_srtp->hs_deadline));
+  dtls_srtp->hs_initialized = 0;
+  dtls_srtp->hs_substate = DTLS_HS_SUB_NEED_RESET;
 
   /* Initialize per-connection mbedtls structures (SSL context, config, etc.)
    * but NOT cert/pkey/entropy/ctr_drbg - those are shared */
@@ -468,44 +487,99 @@ static void dtls_srtp_key_derivation_cb(void* context,
  * its own flight, not the initial ClientHello wait).  Without a separate
  * wall-clock bound the server-role peer_connection_loop blocks indefinitely
  * if the browser ICE never completes and no ClientHello arrives — freezing
- * the reactor thread for the entire test/session lifetime. */
+ * the reactor thread for the entire test/session lifetime.
+ *
+ * Historically this deadline (and the mbedtls_ssl_handshake() retry) ran in a
+ * blocking do/while INSIDE dtls_srtp_do_handshake(), so one call could occupy
+ * the calling thread for up to DTLS_HANDSHAKE_TIMEOUT_S seconds. Since the
+ * caller was the single-threaded signaling reactor (peer_connection_loop, one
+ * thread serving every PeerConnection), a peer that vanished mid-handshake
+ * (e.g. a browser refresh) froze WebRTC for every other peer/camera on this
+ * device for up to that long. dtls_srtp_do_handshake is now step-wise: it
+ * calls mbedtls_ssl_handshake() exactly ONCE per invocation and returns
+ * DTLS_SRTP_HS_WANT (see dtls_srtp.h) instead of looping, so the deadline
+ * must be tracked in the DtlsSrtp struct (hs_deadline) rather than a
+ * stack-local — it has to survive across the many separate calls that now
+ * make up one handshake attempt. */
 #define DTLS_HANDSHAKE_TIMEOUT_S 15
 
+/* One non-blocking step of the DTLS handshake: at most one call to
+ * mbedtls_ssl_handshake(). Returns:
+ *   0                  - handshake finished (success or a definitive mbedtls
+ *                         result such as MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED
+ *                         are NOT folded into this — see below).
+ *   DTLS_SRTP_HS_WANT  - mbedtls returned WANT_READ/WANT_WRITE and the
+ *                         wall-clock deadline has not yet passed; call again.
+ *   MBEDTLS_ERR_SSL_TIMEOUT - WANT_READ/WANT_WRITE but the deadline passed.
+ *   MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED - passed through verbatim (the
+ *                         server-role cookie exchange; handled one level up).
+ *   anything else (<0) - a real mbedtls failure.
+ *
+ * The one-time-per-attempt mbedtls_ssl_set_bio/set_timer_cb/export-keys-cb
+ * setup and the deadline are gated on dtls_srtp->hs_initialized so they run
+ * exactly once per handshake attempt, not once per step — mbedtls retains
+ * those callbacks across mbedtls_ssl_session_reset() (used by the server
+ * role's HelloVerify retry, see dtls_srtp_handshake_server), so re-arming
+ * them every step would be wasteful (and re-arming the deadline every step
+ * would defeat the whole point of it). hs_initialized (and hs_deadline) are
+ * cleared exactly once, in dtls_srtp_init(), i.e. when a genuinely NEW
+ * handshake attempt begins. */
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   int ret;
 
-  struct timespec deadline;
-  clock_gettime(CLOCK_MONOTONIC, &deadline);
-  deadline.tv_sec += DTLS_HANDSHAKE_TIMEOUT_S;
+  if (!dtls_srtp->hs_initialized) {
+    clock_gettime(CLOCK_MONOTONIC, &dtls_srtp->hs_deadline);
+    dtls_srtp->hs_deadline.tv_sec += DTLS_HANDSHAKE_TIMEOUT_S;
 
-  // Use per-connection timer instead of static to support multiple simultaneous handshakes
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+    // Use per-connection timer instead of static to support multiple simultaneous handshakes
+    mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &dtls_srtp->timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
 
 #if CONFIG_MBEDTLS_2_X
-  mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_conf_export_keys_ext_cb(&dtls_srtp->conf, dtls_srtp_key_derivation_cb, dtls_srtp);
 #else
-  mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
+    mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
-  mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+    mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
 
-  do {
-    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
+    dtls_srtp->hs_initialized = 1;
+  }
 
-    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      if (now.tv_sec > deadline.tv_sec ||
-          (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-        LOGE("DTLS handshake timed out after %d seconds (no ClientHello from browser)", DTLS_HANDSHAKE_TIMEOUT_S);
-        return MBEDTLS_ERR_SSL_TIMEOUT;
-      }
+  ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
+
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > dtls_srtp->hs_deadline.tv_sec ||
+        (now.tv_sec == dtls_srtp->hs_deadline.tv_sec && now.tv_nsec >= dtls_srtp->hs_deadline.tv_nsec)) {
+      LOGE("DTLS handshake timed out after %d seconds (no ClientHello from browser)", DTLS_HANDSHAKE_TIMEOUT_S);
+      return MBEDTLS_ERR_SSL_TIMEOUT;
     }
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
+    return DTLS_SRTP_HS_WANT;
+  }
 
   return ret;
 }
 
+/* Step-wise server handshake. Called once per dtls_srtp_handshake() call
+ * (i.e. once per peer_connection_loop() tick while in PEER_CONNECTION_
+ * CONNECTED) — drives dtls_srtp_do_handshake() exactly one step and returns.
+ *
+ * DTLS's cookie exchange (RFC 6347 §4.2.1) requires the server to
+ * mbedtls_ssl_session_reset() + set_client_transport_id() both before the
+ * very first ClientHello AND again after sending a HelloVerifyRequest (so it
+ * accepts the client's second ClientHello, this time carrying the cookie).
+ * The former blocking implementation did this inside an unbounded `while(1)`
+ * that looped internally until the whole exchange finished or failed —
+ * itself one of the two nested busy-loops that produced the 15s reactor
+ * freeze (see dtls_srtp_do_handshake's comment for the other). It's now
+ * tracked via dtls_srtp->hs_substate instead of looping: NEED_RESET means
+ * "the next step must (re)issue session_reset+transport_id before stepping"
+ * (true both for a brand-new attempt and immediately after a
+ * HelloVerifyRequest); STEPPING means "just keep calling
+ * dtls_srtp_do_handshake". Either way this function returns after ONE step,
+ * propagating DTLS_SRTP_HS_WANT so the caller re-invokes it on the next
+ * tick — it never spins waiting for the peer's next flight itself. */
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
   int ret;
 
@@ -514,7 +588,7 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
     LOGE("CERTIFICATE MISMATCH! Connection: %s, Shared: %s", dtls_srtp->local_fingerprint, g_shared_cert.fingerprint);
   }
 
-  while (1) {
+  if (dtls_srtp->hs_substate == DTLS_HS_SUB_NEED_RESET) {
     // Use actual client address with port for transport ID to distinguish between multiple clients.
     // Including the port is critical when multiple clients connect from the same IP address.
     char client_addr_str[ADDRSTRLEN + 10];  // IP + ":port"
@@ -533,39 +607,64 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
 
     mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, (unsigned char*)client_addr_str, addr_len);
 
-    ret = dtls_srtp_do_handshake(dtls_srtp);
+    dtls_srtp->hs_substate = DTLS_HS_SUB_STEPPING;
+  }
 
-    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-      LOGD("DTLS hello verification requested");
+  ret = dtls_srtp_do_handshake(dtls_srtp);
 
-    } else if (ret != 0) {
-      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
+  if (ret == DTLS_SRTP_HS_WANT) {
+    /* Made progress (or is still waiting on the peer's next flight) but not
+     * done — stay STEPPING and let the caller invoke us again next tick. */
+    return DTLS_SRTP_HS_WANT;
+  }
 
-      break;
+  if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
+    LOGD("DTLS hello verification requested");
+    /* Cookie round-trip: the client must resend a ClientHello carrying the
+     * cookie mbedtls just handed it. Arm the reset for the NEXT step (done
+     * once, at the top of this function) and keep going — this is still the
+     * same handshake attempt / same wall-clock deadline (hs_deadline is only
+     * cleared by dtls_srtp_init(), not here). */
+    dtls_srtp->hs_substate = DTLS_HS_SUB_NEED_RESET;
+    return DTLS_SRTP_HS_WANT;
+  }
 
-    } else {
-      break;
-    }
+  if (ret != 0) {
+    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
+    return ret;
   }
 
   LOGD("DTLS server handshake done");
 
-  return ret;
+  return 0;
 }
 
 static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
   int ret;
 
   ret = dtls_srtp_do_handshake(dtls_srtp);
+
+  if (ret == DTLS_SRTP_HS_WANT) {
+    return DTLS_SRTP_HS_WANT;
+  }
+
   if (ret != 0) {
     LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
+    return ret;
   }
 
   LOGD("DTLS client handshake done");
 
-  return ret;
+  return 0;
 }
 
+/* dtls_srtp_handshake — public entrypoint, driven once per
+ * peer_connection_loop() tick from PEER_CONNECTION_CONNECTED. Non-blocking:
+ * performs at most one mbedtls_ssl_handshake() step (via
+ * dtls_srtp_handshake_server/client -> dtls_srtp_do_handshake) and returns
+ * DTLS_SRTP_HS_WANT while the handshake is still in progress. remote_addr is
+ * (re)stamped on every call — cheap, and needed on the server role in case
+ * the selected candidate pair address is still settling early in CONNECTED. */
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
   int ret;
   dtls_srtp->remote_addr = addr;
@@ -574,6 +673,13 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
     ret = dtls_srtp_handshake_server(dtls_srtp);
   } else {
     ret = dtls_srtp_handshake_client(dtls_srtp);
+  }
+
+  if (ret == DTLS_SRTP_HS_WANT) {
+    /* Still in progress — nothing to inspect on the ssl context yet (no
+     * peer cert, no negotiated SRTP profile). Propagate the sentinel
+     * unchanged; the caller steps again on the next tick. */
+    return DTLS_SRTP_HS_WANT;
   }
 
   const mbedtls_x509_crt* remote_crt;
