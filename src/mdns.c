@@ -201,3 +201,184 @@ int mdns_resolve_addr(const char* hostname, Address* addr) {
   udp_socket_close(&udp_socket);
   return 0;
 }
+
+// ── Async resolver (see mdns.h) ─────────────────────────────────────────────
+// One shared 5353 multicast socket, opened while any query is pending, plus a
+// small state table. Everything runs on the caller's (reactor) thread.
+
+#define MDNS_ASYNC_MAX 8
+#define MDNS_ASYNC_CACHE_MS 30000  /* keep a result this long for late lookups */
+#define MDNS_ASYNC_FAIL_CACHE_MS 5000
+
+typedef enum {
+  MDNS_ENTRY_FREE = 0,
+  MDNS_ENTRY_PENDING,
+  MDNS_ENTRY_RESOLVED,
+  MDNS_ENTRY_FAILED,
+} MdnsEntryState;
+
+typedef struct {
+  MdnsEntryState state;
+  char hostname[128];
+  Address addr;         /* RESOLVED: the answer (IP only) */
+  uint64_t deadline;    /* PENDING: give up at this time */
+  uint64_t next_send;   /* PENDING: next query (re)send */
+  uint64_t expire_at;   /* RESOLVED/FAILED: free the slot at this time */
+} MdnsAsyncEntry;
+
+static MdnsAsyncEntry g_mdns_entries[MDNS_ASYNC_MAX];
+static UdpSocket g_mdns_async_socket;
+static int g_mdns_async_socket_open = 0;
+
+static int mdns_async_ensure_socket(void) {
+  Address mcast_addr = {0};
+  if (g_mdns_async_socket_open) {
+    return 0;
+  }
+  if (udp_socket_open(&g_mdns_async_socket, AF_INET, MDNS_PORT) < 0) {
+    LOGE("mdns-async: failed to open socket");
+    return -1;
+  }
+  addr_from_string(MDNS_GROUP, &mcast_addr);
+  addr_set_port(&mcast_addr, MDNS_PORT);
+  if (udp_socket_add_multicast_group(&g_mdns_async_socket, &mcast_addr) < 0) {
+    LOGE("mdns-async: failed to join multicast group");
+    udp_socket_close(&g_mdns_async_socket);
+    return -1;
+  }
+  g_mdns_async_socket_open = 1;
+  return 0;
+}
+
+int mdns_async_request(const char* hostname) {
+  int i, free_slot = -1;
+  uint64_t now = mdns_now_ms();
+
+  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+    MdnsAsyncEntry* e = &g_mdns_entries[i];
+    if (e->state != MDNS_ENTRY_FREE && strcmp(e->hostname, hostname) == 0) {
+      return 0;  /* already pending or cached */
+    }
+    if (e->state == MDNS_ENTRY_FREE && free_slot < 0) {
+      free_slot = i;
+    }
+  }
+  if (free_slot < 0) {
+    LOGW("mdns-async: pending table full, dropping %s", hostname);
+    return -1;
+  }
+  if (mdns_async_ensure_socket() != 0) {
+    return -1;
+  }
+
+  MdnsAsyncEntry* e = &g_mdns_entries[free_slot];
+  memset(e, 0, sizeof(*e));
+  snprintf(e->hostname, sizeof(e->hostname), "%s", hostname);
+  e->state = MDNS_ENTRY_PENDING;
+  e->deadline = now + MDNS_TOTAL_TIMEOUT_MS;
+  e->next_send = 0;  /* poll sends the first query immediately */
+  return 0;
+}
+
+void mdns_async_poll(void) {
+  uint8_t buf[256];
+  uint8_t query[256];
+  char addr_string[ADDRSTRLEN];
+  Address mcast_addr = {0};
+  fd_set rfds;
+  struct timeval tv;
+  uint64_t now = mdns_now_ms();
+  int i, ret, size, any_pending = 0;
+
+  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+    MdnsAsyncEntry* e = &g_mdns_entries[i];
+    switch (e->state) {
+      case MDNS_ENTRY_PENDING:
+        if (now >= e->deadline) {
+          LOGI("mdns-async: %s did not resolve", e->hostname);
+          e->state = MDNS_ENTRY_FAILED;
+          e->expire_at = now + MDNS_ASYNC_FAIL_CACHE_MS;
+          break;
+        }
+        any_pending = 1;
+        if (now >= e->next_send && g_mdns_async_socket_open) {
+          size = mdns_build_query(e->hostname, query, sizeof(query));
+          if (size > 0) {
+            addr_from_string(MDNS_GROUP, &mcast_addr);
+            addr_set_port(&mcast_addr, MDNS_PORT);
+            udp_socket_sendto(&g_mdns_async_socket, &mcast_addr, query, size);
+          }
+          e->next_send = now + MDNS_RESEND_INTERVAL_MS;
+        }
+        break;
+      case MDNS_ENTRY_RESOLVED:
+      case MDNS_ENTRY_FAILED:
+        if (now >= e->expire_at) {
+          e->state = MDNS_ENTRY_FREE;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (!g_mdns_async_socket_open) {
+    return;
+  }
+
+  /* Drain every available datagram without blocking (0-timeout select). */
+  for (;;) {
+    FD_ZERO(&rfds);
+    FD_SET(g_mdns_async_socket.fd, &rfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    ret = select(g_mdns_async_socket.fd + 1, &rfds, NULL, NULL, &tv);
+    if (ret <= 0 || !FD_ISSET(g_mdns_async_socket.fd, &rfds)) {
+      break;
+    }
+    ret = udp_socket_recvfrom(&g_mdns_async_socket, NULL, buf, sizeof(buf));
+    if (ret <= 0) {
+      break;
+    }
+    for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+      MdnsAsyncEntry* e = &g_mdns_entries[i];
+      if (e->state != MDNS_ENTRY_PENDING) {
+        continue;
+      }
+      if (mdns_parse_answer(buf, ret, &e->addr, e->hostname) == 0) {
+        addr_set_family(&e->addr, AF_INET);
+        addr_to_string(&e->addr, addr_string, sizeof(addr_string));
+        LOGI("mdns-async: resolved %s -> %s", e->hostname, addr_string);
+        e->state = MDNS_ENTRY_RESOLVED;
+        e->expire_at = now + MDNS_ASYNC_CACHE_MS;
+        break;
+      }
+    }
+  }
+
+  /* No queries in flight: release the shared socket (reopened on demand). */
+  if (!any_pending) {
+    udp_socket_close(&g_mdns_async_socket);
+    g_mdns_async_socket_open = 0;
+  }
+}
+
+int mdns_async_lookup(const char* hostname, Address* addr) {
+  int i;
+  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+    MdnsAsyncEntry* e = &g_mdns_entries[i];
+    if (e->state == MDNS_ENTRY_FREE || strcmp(e->hostname, hostname) != 0) {
+      continue;
+    }
+    switch (e->state) {
+      case MDNS_ENTRY_PENDING:
+        return 0;
+      case MDNS_ENTRY_RESOLVED:
+        *addr = e->addr;
+        return 1;
+      default:
+        return -1;
+    }
+  }
+  return -1;
+}

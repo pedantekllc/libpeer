@@ -973,6 +973,16 @@ void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len)
       local, ltype, rtype, pc->config.bind_iface[0] ? pc->config.bind_iface : "-");
 }
 
+void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out) {
+  if (!pc || !out) return;
+  out->turn_alloc_ok = pc->agent.turn_alloc_ok;
+  out->turn_alloc_rejected = pc->agent.turn_alloc_rejected;
+  out->mdns_resolved = pc->agent.mdns_resolved;
+  out->mdns_queued = pc->agent.mdns_queued;
+  out->selected_remote_type = pc->agent.selected_remote_type;
+  out->dtls_complete_ms = pc->dtls_complete_ms;
+}
+
 void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }
@@ -1201,6 +1211,10 @@ int peer_connection_loop(PeerConnection* pc) {
   uint32_t ssrc = 0;
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
   pc->agent_ret = -1;
+
+  /* Pump async mDNS (.local) candidate resolution — no-op unless the remote
+   * offered mDNS-obfuscated candidates that are still resolving. */
+  agent_poll_mdns_candidates(&pc->agent);
 
   /* Per-iteration — must stay LOGD (like agent_recv/RTCP/DTLS below), else it
    * floods every connected session: the loop runs ~75 Hz per PeerConnection, so
@@ -1751,10 +1765,38 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
 
 int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
   Agent* agent = &pc->agent;
-  if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], candidate, candidate + strlen(candidate)) != 0) {
+  char mdns_hostname[128];
+  int parsed, i;
+
+  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
+    LOGW("Remote candidate table full; ignoring trickled candidate");
     return -1;
   }
+  IceCandidate* slot = &agent->remote_candidates[agent->remote_candidates_count];
+  parsed = ice_candidate_from_description(slot, candidate, candidate + strlen(candidate),
+                                          mdns_hostname, sizeof(mdns_hostname));
+  if (parsed < 0) {
+    return -1;
+  }
+  if (parsed == 1) {
+    /* .local candidate: resolve asynchronously; promoted + paired on resolve. */
+    agent_queue_mdns_candidate(agent, slot, mdns_hostname);
+    return 0;
+  }
+
+  /* Dedupe by foundation, same rule as the SDP parse path (a candidate often
+   * arrives both in the answer SDP and as a trickle). */
+  for (i = 0; i < agent->remote_candidates_count; i++) {
+    if (strcmp(agent->remote_candidates[i].foundation, slot->foundation) == 0) {
+      return 0;
+    }
+  }
+
   LOGD("Add candidate: %s", candidate);
   agent->remote_candidates_count++;
+  /* Pair it now. Trickled candidates land AFTER the answer-time
+   * agent_update_candidate_pairs() (the only bulk pairing call), so without
+   * this they sat in the table unpaired and were never checked. */
+  agent_pair_remote_candidate(agent, slot);
   return 0;
 }

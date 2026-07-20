@@ -56,7 +56,16 @@ void ice_candidate_create(IceCandidate* ice_candidate, int foundation, IceCandid
 
 void ice_candidate_to_description(IceCandidate* candidate, char* description, int length);
 
-int ice_candidate_from_description(IceCandidate* candidate, char* description, char* end);
+// Parses one `a=candidate:` line into `candidate`.
+// Returns 0 on success, -1 on parse failure/unsupported candidate.
+// Returns 1 for an mDNS-obfuscated (".local") host candidate: `candidate` is
+// complete except for its IP, and the .local name is copied into
+// `mdns_hostname` for the caller to resolve asynchronously (mdns_async_* +
+// agent_queue_mdns_candidate). Resolving inline here would block the signaling
+// reactor for up to MDNS_TOTAL_TIMEOUT_MS per candidate — and off-LAN the
+// resolve can never succeed, so the stall is pure damage.
+int ice_candidate_from_description(IceCandidate* candidate, char* description, char* end,
+                                   char* mdns_hostname, size_t mdns_hostname_size);
 
 int ice_candidate_get_local_address(IceCandidate* candidate, Address* address);
 

@@ -39,6 +39,16 @@ typedef enum AgentMode {
 
 } AgentMode;
 
+// A remote ".local" (mDNS-obfuscated) candidate parked while its name resolves
+// asynchronously (mdns_async_*). `candidate` is complete except its IP.
+#define AGENT_MAX_PENDING_MDNS 4
+
+typedef struct AgentPendingMdns {
+  int active;
+  char hostname[128];
+  IceCandidate candidate;
+} AgentPendingMdns;
+
 typedef struct Agent Agent;
 
 struct Agent {
@@ -86,6 +96,34 @@ struct Agent {
   int candidate_pairs_num;
   int use_candidate;
   uint32_t transaction_id[3];
+
+  /* Remote .local candidates awaiting async mDNS resolution (see
+   * agent_queue_mdns_candidate / agent_poll_mdns_candidates). */
+  AgentPendingMdns pending_mdns[AGENT_MAX_PENDING_MDNS];
+
+  /* ── Connection-attempt diagnostics (Plane A observability) ────────────────
+   * Cumulative for this Agent's lifetime (one Agent per PeerConnection, one
+   * PeerConnection per connection attempt — there is no ICE restart today, so
+   * "per Agent" == "per attempt"). Read via peer_connection_get_diag(). Reset
+   * to their zero/-1 defaults in agent_clear_candidates() (called once at
+   * agent_create() and again at the top of every SDP_TYPE_OFFER, i.e. before
+   * gathering starts for this attempt). */
+  uint32_t turn_alloc_ok;         /* TURN Allocate succeeded (see agent_create_turn_addr) */
+  uint32_t turn_alloc_rejected;   /* TURN authenticated Allocate rejected                 */
+  uint32_t mdns_resolved;         /* remote .local candidate resolved + paired            */
+  uint32_t mdns_queued;           /* remote .local candidate EVER queued for async resolve
+                                   * this attempt (agent_queue_mdns_candidate) — the
+                                   * "had a pending mDNS candidate" signal for Plane-B's
+                                   * per-attempt died-at inference (webrtc-connection-
+                                   * reliability.md). Distinct from mdns_resolved: an
+                                   * attempt can queue N candidates and resolve zero of
+                                   * them (the RC2 failure signature) or resolve none
+                                   * because it never offered any (queued==0) — the two
+                                   * cases must not be conflated. */
+  int      selected_remote_type;  /* IceCandidateType of the selected pair's remote
+                                   * candidate once agent_connectivity_check commits
+                                   * (host=0/srflx=1/prflx=2/relay=3); -1 = not yet
+                                   * selected for this attempt. */
 };
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
@@ -99,6 +137,24 @@ int agent_send(Agent* agent, const uint8_t* buf, int len);
 int agent_recv(Agent* agent, uint8_t* buf, int len);
 
 void agent_set_remote_description(Agent* agent, char* description);
+
+// Pair one late-arriving remote candidate against every same-family local
+// candidate (append-only; safe mid-CHECKING — see agent_add_prflx_candidate).
+// Used for trickled candidates and async-resolved mDNS candidates, which land
+// after the answer-time bulk pairing and would otherwise never be checked.
+void agent_pair_remote_candidate(Agent* agent, IceCandidate* remote);
+
+// Park a parsed-but-unresolved ".local" remote candidate (from
+// ice_candidate_from_description returning 1) and kick off its async mDNS
+// resolution. Idempotent per hostname.
+void agent_queue_mdns_candidate(Agent* agent, const IceCandidate* candidate, const char* hostname);
+
+// Pump pending .local resolutions (call every peer_connection_loop tick; cheap
+// no-op when none are pending). A resolved name becomes a real remote
+// candidate, incrementally paired against every local candidate — same
+// append-only discipline as agent_add_prflx_candidate, so it is safe while
+// connectivity checks are in flight. Failed/expired names are dropped.
+void agent_poll_mdns_candidates(Agent* agent);
 
 // Learn a peer-reflexive remote candidate from the source address of a
 // validated inbound STUN binding request, and form candidate pairs for it.

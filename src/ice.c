@@ -83,7 +83,8 @@ void ice_candidate_to_description(IceCandidate* candidate, char* description, in
            typ_raddr);
 }
 
-int ice_candidate_from_description(IceCandidate* candidate, char* description, char* end) {
+int ice_candidate_from_description(IceCandidate* candidate, char* description, char* end,
+                                   char* mdns_hostname, size_t mdns_hostname_size) {
   char* candidate_start = description;
   uint32_t port;
   char type[16];
@@ -133,12 +134,16 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
 
   addr_set_port(&candidate->addr, port);
 
-  if (strstr(addrstring, "local") != NULL) {
-    if (mdns_resolve_addr(addrstring, &candidate->addr) == 0) {
-      LOGW("Failed to resolve mDNS address");
+  if (strstr(addrstring, ".local") != NULL) {
+    /* mDNS-obfuscated host candidate — hand the name back for async resolve
+     * (see ice.h). No blocking resolve on this thread. */
+    if (mdns_hostname == NULL) {
       return -1;
     }
-  } else if (addr_from_string(addrstring, &candidate->addr) == 0) {
+    snprintf(mdns_hostname, mdns_hostname_size, "%s", addrstring);
+    return 1;
+  }
+  if (addr_from_string(addrstring, &candidate->addr) == 0) {
     return -1;
   }
 

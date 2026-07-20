@@ -154,6 +154,36 @@ uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc);
  * a session wedged — e.g. inData=0 stunAgeMs huge = dead browser→device path. */
 void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len);
 
+/* Connection-attempt diagnostics for the Plane-A WebRTC KPI (see
+ * docs/architecture/webrtc-connection-reliability.md). One PeerConnection is
+ * one connection attempt (no ICE restart today), so these are naturally
+ * per-attempt counters — cumulative for this pc's Agent, reset at
+ * agent_clear_candidates() (agent_create + every fresh offer). */
+typedef struct {
+  uint32_t turn_alloc_ok;         /* TURN Allocate succeeded this attempt        */
+  uint32_t turn_alloc_rejected;   /* TURN authenticated Allocate rejected        */
+  uint32_t mdns_resolved;         /* remote .local candidate(s) resolved+paired  */
+  uint32_t mdns_queued;           /* remote .local candidate(s) EVER queued for
+                                   * async resolve this attempt (see agent.h's
+                                   * mdns_queued) — Plane-B's "had a pending mDNS
+                                   * candidate" signal, distinct from resolved.  */
+  int      selected_remote_type;  /* IceCandidateType of the selected pair's
+                                   * remote candidate (0=host,1=srflx,2=prflx,
+                                   * 3=relay); -1 = no pair selected yet.        */
+  uint32_t dtls_complete_ms;      /* wall-clock ms (ports_get_epoch_time domain,
+                                   * same as PeerConnection.dtls_complete_ms) the
+                                   * DTLS handshake finished this attempt; 0 = DTLS
+                                   * never completed. For Plane-B's dtls_ms (paired
+                                   * with the PC-creation wall-clock stamp the shell
+                                   * keeps in the SAME domain — see sigshell_bind.c's
+                                   * lane_side.created_epoch_ms). */
+} PeerConnectionDiag;
+
+/* Snapshot the above into `out`. Safe to call at any time (reads the live
+ * Agent fields); the caller decides when the numbers are meaningful (e.g. once
+ * per lane at CONNECTED, or once more at teardown for an unconnected lane). */
+void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out);
+
 void* peer_connection_get_sctp(PeerConnection* pc);
 
 /* Test-only: arm dropping the next `count` server DTLS final flights, to
