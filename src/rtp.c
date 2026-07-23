@@ -452,6 +452,12 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
   uint8_t* nalu_buf = rtp_decoder->nalu_buf;
   int* offset = &rtp_decoder->nalu_offset;
   if (!nalu_buf) return -1;  /* not initialised */
+  if (size <= sizeof(RtpHeader)) {
+    /* No payload at all (or not even a full RTP header): reading
+     * rtp_packet->payload[0] below would be an out-of-bounds read, and
+     * payload_size would be <= 0. Never legitimate for H.264. */
+    return -1;
+  }
   RtpPacket* rtp_packet = (RtpPacket*)buf;
   uint8_t nalu_type = *rtp_packet->payload & 0x1f;
   int payload_size = size - sizeof(RtpHeader);
@@ -491,6 +497,13 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
     }
     *offset = 0;  /* aggregated NALs are complete; keep FU-A reassembly clean */
   } else if (nalu_type == FU_A) {
+    if (payload_size < (int)(sizeof(NaluHeader) + sizeof(FuHeader))) {
+      // Not enough payload to hold the FU indicator + FU header (2 bytes) —
+      // never a legitimate FU-A packet. Without this guard the subtraction
+      // below goes negative and the resulting (size_t)-cast length in the
+      // memcpy below wraps to a huge value.
+      return 0;
+    }
     NaluHeader* fu_indicator = (NaluHeader*)rtp_packet->payload;
     FuHeader* fu_header = (FuHeader*)(rtp_packet->payload + sizeof(NaluHeader));
     uint8_t reconstructed_nalu_type = (fu_indicator->f << 7) |
@@ -498,12 +511,22 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
                                       fu_header->type;
     payload_size -= sizeof(NaluHeader) + sizeof(FuHeader);
     if (fu_header->s) {
-      memcpy(nalu_buf, &nalu_start_4bytecode, sizeof(nalu_start_4bytecode));
-      *offset = sizeof(nalu_start_4bytecode);
-      memcpy(nalu_buf + *offset, &reconstructed_nalu_type, 1);
-      *offset += 1;
-      memcpy(nalu_buf + *offset, rtp_packet->payload + 2, payload_size);
-      *offset += payload_size;
+      if ((int)sizeof(nalu_start_4bytecode) + 1 + payload_size <= CONFIG_MAX_NALU_SIZE) {
+        // Mirror the continuation branch's CONFIG_MAX_NALU_SIZE bound: a
+        // start fragment writes 4 (start code) + 1 (reconstructed NAL
+        // header) + payload_size bytes into nalu_buf from offset 0, and
+        // without this check that write was completely unbounded.
+        memcpy(nalu_buf, &nalu_start_4bytecode, sizeof(nalu_start_4bytecode));
+        *offset = sizeof(nalu_start_4bytecode);
+        memcpy(nalu_buf + *offset, &reconstructed_nalu_type, 1);
+        *offset += 1;
+        memcpy(nalu_buf + *offset, rtp_packet->payload + 2, payload_size);
+        *offset += payload_size;
+      } else {
+        LOGW("rtp h264: FU-A start fragment exceeds CONFIG_MAX_NALU_SIZE (%d B); dropping (%d B)",
+             CONFIG_MAX_NALU_SIZE, (int)payload_size);
+        *offset = 0;
+      }
     } else if (*offset > 0 && *offset + payload_size <= CONFIG_MAX_NALU_SIZE) {
       memcpy(nalu_buf + *offset, rtp_packet->payload + 2, payload_size);
       *offset += payload_size;

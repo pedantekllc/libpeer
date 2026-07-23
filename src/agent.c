@@ -653,6 +653,16 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   StunMessage stun_msg;
   Address addr;
   if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0 && stun_probe(buf, len) == 0) {
+    if ((size_t)ret > sizeof(stun_msg.buf)) {
+      /* Oversized STUN datagram: a legitimate STUN message never approaches
+       * STUN_ATTR_BUF_SIZE. Drop it rather than truncating into
+       * stun_msg.buf, which would corrupt the attribute TLV stream and let
+       * stun_parse_msg_buf() walk past the buffer. Treat as consumed (like
+       * any other STUN packet) so callers don't mistake the raw bytes for
+       * a DTLS record. */
+      LOGW("Dropping oversized STUN datagram (%d bytes > %zu byte buffer)", ret, sizeof(stun_msg.buf));
+      return 0;
+    }
     memcpy(stun_msg.buf, buf, ret);
     stun_msg.size = ret;
     stun_parse_msg_buf(&stun_msg);

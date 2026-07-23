@@ -123,6 +123,19 @@ void stun_get_mapped_address(char* value, uint8_t* mask, Address* addr) {
   LOGD("XOR Mapped Address IP: %s (IP XOR: %08" PRIu32 ")", addr_string, *addr32);
 }
 
+/* Copy at most `dest_size` bytes of an attacker-controlled STUN attribute
+ * value into a fixed-size destination field, never overflowing it. Returns
+ * the number of bytes actually copied (== min(attr_len, dest_size)). Oversized
+ * attributes are simply truncated to the field size rather than rejecting the
+ * whole message — these fields (username/realm/nonce/message-integrity) are
+ * bounded by the STUN/TURN specs to well under our field sizes, so truncation
+ * only ever fires on malformed/malicious input. */
+static size_t stun_attr_copy(void* dest, size_t dest_size, const void* src, size_t attr_len) {
+  size_t copy_len = attr_len < dest_size ? attr_len : dest_size;
+  memcpy(dest, src, copy_len);
+  return copy_len;
+}
+
 void stun_parse_msg_buf(StunMessage* msg) {
   StunHeader* header = (StunHeader*)msg->buf;
 
@@ -162,11 +175,13 @@ void stun_parse_msg_buf(StunMessage* msg) {
         break;
       case STUN_ATTR_TYPE_USERNAME:
         memset(msg->username, 0, sizeof(msg->username));
-        memcpy(msg->username, attr->value, ntohs(attr->length));
+        /* Reserve the trailing byte so the field stays NUL-terminated even
+         * when an oversized attribute is truncated. */
+        stun_attr_copy(msg->username, sizeof(msg->username) - 1, attr->value, ntohs(attr->length));
         // LOGD("length = %d, Username %s", ntohs(attr->length), msg->username);
         break;
       case STUN_ATTR_TYPE_MESSAGE_INTEGRITY:
-        memcpy(msg->message_integrity, attr->value, ntohs(attr->length));
+        stun_attr_copy(msg->message_integrity, sizeof(msg->message_integrity), attr->value, ntohs(attr->length));
 
         char message_integrity_hex[41];
 
@@ -179,12 +194,12 @@ void stun_parse_msg_buf(StunMessage* msg) {
         break;
       case STUN_ATTR_TYPE_REALM:
         memset(msg->realm, 0, sizeof(msg->realm));
-        memcpy(msg->realm, attr->value, ntohs(attr->length));
+        stun_attr_copy(msg->realm, sizeof(msg->realm) - 1, attr->value, ntohs(attr->length));
         LOGD("Realm %s", msg->realm);
         break;
       case STUN_ATTR_TYPE_NONCE:
         memset(msg->nonce, 0, sizeof(msg->nonce));
-        memcpy(msg->nonce, attr->value, ntohs(attr->length));
+        stun_attr_copy(msg->nonce, sizeof(msg->nonce) - 1, attr->value, ntohs(attr->length));
         LOGD("Nonce %s", msg->nonce);
         break;
       case STUN_ATTR_TYPE_XOR_RELAYED_ADDRESS:
@@ -204,7 +219,7 @@ void stun_parse_msg_buf(StunMessage* msg) {
         // LOGD("Use Candidate");
         break;
       case STUN_ATTR_TYPE_FINGERPRINT:
-        memcpy(&msg->fingerprint, attr->value, ntohs(attr->length));
+        stun_attr_copy(&msg->fingerprint, sizeof(msg->fingerprint), attr->value, ntohs(attr->length));
         // LOGD("Fingerprint: 0x%.4x", msg->fingerprint);
         break;
       case STUN_ATTR_TYPE_ICE_CONTROLLED:
@@ -353,6 +368,15 @@ StunMsgType stun_is_stun_msg(uint8_t *buf, size_t size) {
 #endif
 int stun_msg_is_valid(uint8_t* buf, size_t size, char* password) {
   StunMessage msg;
+
+  if (size > sizeof(msg.buf)) {
+    /* Never legitimate: a valid STUN message fits well within
+     * STUN_ATTR_BUF_SIZE. Reject rather than truncate into msg.buf, which
+     * would both overflow and desync the fingerprint/MESSAGE-INTEGRITY
+     * length math below. */
+    LOGE("Rejecting oversized STUN message (%zu bytes > %zu byte buffer)", size, sizeof(msg.buf));
+    return -1;
+  }
 
   memcpy(msg.buf, buf, size);
 
