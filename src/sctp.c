@@ -627,6 +627,17 @@ void sctp_usrsctp_init() {
    * 614KB bursts that risk loss on a lossy path. SCTP still backs off on loss. */
   usrsctp_sysctl_set_sctp_initial_cwnd(256);
   usrsctp_sysctl_set_sctp_max_burst_default(256);
+
+  /* A control reply (availability, playlist) is one burst and then silence.
+   * A lost chunk in it gets too few later SACKs to trigger fast retransmit, so
+   * only the T3 timer recovers it, and usrsctp floors that timer at 1s. On a
+   * link losing a few percent that stalls the reply for >=1s, doubling per
+   * repeat loss (bug report 5effb659: 2.9s on a gateway whose live RTP showed
+   * 2-4% loss; frontend/e2e/gateway-playback-availability-latency.spec.ts).
+   * RTO is max(rto_min, srtt + 4*rttvar), so on a slow or jittery path the
+   * measured term still dominates and this floor does not apply; it only
+   * binds on a fast link, where 200ms is still tens of RTTs. */
+  usrsctp_sysctl_set_sctp_rto_min_default(200);
 #endif
 }
 
