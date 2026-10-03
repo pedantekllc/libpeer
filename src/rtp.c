@@ -425,6 +425,16 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
   }
 }
 
+uint32_t rtp_timestamp_from_ns(uint64_t capture_time_ns, uint32_t clock_rate_hz) {
+  /* Whole seconds and the sub-second remainder are scaled separately: a
+   * CLOCK_REALTIME ns value times the clock rate exceeds 2^64. The remainder
+   * product stays below 1e9 * rate, and uint32 truncation keeps the sum exact
+   * mod 2^32. */
+  uint64_t sec = capture_time_ns / 1000000000ULL;
+  uint64_t rem = capture_time_ns % 1000000000ULL;
+  return (uint32_t)(sec * clock_rate_hz + (rem * clock_rate_hz) / 1000000000ULL);
+}
+
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size, uint64_t capture_time_ns) {
   /* Video path: stamp RTP timestamp from the caller's capture time so
    * the receiver plays frames at the wall-clock pace they were produced,
@@ -436,8 +446,7 @@ int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size,
    * timestamps with no rate drift to correct for).
    */
   if (rtp_encoder->type == PT_H264) {
-    /* (ns * rate) overflows uint64_t only past ~6 thousand years, fine. */
-    rtp_encoder->timestamp = (uint32_t)((capture_time_ns * rtp_encoder->clock_rate_hz) / 1000000000ULL);
+    rtp_encoder->timestamp = rtp_timestamp_from_ns(capture_time_ns, rtp_encoder->clock_rate_hz);
   }
   return rtp_encoder->encode_func(rtp_encoder, (uint8_t*)buf, size);
 }

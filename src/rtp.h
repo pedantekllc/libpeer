@@ -161,7 +161,7 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
 /**
  * Packetise and emit an access unit / audio packet.
  *
- * @param capture_time_ns  Monotonic capture timestamp in nanoseconds.
+ * @param capture_time_ns  Frame capture time, CLOCK_REALTIME nanoseconds.
  *   - Video (H.264): set the RTP timestamp to capture_time_ns converted
  *     to the 90kHz RTP clock. Receivers play frames at the wall-clock
  *     pace dictated by these timestamps — drift between encoder rate
@@ -170,11 +170,14 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
  *     by samples-per-packet because the audio sample clock is the
  *     authoritative timebase. Caller may pass 0.
  *
- * Absolute value doesn't matter to receivers; only deltas within an
- * SSRC do, so any consistent monotonic source works (CLOCK_MONOTONIC,
- * gettimeofday, capture pipeline PTS converted to ns, …).
+ * The absolute value is part of the contract: a viewer matches overlay
+ * messages to frames by computing (capture epoch ms * 90) mod 2^32 and
+ * comparing it with the video RTP timestamp.
  */
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size, uint64_t capture_time_ns);
+
+/* RTP timestamp for a capture time in ns at clock_rate_hz, mod 2^32. */
+uint32_t rtp_timestamp_from_ns(uint64_t capture_time_ns, uint32_t clock_rate_hz);
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 void rtp_decoder_deinit(RtpDecoder* rtp_decoder);

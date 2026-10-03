@@ -1146,7 +1146,7 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
     /* SR reference: this frame's on-wire RTP timestamp paired with its capture
      * NTP — a true (RTP, NTP) point in the wire timebase, consistent with both
      * the per-packet RTP timestamps and abs-capture-time. */
-    pc->sr_ref_rtp = (uint32_t)((capture_time_ns * 90000ULL) / 1000000000ULL);
+    pc->sr_ref_rtp = rtp_timestamp_from_ns(capture_time_ns, 90000);
     pc->sr_ref_ntp = pc->cur_frame_capture_ntp;
   }
   /* TEMP INSTRUMENT (send_ms decomposition): reset the per-thread segment
