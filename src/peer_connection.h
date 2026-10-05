@@ -212,8 +212,8 @@ void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out);
 void* peer_connection_get_sctp(PeerConnection* pc);
 
 /* Test-only: arm dropping the next `count` server DTLS final flights, to
- * reproduce the lost-final-flight wedge in e2e (count>=2 also forces the
- * proactive-retransmit recovery path). Driven by the SDK's "drop_dtls_flight"
+ * reproduce the lost-final-flight wedge in e2e (count>=2 also drops the
+ * reactive resend). Driven by the SDK's "drop_dtls_flight"
  * MQTT control action (SDK_LOCAL_TEST_DRIVER only) — never called on a real
  * device. */
 void peer_connection_test_arm_flight_drop(int count);

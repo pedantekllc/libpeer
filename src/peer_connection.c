@@ -874,10 +874,12 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
  * production). Drops the next `count` server DTLS final flights — each begins
  * with a ChangeCipherSpec, content_type 0x14 — deterministically reproducing the
  * lost-final-flight wedge in e2e without flaky netem loss. count=1 loses the
- * original flight (recovered by the peer's retransmit); count>=2 also loses the
- * reactive resend, forcing the device's proactive retransmit timer to recover
- * (the field case where resends themselves are lost on wifi). Never set on a
- * real device. */
+ * original flight (recovered by the reactive resend when the peer retransmits);
+ * count>=2 also loses that resend, leaving recovery to the peer's next
+ * retransmit after its backed-off DTLS RTO. Never set on a real device.
+ *
+ * > **Not built:** a device-side timer that resends the final flight without
+ * > waiting for the peer to retransmit. */
 static volatile int g_test_drop_remaining = 0;
 void peer_connection_test_arm_flight_drop(int count) { g_test_drop_remaining = count; }
 
