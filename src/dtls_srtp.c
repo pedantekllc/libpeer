@@ -540,6 +540,11 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
     mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation_cb, dtls_srtp);
 #endif
 
+    // Peer identity is the SDP fingerprint checked in dtls_srtp_cert_verify, not
+    // a hostname. mbedtls >= 3.6 refuses a client handshake with
+    // VERIFY_REQUIRED unless the hostname is explicitly declared absent.
+    mbedtls_ssl_set_hostname(&dtls_srtp->ssl, NULL);
+
     mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
 
     dtls_srtp->hs_initialized = 1;
