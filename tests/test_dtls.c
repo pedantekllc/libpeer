@@ -92,6 +92,9 @@ void test_reset() {
 }
 
 int main(int argc, char* argv[]) {
+  if (dtls_srtp_init_cert() != 0) {
+    return 1;
+  }
   test_reset();
   test_handshake(argc, argv);
 

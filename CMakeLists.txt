@@ -32,7 +32,7 @@ include_directories(${CMAKE_BINARY_DIR}/dist/include ${CMAKE_BINARY_DIR}/dist/in
 
 link_directories(${CMAKE_BINARY_DIR}/dist/lib)
 
-set(DEP_LIBS "srtp2" "usrsctp" "mbedtls" "mbedcrypto" "mbedx509" "cjson")
+set(DEP_LIBS "srtp2" "usrsctp" "mbedtls" "mbedx509" "mbedcrypto" "cjson")
 # Extended debug information (symbols, source code, and macro definitions)
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
