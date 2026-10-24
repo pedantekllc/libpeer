@@ -57,6 +57,8 @@ typedef struct AgentPendingMdns {
 
 typedef struct Agent Agent;
 
+#define AGENT_CONSENT_OUTSTANDING 4
+
 struct Agent {
   char remote_ufrag[ICE_UFRAG_LENGTH + 1];
   char remote_upwd[ICE_UPWD_LENGTH + 1];
@@ -83,13 +85,40 @@ struct Agent {
 
   Address host_addr;
   int b_host_addr;
-  /* Epoch-ms of the last inbound STUN binding request from the peer (its consent
-   * checks, arriving continuously on an established connection). This is a
-   * spec-appropriate liveness signal (RFC 7675: liveness/consent is renewed by
-   * STUN, NOT by received media — media can be replayed/spoofed). Drives the
-   * keepalive timeout and is exposed via peer_connection_get_last_stun_rx_time()
-   * for higher-level watchdogs (e.g. the sigcore GC). */
-  uint64_t binding_request_time;
+  /* Liveness of the peer, renewed only by STUN (RFC 7675: consent is renewed
+   * by STUN, NOT by received media — media can be replayed/spoofed). Two
+   * things renew it, both stamped in last_liveness_ms (ports_get_epoch_time
+   * domain), valid only when has_liveness is set:
+   *   - an integrity-checked inbound Binding request from the peer (its
+   *     consent checks, normally arriving every ~2.5 s), and
+   *   - an integrity-checked Binding response, from the nominated pair's
+   *     remote, to one of OUR consent checks.
+   * The consent check is sent by agent_consent_tick() once the peer's own
+   * checks have been absent for CONFIG_CONSENT_SILENCE_MS, then every
+   * CONFIG_CONSENT_RETRY_MS for as long as they stay absent — answered or not.
+   * A peer whose own checks go unanswered discards the connection after its
+   * own timeout (Chromium destroys the pair and drops the media arriving on
+   * it) and re-learns the path only from an inbound check, so the checks keep
+   * coming at the retry cadence rather than pausing after each answer. The keepalive timeout (CONFIG_KEEPALIVE_TIMEOUT)
+   * runs against this single stamp, and peer_connection_get_last_stun_rx_age_ms()
+   * reports its age, so a peer whose inbound checks stop but who still answers
+   * ours stays alive and a peer that does neither is closed. */
+  uint32_t last_liveness_ms;
+  int has_liveness;
+  /* When the peer's own last integrity-checked Binding request arrived; valid
+   * only when has_peer_request is set. agent_consent_tick() measures silence
+   * from it. */
+  uint32_t last_peer_request_ms;
+  int has_peer_request;
+  /* Outstanding consent checks: the transaction ids of the most recent sends,
+   * so a response is credited only if it answers a request we made. */
+  uint32_t consent_txid[AGENT_CONSENT_OUTSTANDING][3];
+  int consent_txid_count;       /* valid entries in consent_txid            */
+  int consent_txid_next;        /* ring slot the next send writes           */
+  uint32_t consent_txid_seq;    /* distinguishes consecutive transaction ids */
+  uint32_t last_consent_sent_ms;
+  int has_consent_sent;
+  uint32_t consent_sent_total;  /* consent checks sent this attempt          */
   uint32_t first_success_time;  // ms (ports_get_epoch_time) of first pair success; 0 = none yet
   AgentState state;
 
@@ -198,9 +227,30 @@ int agent_add_prflx_candidate(Agent* agent, Address* addr);
 // sits in the (partially unsorted) pair array.
 IceCandidatePair* agent_best_succeeded_pair(Agent* agent);
 
-/* Credit every pair whose remote is `from_addr` with a validated Binding
- * Response; a response from an address no pair names credits nothing. */
-void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr);
+/* Handle a validated inbound Binding request. `now_ms` is the
+ * ports_get_epoch_time() reading the liveness stamp takes. */
+void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr, uint32_t now_ms);
+
+/* A Binding Response answers one of two things. If its transaction id is one of
+ * our outstanding consent checks and it comes from the nominated pair's remote,
+ * it renews liveness and changes no pair. Otherwise it credits every pair whose
+ * remote is `from_addr`; a response from an address no pair names credits
+ * nothing. */
+void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr, uint32_t now_ms);
+
+/* Send a consent check on the nominated pair when the peer's own checks have
+ * been absent for CONFIG_CONSENT_SILENCE_MS (or, before the peer has sent any,
+ * when liveness is that old), at most one per CONFIG_CONSENT_RETRY_MS. Returns 1
+ * if a check was sent. Pair selection and nomination are untouched. */
+int agent_consent_tick(Agent* agent, uint32_t now_ms);
+
+/* 1 once CONFIG_KEEPALIVE_TIMEOUT has passed since the last proof of liveness,
+ * or when there has been none. */
+int agent_liveness_expired(const Agent* agent, uint32_t now_ms);
+
+/* Age of the last proof of liveness in ms; returns 0 and sets *age_ms, or -1
+ * when there has been none. */
+int agent_liveness_age_ms(const Agent* agent, uint32_t now_ms, uint32_t* age_ms);
 
 int agent_select_candidate_pair(Agent* agent);
 
