@@ -143,9 +143,10 @@ const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
 
-/* Milliseconds since the last inbound STUN binding request from the peer
- * (RFC 7675 liveness; UINT64_MAX if none). A live stream refreshes it
- * ~continuously via consent; a dead peer stops. For higher-level idle watchdogs. */
+/* Milliseconds since the last STUN proof of liveness from the peer (RFC 7675):
+ * an inbound binding request or a response to one of our consent checks;
+ * UINT64_MAX if none. A live peer refreshes it continuously; a dead peer
+ * stops. For higher-level idle watchdogs. */
 uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc);
 
 /* Fill `buf` with a compact one-line session diagnostic (state, sctp-connected,

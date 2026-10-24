@@ -53,6 +53,18 @@
 #define CONFIG_KEEPALIVE_TIMEOUT 10000
 #endif
 
+/* Consent checks (agent_consent_tick). The browser's own checks arrive about
+ * every 2.5 s, so a silence threshold at that cadence would fire on most
+ * healthy gaps; 3500 ms sits a full cadence plus jitter above it and still
+ * leaves room for several retries before CONFIG_KEEPALIVE_TIMEOUT. */
+#ifndef CONFIG_CONSENT_SILENCE_MS
+#define CONFIG_CONSENT_SILENCE_MS 3500
+#endif
+
+#ifndef CONFIG_CONSENT_RETRY_MS
+#define CONFIG_CONSENT_RETRY_MS 1000
+#endif
+
 #ifndef CONFIG_AUDIO_DURATION
 #define CONFIG_AUDIO_DURATION 20
 #endif

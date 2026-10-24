@@ -6,6 +6,7 @@
 
 #include "agent.h"
 #include "base64.h"
+#include "config.h"
 #include "ice.h"
 #include "mdns.h"
 #include "ports.h"
@@ -40,6 +41,13 @@ void agent_clear_candidates(Agent* agent) {
   agent->mdns_timed_out = 0;
   agent->selected_remote_type = -1;
   agent->remote_end_of_candidates = 0;
+  agent->has_liveness = 0;
+  agent->last_liveness_ms = 0;
+  agent->consent_txid_count = 0;
+  agent->consent_txid_next = 0;
+  agent->has_consent_sent = 0;
+  agent->last_consent_sent_ms = 0;
+  agent->consent_sent_total = 0;
 }
 
 int agent_mdns_pending(const Agent* agent) {
@@ -420,10 +428,15 @@ static void agent_create_binding_response(Agent* agent, StunMessage* msg, Addres
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->local_upwd, strlen(agent->local_upwd));
 }
 
-static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
+/* `txid` (3 words, network order) replaces the transaction id stun_msg_create
+ * assigns; NULL keeps that id. */
+static void agent_build_binding_request(Agent* agent, StunMessage* msg, const uint32_t* txid) {
   uint64_t tie_breaker = 0;  // always be controlled
   // send binding request
   stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+  if (txid != NULL) {
+    memcpy(((StunHeader*)msg->buf)->transaction_id, txid, 3 * sizeof(uint32_t));
+  }
   char username[584];
   memset(username, 0, sizeof(username));
   snprintf(username, sizeof(username), "%s:%s", agent->remote_ufrag, agent->local_ufrag);
@@ -436,6 +449,80 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
     stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLED, 8, (char*)&tie_breaker);
   }
   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
+}
+
+static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
+  agent_build_binding_request(agent, msg, NULL);
+}
+
+static void agent_note_liveness(Agent* agent, uint32_t now_ms) {
+  agent->last_liveness_ms = now_ms;
+  agent->has_liveness = 1;
+}
+
+int agent_liveness_age_ms(const Agent* agent, uint32_t now_ms, uint32_t* age_ms) {
+  if (!agent->has_liveness) {
+    return -1;
+  }
+  *age_ms = now_ms - agent->last_liveness_ms;
+  return 0;
+}
+
+int agent_liveness_expired(const Agent* agent, uint32_t now_ms) {
+  uint32_t age;
+  if (agent_liveness_age_ms(agent, now_ms, &age) != 0) {
+    return 1;
+  }
+  return age > CONFIG_KEEPALIVE_TIMEOUT;
+}
+
+/* Transaction ids are unique per consent check (a response is credited only to
+ * a request we made) and unpredictable enough to not be guessed from a prior
+ * one: an FNV-1a mix of our secret ICE password, a sequence number and the
+ * send time. MESSAGE-INTEGRITY is what authenticates the response. */
+static void agent_next_consent_txid(Agent* agent, uint32_t now_ms, uint32_t txid[3]) {
+  uint32_t h = 2166136261u;
+  const char* p;
+  for (p = agent->local_upwd; *p; p++) {
+    h = (h ^ (uint8_t)*p) * 16777619u;
+  }
+  agent->consent_txid_seq++;
+  for (int i = 0; i < 3; i++) {
+    uint32_t word = (i == 0) ? agent->consent_txid_seq : (i == 1) ? now_ms : (agent->consent_txid_seq ^ now_ms);
+    for (int b = 0; b < 4; b++) {
+      h = (h ^ ((word >> (8 * b)) & 0xff)) * 16777619u;
+    }
+    txid[i] = h;
+  }
+}
+
+int agent_consent_tick(Agent* agent, uint32_t now_ms) {
+  uint32_t silence;
+  if (agent->nominated_pair == NULL || agent_liveness_age_ms(agent, now_ms, &silence) != 0) {
+    return 0;
+  }
+  if (silence < CONFIG_CONSENT_SILENCE_MS) {
+    return 0;
+  }
+  if (agent->has_consent_sent && (uint32_t)(now_ms - agent->last_consent_sent_ms) < CONFIG_CONSENT_RETRY_MS) {
+    return 0;
+  }
+  uint32_t txid[3];
+  StunMessage req;
+  memset(&req, 0, sizeof(req));
+  agent_next_consent_txid(agent, now_ms, txid);
+  agent_build_binding_request(agent, &req, txid);
+  memcpy(agent->consent_txid[agent->consent_txid_next], txid, sizeof(txid));
+  agent->consent_txid_next = (agent->consent_txid_next + 1) % AGENT_CONSENT_OUTSTANDING;
+  if (agent->consent_txid_count < AGENT_CONSENT_OUTSTANDING) {
+    agent->consent_txid_count++;
+  }
+  agent->last_consent_sent_ms = now_ms;
+  agent->has_consent_sent = 1;
+  agent->consent_sent_total++;
+  LOGD("peer silent %ums; sent consent check", silence);
+  agent_socket_send(agent, &agent->nominated_pair->remote->addr, req.buf, req.size);
+  return 1;
 }
 
 /* Pair one late-arriving remote candidate against every same-family local
@@ -614,7 +701,7 @@ int agent_add_prflx_candidate(Agent* agent, Address* addr) {
   return prflx_idx;
 }
 
-void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
+void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr, uint32_t now_ms) {
   StunMessage msg;
   StunHeader* header;
   switch (stun_msg->stunmethod) {
@@ -624,7 +711,7 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         memcpy(agent->transaction_id, header->transaction_id, sizeof(header->transaction_id));
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
-        agent->binding_request_time = ports_get_epoch_time();
+        agent_note_liveness(agent, now_ms);
         // Browsers hide their host candidate behind an mDNS .local name in the
         // SDP, but their connectivity checks still arrive from the real
         // address. Learn it as a peer-reflexive candidate so we can establish a
@@ -661,6 +748,22 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
   }
 }
 
+/* True, and the transaction retired, when `stun_msg` carries the id of an
+ * outstanding consent check and arrives from the nominated pair's remote. */
+static int agent_consent_response_matches(Agent* agent, const StunMessage* stun_msg, const Address* from_addr) {
+  const StunHeader* header = (const StunHeader*)stun_msg->buf;
+  if (agent->nominated_pair == NULL || !addr_equal(&agent->nominated_pair->remote->addr, from_addr)) {
+    return 0;
+  }
+  for (int i = 0; i < agent->consent_txid_count; i++) {
+    if (memcmp(agent->consent_txid[i], header->transaction_id, sizeof(header->transaction_id)) == 0) {
+      memset(agent->consent_txid[i], 0, sizeof(agent->consent_txid[i]));
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* A Binding Response is evidence about exactly one address: the one it came
  * from. Every pair whose remote is that address succeeds, whatever state it
  * was in. A FROZEN pair can legitimately be answered — the triggered check in
@@ -671,12 +774,19 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
  * A response that matches no pair credits nothing. Crediting nominated_pair
  * instead marked a pair SUCCEEDED for a path that had never answered; the
  * agent then committed to it and sent every DTLS flight to a dead address. */
-void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr) {
+void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr, uint32_t now_ms) {
   int i;
   int matched = 0;
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
+        /* A response to one of our consent checks proves the path is alive and
+         * nothing else: it renews liveness and leaves every pair, selected_pair
+         * and nominated_pair as they are. */
+        if (agent_consent_response_matches(agent, stun_msg, from_addr)) {
+          agent_note_liveness(agent, now_ms);
+          break;
+        }
         for (i = 0; i < agent->candidate_pairs_num; i++) {
           IceCandidatePair* pair = &agent->candidate_pairs[i];
           if (!addr_equal(&pair->remote->addr, from_addr)) {
@@ -721,10 +831,10 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
     stun_parse_msg_buf(&stun_msg);
     switch (stun_msg.stunclass) {
       case STUN_CLASS_REQUEST:
-        agent_process_stun_request(agent, &stun_msg, &addr);
+        agent_process_stun_request(agent, &stun_msg, &addr, ports_get_epoch_time());
         break;
       case STUN_CLASS_RESPONSE:
-        agent_process_stun_response(agent, &stun_msg, &addr);
+        agent_process_stun_response(agent, &stun_msg, &addr, ports_get_epoch_time());
         break;
       case STUN_CLASS_ERROR:
         break;

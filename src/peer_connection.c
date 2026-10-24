@@ -982,16 +982,16 @@ PeerConnectionState peer_connection_get_state(PeerConnection* pc) {
   return pc->state;
 }
 
-/* Milliseconds since the last inbound STUN binding request from the peer — a
- * spec-appropriate (RFC 7675) liveness signal, distinct from the PC state
- * machine (which can sit in COMPLETED after a peer has silently gone). Returns
- * UINT64_MAX if none seen yet. Higher-level watchdogs use this to tell a
- * live-but-signalling-quiet stream (consent still flowing) from a dead peer.
- * The clock (ports_get_epoch_time, uint32 ms, wrap-correct for deltas) stays
- * internal to libpeer. */
+/* Milliseconds since the last STUN proof of liveness from the peer (RFC 7675):
+ * an inbound binding request, or a response to one of our consent checks —
+ * distinct from the PC state machine (which can sit in COMPLETED after a peer
+ * has silently gone). Returns UINT64_MAX if there has been none. Higher-level
+ * watchdogs use this to tell a live-but-signalling-quiet stream from a dead
+ * peer. The clock (ports_get_epoch_time, uint32 ms, wrap-correct for deltas)
+ * stays internal to libpeer. */
 uint64_t peer_connection_get_last_stun_rx_age_ms(PeerConnection* pc) {
-  if (pc->agent.binding_request_time == 0) return UINT64_MAX;
-  uint32_t age = (uint32_t)ports_get_epoch_time() - (uint32_t)pc->agent.binding_request_time;
+  uint32_t age;
+  if (agent_liveness_age_ms(&pc->agent, ports_get_epoch_time(), &age) != 0) return UINT64_MAX;
   return (uint64_t)age;
 }
 
@@ -1006,10 +1006,10 @@ void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len)
   }
   if (sp && sp->remote) rtype = (int)sp->remote->type;
   snprintf(buf, len,
-      "state=%d sctp=%d stunAgeMs=%llu inData=%u inStun=%u ncFloods=%u pair=%s ltype=%d rtype=%d iface=%s",
+      "state=%d sctp=%d stunAgeMs=%llu consentSent=%u inData=%u inStun=%u ncFloods=%u pair=%s ltype=%d rtype=%d iface=%s",
       (int)pc->state, sctp_is_connected(&pc->sctp),
       (unsigned long long)peer_connection_get_last_stun_rx_age_ms(pc),
-      pc->in_data_pkts, pc->in_stun_pkts, pc->sctp_nc_logs,
+      pc->agent.consent_sent_total, pc->in_data_pkts, pc->in_stun_pkts, pc->sctp_nc_logs,
       local, ltype, rtype, pc->config.bind_iface[0] ? pc->config.bind_iface : "-");
 }
 
@@ -1488,8 +1488,9 @@ int peer_connection_loop(PeerConnection* pc) {
         }
       }
 
-      if (CONFIG_KEEPALIVE_TIMEOUT > 0 && (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {
-        LOGI("binding request timeout");
+      agent_consent_tick(&pc->agent, ports_get_epoch_time());
+      if (CONFIG_KEEPALIVE_TIMEOUT > 0 && agent_liveness_expired(&pc->agent, ports_get_epoch_time())) {
+        LOGI("liveness timeout: no inbound binding request or consent response");
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
       }
 

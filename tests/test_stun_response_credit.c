@@ -67,7 +67,7 @@ int main(void) {
   make_response(&agent, &resp);
 
   // The browser answers from its LAN address. Only the host pair may succeed.
-  agent_process_stun_response(&agent, &resp, &host);
+  agent_process_stun_response(&agent, &resp, &host, 0);
   CHECK(agent.candidate_pairs[1].state == ICE_CANDIDATE_STATE_SUCCEEDED);
   CHECK(agent.candidate_pairs[0].state == ICE_CANDIDATE_STATE_INPROGRESS);
   CHECK(agent_best_succeeded_pair(&agent) == &agent.candidate_pairs[1]);
@@ -77,14 +77,14 @@ int main(void) {
   agent.candidate_pairs[1].state = ICE_CANDIDATE_STATE_FROZEN;
   Address stranger;
   make_addr("198.51.100.7", 4444, &stranger);
-  agent_process_stun_response(&agent, &resp, &stranger);
+  agent_process_stun_response(&agent, &resp, &stranger, 0);
   CHECK(agent.candidate_pairs[0].state == ICE_CANDIDATE_STATE_INPROGRESS);
   CHECK(agent.candidate_pairs[1].state == ICE_CANDIDATE_STATE_FROZEN);
   CHECK(agent_best_succeeded_pair(&agent) == NULL);
 
   // A response that fails integrity credits nothing either.
   snprintf(agent.remote_upwd, sizeof(agent.remote_upwd), "%s", "wrong-password-wrong-pass");
-  agent_process_stun_response(&agent, &resp, &host);
+  agent_process_stun_response(&agent, &resp, &host, 0);
   CHECK(agent.candidate_pairs[1].state == ICE_CANDIDATE_STATE_FROZEN);
 
   if (g_failures == 0) {
