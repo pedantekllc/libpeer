@@ -430,7 +430,12 @@ static void agent_create_binding_response(Agent* agent, StunMessage* msg, Addres
 
 /* `txid` (3 words, network order) replaces the transaction id stun_msg_create
  * assigns; NULL keeps that id. */
-static void agent_build_binding_request(Agent* agent, StunMessage* msg, const uint32_t* txid) {
+/* A connectivity check nominates (USE_CANDIDATE when controlling); a consent
+ * check only asks whether the peer is still there (RFC 7675 §5.1) and never
+ * nominates. */
+typedef enum { BINDING_CHECK, BINDING_CONSENT } BindingPurpose;
+
+static void agent_build_binding_request(Agent* agent, StunMessage* msg, const uint32_t* txid, BindingPurpose purpose) {
   uint64_t tie_breaker = 0;  // always be controlled
   // send binding request
   stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
@@ -443,7 +448,9 @@ static void agent_build_binding_request(Agent* agent, StunMessage* msg, const ui
   stun_msg_write_attr(msg, STUN_ATTR_TYPE_USERNAME, strlen(username), username);
   stun_msg_write_attr(msg, STUN_ATTR_TYPE_PRIORITY, 4, (char*)&agent->nominated_pair->priority);
   if (agent->mode == AGENT_MODE_CONTROLLING) {
-    stun_msg_write_attr(msg, STUN_ATTR_TYPE_USE_CANDIDATE, 0, NULL);
+    if (purpose == BINDING_CHECK) {
+      stun_msg_write_attr(msg, STUN_ATTR_TYPE_USE_CANDIDATE, 0, NULL);
+    }
     stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLING, 8, (char*)&tie_breaker);
   } else {
     stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLED, 8, (char*)&tie_breaker);
@@ -452,7 +459,7 @@ static void agent_build_binding_request(Agent* agent, StunMessage* msg, const ui
 }
 
 static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
-  agent_build_binding_request(agent, msg, NULL);
+  agent_build_binding_request(agent, msg, NULL, BINDING_CHECK);
 }
 
 static void agent_note_liveness(Agent* agent, uint32_t now_ms) {
@@ -511,7 +518,7 @@ int agent_consent_tick(Agent* agent, uint32_t now_ms) {
   StunMessage req;
   memset(&req, 0, sizeof(req));
   agent_next_consent_txid(agent, now_ms, txid);
-  agent_build_binding_request(agent, &req, txid);
+  agent_build_binding_request(agent, &req, txid, BINDING_CONSENT);
   memcpy(agent->consent_txid[agent->consent_txid_next], txid, sizeof(txid));
   agent->consent_txid_next = (agent->consent_txid_next + 1) % AGENT_CONSENT_OUTSTANDING;
   if (agent->consent_txid_count < AGENT_CONSENT_OUTSTANDING) {

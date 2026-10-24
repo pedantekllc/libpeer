@@ -35,6 +35,8 @@ typedef struct Fixture {
   Agent agent;
   int peer_fd;
   Address peer_addr;
+  // Requests the peer received carrying USE_CANDIDATE.
+  int nominating_requests;
 } Fixture;
 
 // An established connection: one SUCCEEDED, nominated and selected pair whose
@@ -104,6 +106,19 @@ static void peer_sends_request(Fixture* f, uint32_t now_ms) {
   settle_and_discard(f, now_ms);
 }
 
+// Whether a STUN message carries an attribute of `type` (attributes follow the
+// 20-byte header as type/length/value, each value padded to 4 bytes).
+static int stun_has_attr(const uint8_t* buf, ssize_t n, uint16_t type) {
+  ssize_t off = 20;
+  while (off + 4 <= n) {
+    uint16_t t = (uint16_t)((buf[off] << 8) | buf[off + 1]);
+    uint16_t len = (uint16_t)((buf[off + 2] << 8) | buf[off + 3]);
+    if (t == type) return 1;
+    off += 4 + ((len + 3) & ~3);
+  }
+  return 0;
+}
+
 // Reads every datagram waiting at the peer. Each Binding request among them is
 // handed to `reply` (if non-NULL) as a response with the request's transaction
 // id, signed with `password`. Returns the number of requests seen.
@@ -121,6 +136,9 @@ static int peer_drain(Fixture* f, uint32_t now_ms, ReplyKind kind) {
       continue;  // the agent's response to the peer's own request
     }
     requests++;
+    if (stun_has_attr(buf, n, STUN_ATTR_TYPE_USE_CANDIDATE)) {
+      f->nominating_requests++;
+    }
     if (kind == REPLY_NONE) {
       continue;
     }
@@ -206,6 +224,8 @@ static void test_consent_checks_are_rate_limited(AgentMode mode) {
   Fixture f;
   fixture_open(&f, mode);
   peer_sends_request(&f, 0);
+  settle_and_discard(&f, 0);  // the response and, as CONTROLLING, the triggered check
+  f.nominating_requests = 0;
   int sent = 0;
   uint32_t last_sent = 0;
   const uint32_t window = CONFIG_KEEPALIVE_TIMEOUT - 1000;
@@ -231,6 +251,9 @@ static void test_consent_checks_are_rate_limited(AgentMode mode) {
   // Each counted check is one datagram on the wire.
   usleep(20000);
   CHECK(peer_drain(&f, window, REPLY_NONE) == sent);
+  // The peer was silent, so every request was a consent check, and a consent
+  // check asks whether the peer is there; it never nominates.
+  CHECK(f.nominating_requests == 0);
   fixture_close(&f);
 }
 
