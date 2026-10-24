@@ -43,6 +43,8 @@ void agent_clear_candidates(Agent* agent) {
   agent->remote_end_of_candidates = 0;
   agent->has_liveness = 0;
   agent->last_liveness_ms = 0;
+  agent->has_peer_request = 0;
+  agent->last_peer_request_ms = 0;
   agent->consent_txid_count = 0;
   agent->consent_txid_next = 0;
   agent->has_consent_sent = 0;
@@ -505,7 +507,12 @@ static void agent_next_consent_txid(Agent* agent, uint32_t now_ms, uint32_t txid
 
 int agent_consent_tick(Agent* agent, uint32_t now_ms) {
   uint32_t silence;
-  if (agent->nominated_pair == NULL || agent_liveness_age_ms(agent, now_ms, &silence) != 0) {
+  if (agent->nominated_pair == NULL) {
+    return 0;
+  }
+  if (agent->has_peer_request) {
+    silence = now_ms - agent->last_peer_request_ms;
+  } else if (agent_liveness_age_ms(agent, now_ms, &silence) != 0) {
     return 0;
   }
   if (silence < CONFIG_CONSENT_SILENCE_MS) {
@@ -719,6 +726,8 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
         agent_create_binding_response(agent, &msg, addr);
         agent_socket_send(agent, addr, msg.buf, msg.size);
         agent_note_liveness(agent, now_ms);
+        agent->last_peer_request_ms = now_ms;
+        agent->has_peer_request = 1;
         // Browsers hide their host candidate behind an mDNS .local name in the
         // SDP, but their connectivity checks still arrive from the real
         // address. Learn it as a peer-reflexive candidate so we can establish a

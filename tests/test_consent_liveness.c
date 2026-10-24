@@ -179,7 +179,11 @@ static void test_answered_consent_keeps_connection(AgentMode mode) {
     if (agent_liveness_expired(&f.agent, t)) ever_expired = 1;
   }
   CHECK(!ever_expired);
-  CHECK(f.agent.consent_sent_total > 0);
+  // An answer does not pause the checks: while the peer's own checks stay
+  // absent they go out at the retry cadence, so a peer that discarded the
+  // path re-learns it within one retry.
+  const uint32_t span = 4 * CONFIG_KEEPALIVE_TIMEOUT - CONFIG_CONSENT_SILENCE_MS;
+  CHECK(f.agent.consent_sent_total + 1 >= span / CONFIG_CONSENT_RETRY_MS);
   check_pair_untouched(&f);
   fixture_close(&f);
 }
