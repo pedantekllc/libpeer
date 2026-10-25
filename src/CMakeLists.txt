@@ -1,8 +1,15 @@
 project(lib)
 
-file(GLOB SRCS "*.c")
+# CONFIGURE_DEPENDS, because a plain GLOB is evaluated ONCE at configure time
+# and never again. Adding a .c and then building against a warm tree — a CI
+# runner's, a cross-build slot's, a developer's laptop — recompiles the
+# translation unit that CALLS the new code while silently never compiling the
+# new file, and surfaces as an undefined reference with nothing in the output
+# naming the cause. CONFIGURE_DEPENDS makes the build step re-glob when the
+# directory's contents change, which is what makes that unrepresentable.
+file(GLOB SRCS CONFIGURE_DEPENDS "*.c")
 
-file(GLOB HEADERS "peer.h" "peer_connection.h" "peer_signaling.h")
+file(GLOB HEADERS CONFIGURE_DEPENDS "peer.h" "peer_connection.h" "peer_signaling.h")
 
 add_library(peer
   ${SRCS}
