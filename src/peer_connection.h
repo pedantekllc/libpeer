@@ -8,6 +8,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "pair_info.h"
+#include "twcc.h"
+#include "twcc_send.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -290,22 +294,96 @@ const char* peer_connection_create_offer(PeerConnection* pc);
 
 const char* peer_connection_create_answer(PeerConnection* pc);
 
-/**
- * @brief register callback function to handle packet loss from RTCP receiver report
- * @param[in] peer connection
- * @param[in] callback function void (*cb)(float fraction_loss, uint32_t total_loss, void *userdata)
- * @param[in] userdata for callback function
- */
-void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
-                                             void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
 
 /**
- * @brief register callback for the browser's REMB (goog-remb) bandwidth
- *        estimate, in bits/sec. Fires on each RTCP AFB (PT=206, fmt=15)
- *        carrying "REMB". Drives the send-rate controller (browser-side BWE).
+ * @brief register callback for transport-wide congestion control feedback.
+ *        Every RTCP RTPFB FMT 15 from the browser is parsed into one array of
+ *        per-packet arrivals (sequence, received flag, receiver-clock arrival
+ *        time in microseconds, unwrapped). The estimator joins them with the
+ *        records drained by peer_connection_drain_sent(). Runs on the thread
+ *        that drives peer_connection_loop(); `arrivals` is valid only for the
+ *        duration of the call. Fires only on connections where
+ *        peer_connection_transport_cc_negotiated() is 1.
  */
-void peer_connection_on_remb(PeerConnection* pc,
-                             void (*on_remb)(uint32_t bitrate_bps, void* userdata));
+void peer_connection_on_transport_feedback(PeerConnection* pc,
+                                           void (*on_transport_feedback)(const twcc_arrival* arrivals, size_t count, void* userdata));
+
+/* 1 when the answer kept the transport-cc extension and feedback request, 0
+ * when this connection has no sender-side estimator. Decided when the answer is
+ * set; stays 0 before that. */
+int peer_connection_transport_cc_negotiated(PeerConnection* pc);
+
+/* Probe-send failures (negative return of peer_connection_send_probe). */
+#define PEER_PROBE_ERR_ARGS (-1)
+#define PEER_PROBE_ERR_NO_TRANSPORT_CC (-2)
+#define PEER_PROBE_ERR_NOT_CONNECTED (-3)
+#define PEER_PROBE_ERR_UNSUPPORTED (-4) /* FEC on and no RTX: padding on the video SSRC would corrupt FEC groups */
+#define PEER_PROBE_ERR_THREAD (-6)
+
+/**
+ * @brief queue a probe cluster (libwebrtc BitrateProber semantics). One
+ *        cluster is active at a time per connection, in request order. While it
+ *        is active every packet sent on the connection, media and padding, is
+ *        tagged with `cluster_id` in its sent record. Padding-only RTP (padding
+ *        bit, 255 padding bytes; RTX SSRC when RTX was negotiated, else the
+ *        video SSRC) fills only the gap between the bytes already sent in the
+ *        cluster (media included) and `bps`. The cluster ends when
+ *        `min_bytes`, `min_packets` (packets of any kind, media included) and
+ *        `min_duration_ms` are all met. A request is never refused: when more
+ *        than TWCC_PROBE_MAX_PENDING clusters are pending the oldest queued
+ *        ones are dropped, and one not started within TWCC_PROBE_TIMEOUT_US
+ *        expires; each is reported by peer_connection_drain_probe_events().
+ *        Returns at once: a
+ *        per-connection thread paces and sends outside send_mtx, so the caller
+ *        never waits on a pace. Returns 0 when queued, else a PEER_PROBE_ERR_*.
+ */
+int peer_connection_send_probe(PeerConnection* pc, uint16_t cluster_id, uint32_t bps, uint32_t min_bytes, uint32_t min_packets, uint32_t min_duration_ms);
+
+/**
+ * @brief move up to `cap` probe-cluster events into `out`, oldest first: every
+ *        cluster that was dropped from the queue, expired, or cancelled (the
+ *        connection was not up). The estimator closes such a cluster as
+ *        not-sent instead of timing it out as a failed probe. Pollable from the
+ *        reactor; takes send_mtx briefly. Returns 0 on a connection without
+ *        transport-cc.
+ */
+size_t peer_connection_drain_probe_events(PeerConnection* pc, twcc_probe_event* out, size_t cap);
+
+/**
+ * @brief move up to `cap` sent-packet records into `out`, oldest first. One
+ *        record per RTP packet stamped with a transport-wide sequence number
+ *        (video, audio, RTX, FEC, padding), appended under the send lock at the
+ *        stamping point. The ring holds TWCC_SENT_RING_CAP records; records
+ *        overwritten before they were drained are counted in
+ *        peer_connection_sent_dropped(). Returns 0 records on a connection
+ *        without transport-cc. Takes send_mtx briefly.
+ */
+size_t peer_connection_drain_sent(PeerConnection* pc, twcc_sent_record* out, size_t cap);
+
+/* Sent records overwritten before they were drained, since negotiation. */
+uint64_t peer_connection_sent_dropped(PeerConnection* pc);
+
+/**
+ * @brief the latest round-trip time, measured from the peer's receiver reports:
+ *        a report block for the video SSRC names (LSR) one of our Sender
+ *        Reports, and the time since that SR left, minus the peer's hold time
+ *        (DLSR), is the round trip. Returns 0 and sets *out_ms (rounded up, at
+ *        least 1) once a sample exists; -1 before the first sample. A report
+ *        with LSR=0 (the peer has received no SR yet) gives no sample.
+ *        Callable from any thread.
+ */
+int peer_connection_rtt_ms(PeerConnection* pc, uint32_t* out_ms);
+
+/**
+ * @brief the ICE pair this connection sends on (the agent's nominated pair).
+ *        Returns 0 and fills `out` (valid=1) once a pair has succeeded, else
+ *        -1 with out->valid=0.
+ */
+int peer_connection_selected_pair(PeerConnection* pc, peer_pair_info* out);
+
+/* A counter that advances each time the pair in use changes (first selection
+ * included). Call from one thread (the reactor), once per tick. */
+uint32_t peer_connection_pair_generation(PeerConnection* pc);
 
 /**
  * @brief Set the callback function to handle onicecandidate event.

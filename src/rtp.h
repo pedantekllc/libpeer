@@ -108,6 +108,9 @@ struct RtpEncoder {
   RtpOnPacket on_packet;
   int (*encode_func)(RtpEncoder* rtp_encoder, uint8_t* data, size_t size);
   void* user_data;
+  /* Audio's wire seq. Video packets are re-numbered at the transmit tail
+   * (peer_connection.c video_seq / out_seq), so this counter is only the
+   * packetiser's placeholder there. */
   uint16_t seq_number;
   uint32_t ssrc;
   uint32_t timestamp;
@@ -123,10 +126,10 @@ struct RtpEncoder {
   uint8_t buf[CONFIG_MTU + 128];
 };
 
-/* RFC 8285 one-byte header-extension ids for abs-send-time and abs-capture-time.
- * We are the offerer, so these are the ids we advertise in sdp.c and stamp on
- * outgoing video RTP. Keep in sync with the extmap literals in sdp_append_h264(). */
-#define RTP_EXT_ID_ABS_SEND_TIME    3
+/* RFC 8285 one-byte header-extension id for abs-capture-time. We are the
+ * offerer, so this is the id we advertise in sdp.c and stamp on the first
+ * outgoing video packet of each access unit. Keep in sync with the extmap
+ * literals in sdp.c. */
 #define RTP_EXT_ID_ABS_CAPTURE_TIME 4
 
 /* Convert a CLOCK_REALTIME (or realtime-derived) nanosecond timestamp to a
@@ -136,23 +139,13 @@ struct RtpEncoder {
  * Used by abs-capture-time and RTCP Sender Reports.                              */
 uint64_t unix_ns_to_ntp(uint64_t unix_ns);
 
-/* Insert a one-byte RFC 8285 header-extension block into an already-built RTP
- * packet (12-byte header + payload, CSRC=0).  Always rebuilds the extension —
- * see rtp.c for the FU-A buffer-reuse rationale.
- *
- * `has_capture_time`:  non-zero  → emit abs-send-time (id 3, 3 B) + abs-capture-
- *   time (id 4, 8 B) in a single 0xBEDE block (20 bytes total inserted).
- *                      zero      → emit abs-send-time only (8 bytes total inserted).
- * `ast24`            : abs-send-time value (6.18 fixed-point, low 24 bits).
- * `capture_ntp`      : 64-bit NTP capture time (only used when has_capture_time!=0).
- * Caller must guarantee >= 20 bytes headroom past `size` in the buffer.
- * Returns the new packet length.                                                    */
-size_t rtp_insert_extensions(uint8_t* data, size_t size, uint32_t ast24,
-                             int has_capture_time, uint64_t capture_ntp);
-
-/* Legacy single-element wrapper — kept for back-compat; calls rtp_insert_extensions
- * with has_capture_time=0.  Caller must guarantee >= 8 bytes headroom.             */
-size_t rtp_insert_abs_send_time(uint8_t* data, size_t size, int ext_id, uint32_t ast24);
+/* Reset the header-extension state of an already-built RTP packet (12-byte
+ * header + payload, CSRC=0) and, when `has_capture_time` is non-zero, insert a
+ * one-byte RFC 8285 block holding abs-capture-time (id 4, 8 B; 16 bytes
+ * inserted). Always rebuilds: the X bit is cleared first — see rtp.c for the
+ * FU-A buffer-reuse rationale. Caller must guarantee >= 16 bytes headroom past
+ * `size`. Returns the new packet length. */
+size_t rtp_insert_extensions(uint8_t* data, size_t size, int has_capture_time, uint64_t capture_ntp);
 
 int rtp_packet_validate(uint8_t* packet, size_t size);
 

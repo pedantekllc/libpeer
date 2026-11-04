@@ -1,6 +1,7 @@
 #ifndef SDP_H_
 #define SDP_H_
 
+#include <stdint.h>
 #include <string.h>
 #include "config.h"
 
@@ -27,5 +28,9 @@ void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel);
 int sdp_append(char* sdp, const char* format, ...);
 
 void sdp_reset(char* sdp);
+
+/* Find the one-byte extension id the SDP maps to `uri` (a=extmap line).
+ * Returns 1 and sets *id, or 0 when the SDP carries no such mapping. */
+int sdp_find_extmap_id(const char* sdp, const char* uri, uint8_t* id);
 
 #endif  // SDP_H_

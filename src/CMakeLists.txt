@@ -1,8 +1,8 @@
 project(lib)
 
-file(GLOB SRCS "*.c")
+file(GLOB SRCS CONFIGURE_DEPENDS "*.c")
 
-file(GLOB HEADERS "peer.h" "peer_connection.h" "peer_signaling.h")
+file(GLOB HEADERS "peer.h" "peer_connection.h" "peer_signaling.h" "twcc.h" "twcc_send.h" "pair_info.h")
 
 add_library(peer
   ${SRCS}

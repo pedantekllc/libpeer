@@ -49,14 +49,6 @@ int rtcp_get_fir(uint8_t* packet, int len, int* seqnr) {
   return 20;
 }
 
-RtcpRr rtcp_parse_rr(uint8_t* packet) {
-  RtcpRr rtcp_rr;
-  memcpy(&rtcp_rr.header, packet, sizeof(rtcp_rr.header));
-  memcpy(&rtcp_rr.report_block[0], packet + 8, 6 * sizeof(uint32_t));
-
-  return rtcp_rr;
-}
-
 int rtcp_build_sr(uint8_t* buf, uint32_t ssrc, uint64_t ntp_ts, uint32_t rtp_ts,
                   uint32_t packets_sent, uint32_t octets_sent) {
   /* RFC 3550 §6.4.1 Sender Report layout (28 bytes, no report blocks):
@@ -103,28 +95,4 @@ int rtcp_build_sr(uint8_t* buf, uint32_t ssrc, uint64_t ntp_ts, uint32_t rtp_ts,
   buf[26] = (uint8_t)((octets_sent >>  8) & 0xFF);
   buf[27] = (uint8_t)( octets_sent        & 0xFF);
   return 28;
-}
-
-/* goog-remb PSFB layout (draft-alvestrand-rmcat-remb):
- *   [0..3]   RTCP header (V/P/FMT=15, PT=206, length)
- *   [4..7]   packet sender SSRC
- *   [8..11]  media source SSRC (0 for REMB)
- *   [12..15] 'R' 'E' 'M' 'B'
- *   [16]     Num SSRC
- *   [17..19] Exp (6 bits) | Mantissa (18 bits), big-endian
- *   [20..]   Num SSRC × feedback SSRC
- * bitrate = mantissa << exp. */
-int rtcp_parse_remb(const uint8_t* pkt, size_t len, uint32_t* out_bps) {
-  if (!pkt || !out_bps || len < 20)
-    return 0;
-  if (pkt[12] != 'R' || pkt[13] != 'E' || pkt[14] != 'M' || pkt[15] != 'B')
-    return 0;
-  uint8_t exp = (uint8_t)(pkt[17] >> 2);
-  uint32_t mantissa = ((uint32_t)(pkt[17] & 0x03) << 16) |
-                      ((uint32_t)pkt[18] << 8) |
-                      (uint32_t)pkt[19];
-  uint64_t bps = (exp < 47) ? ((uint64_t)mantissa << exp) : 0xFFFFFFFFULL;
-  if (bps > 0xFFFFFFFFULL) bps = 0xFFFFFFFFULL;
-  *out_bps = (uint32_t)bps;
-  return 1;
 }
