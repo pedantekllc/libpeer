@@ -15,6 +15,10 @@ void sdp_append_h264(char* sdp);
 void sdp_append_h264_fec(char* sdp);
 void sdp_append_h264_rtx(char* sdp);
 
+void sdp_append_h265(char* sdp);
+void sdp_append_h265_fec(char* sdp);
+void sdp_append_h265_rtx(char* sdp);
+
 void sdp_append_pcma(char* sdp);
 
 void sdp_append_pcmu(char* sdp);

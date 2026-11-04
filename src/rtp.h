@@ -26,6 +26,9 @@ typedef enum RtpPayloadType {
   PT_PCMA = 8,
   PT_G722 = 9,
   PT_H264 = 96,
+  /* H.265 (RFC 7798) rides its own dynamic PT; a connection offers exactly
+   * one video codec, so only one of PT_H264 / PT_H265 is ever on the wire. */
+  PT_H265 = 98,
   PT_OPUS = 111,
   /* RED (RFC 2198) + ULPFEC (RFC 5109) — send-side FEC for video. Dynamic
    * PTs we offer in sdp_append_h264_fec(); the browser answers with the
@@ -35,7 +38,7 @@ typedef enum RtpPayloadType {
   PT_ULPFEC = 119,
   /* RTX retransmissions (RFC 4588): separate SSRC (RTX_SSRC), own sequence
    * space, payload = 2-byte OSN + original payload. Offered as
-   * "a=rtpmap:97 rtx/90000" + "a=fmtp:97 apt=96" + ssrc-group:FID. */
+   * "a=rtpmap:97 rtx/90000" + "a=fmtp:97 apt=<video PT>" + ssrc-group:FID. */
   PT_RTX = 97
 
 } RtpPayloadType;
@@ -43,11 +46,19 @@ typedef enum RtpPayloadType {
 typedef enum RtpSsrc {
 
   SSRC_H264 = 1,
+  SSRC_H265 = 1,
   SSRC_PCMA = 4,
   SSRC_PCMU = 5,
   SSRC_OPUS = 6,
 
 } RtpSsrc;
+
+/* RTP payload type a video codec is sent on, or -1 when `codec` is not a video
+ * codec this encoder packetises. */
+int rtp_video_pt(MediaCodec codec);
+
+/* 1 when `pt` is the payload type of a codec rtp_video_pt() knows. */
+int rtp_is_video_pt(int pt);
 
 typedef struct RtpHeader {
 #if __BYTE_ORDER == __BIG_ENDIAN

@@ -235,7 +235,9 @@ static int rtp_encoder_encode_h264_stap_a(RtpEncoder* rtp_encoder, NaluInfo* nal
   return 0;
 }
 
-static uint8_t* h264_find_nalu(uint8_t* buf_start, uint8_t* buf_end) {
+/* Annex-B start-code scan shared by the H.264 and H.265 packetizers: returns
+ * the first byte after the next 00 00 01 at or after buf_start+2, or buf_end. */
+static uint8_t* annexb_find_nalu(uint8_t* buf_start, uint8_t* buf_end) {
   uint8_t* p = buf_start + 2;
 
   while (p < buf_end) {
@@ -265,8 +267,8 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
   NaluInfo nalus[64];  /* max 64 NALUs per access unit */
   int nalu_count = 0;
 
-  for (pstart = h264_find_nalu(buf, buf_end); pstart < buf_end && nalu_count < 64; pstart = pend) {
-    pend = h264_find_nalu(pstart, buf_end);
+  for (pstart = annexb_find_nalu(buf, buf_end); pstart < buf_end && nalu_count < 64; pstart = pend) {
+    pend = annexb_find_nalu(pstart, buf_end);
     nalu_size = pend - pstart;
 
     if (pend != buf_end)
@@ -326,6 +328,162 @@ static int rtp_encoder_encode_h264(RtpEncoder* rtp_encoder, uint8_t* buf, size_t
   return 0;
 }
 
+/* ── H.265 (RFC 7798) ─────────────────────────────────────────────────────
+ * NAL unit header: 2 bytes, F(1) Type(6) LayerId(6) TID(3); type =
+ * (b0 >> 1) & 0x3F. Packet kinds used here: the NAL itself (single NAL unit
+ * packet), Aggregation Packet (type 48, §4.4.2) and Fragmentation Unit
+ * (type 49, §4.4.3: 2-byte payload header + 1-byte FU header S|E|FuType).
+ * As for H.264 the packetiser fills a placeholder seq; the transmit tail
+ * (peer_connection_xmit_rtp) draws the wire seq. */
+#define H265_NAL_HDR_SIZE 2
+#define H265_NAL_TYPE_AP 48
+#define H265_NAL_TYPE_FU 49
+#define H265_FU_HDR_SIZE 1
+#define H265_FU_PAYLOAD_SIZE (RTP_PAYLOAD_SIZE - H265_NAL_HDR_SIZE - H265_FU_HDR_SIZE)
+
+/* Fill the fixed RTP header of the next packet; returns the payload pointer. */
+static uint8_t* rtp_encoder_h265_header(RtpEncoder* rtp_encoder, int marker) {
+  RtpPacket* rtp_packet = (RtpPacket*)rtp_encoder->buf;
+  rtp_packet->header.version = 2;
+  rtp_packet->header.padding = 0;
+  rtp_packet->header.extension = 0;
+  rtp_packet->header.csrccount = 0;
+  rtp_packet->header.markerbit = marker ? 1 : 0;
+  rtp_packet->header.type = rtp_encoder->type;
+  rtp_packet->header.seq_number = htons(rtp_encoder->seq_number++);
+  rtp_packet->header.timestamp = htonl(rtp_encoder->timestamp);
+  rtp_packet->header.ssrc = htonl(rtp_encoder->ssrc);
+  return rtp_packet->payload;
+}
+
+static void rtp_encoder_h265_single(RtpEncoder* rtp_encoder, const NaluInfo* nalu, int is_last_nalu) {
+  uint8_t* p = rtp_encoder_h265_header(rtp_encoder, is_last_nalu);
+  memcpy(p, nalu->data, nalu->size);
+  rtp_encoder->on_packet(rtp_encoder->buf, nalu->size + sizeof(RtpHeader), rtp_encoder->user_data);
+}
+
+/* Split one NAL across FU packets; S on the first, E on the last; the marker
+ * rides the last fragment of the last NAL of the access unit. */
+static void rtp_encoder_h265_fu(RtpEncoder* rtp_encoder, const NaluInfo* nalu, int is_last_nalu) {
+  uint8_t hdr0 = (uint8_t)((nalu->data[0] & 0x81) | (H265_NAL_TYPE_FU << 1));
+  uint8_t hdr1 = nalu->data[1];
+  uint8_t fu_type = (uint8_t)((nalu->data[0] >> 1) & 0x3F);
+  const uint8_t* src = nalu->data + H265_NAL_HDR_SIZE;
+  size_t left = nalu->size - H265_NAL_HDR_SIZE;
+  int first = 1;
+
+  while (left > 0) {
+    size_t chunk = left < H265_FU_PAYLOAD_SIZE ? left : H265_FU_PAYLOAD_SIZE;
+    int last = (chunk == left);
+    uint8_t* p = rtp_encoder_h265_header(rtp_encoder, last && is_last_nalu);
+    p[0] = hdr0;
+    p[1] = hdr1;
+    p[2] = (uint8_t)((first ? 0x80 : 0) | (last ? 0x40 : 0) | fu_type);
+    memcpy(p + H265_NAL_HDR_SIZE + H265_FU_HDR_SIZE, src, chunk);
+    rtp_encoder->on_packet(rtp_encoder->buf,
+                           chunk + sizeof(RtpHeader) + H265_NAL_HDR_SIZE + H265_FU_HDR_SIZE,
+                           rtp_encoder->user_data);
+    src += chunk;
+    left -= chunk;
+    first = 0;
+  }
+}
+
+/* All NAL units of the access unit in one Aggregation Packet: F = OR of the
+ * NAL F bits, LayerId and TID = the lowest of the aggregated NALs. Each NAL is
+ * preceded by its 16-bit big-endian size. */
+static void rtp_encoder_h265_ap(RtpEncoder* rtp_encoder, const NaluInfo* nalus, int nalu_count) {
+  uint8_t* p = rtp_encoder_h265_header(rtp_encoder, 1);
+  uint8_t f = 0;
+  uint8_t layer_id = 0x3F;
+  uint8_t tid = 0x07;
+  for (int i = 0; i < nalu_count; i++) {
+    f |= (uint8_t)(nalus[i].data[0] >> 7);
+    uint8_t lid = (uint8_t)(((nalus[i].data[0] & 0x01) << 5) | (nalus[i].data[1] >> 3));
+    uint8_t t = nalus[i].data[1] & 0x07;
+    if (lid < layer_id) layer_id = lid;
+    if (t < tid) tid = t;
+  }
+  uint8_t* w = p;
+  *w++ = (uint8_t)((f << 7) | (H265_NAL_TYPE_AP << 1) | (layer_id >> 5));
+  *w++ = (uint8_t)(((layer_id & 0x1F) << 3) | tid);
+  for (int i = 0; i < nalu_count; i++) {
+    *w++ = (uint8_t)(nalus[i].size >> 8);
+    *w++ = (uint8_t)(nalus[i].size & 0xFF);
+    memcpy(w, nalus[i].data, nalus[i].size);
+    w += nalus[i].size;
+  }
+  rtp_encoder->on_packet(rtp_encoder->buf, (size_t)(w - p) + sizeof(RtpHeader), rtp_encoder->user_data);
+}
+
+/* Encode one H.265 access unit (Annex-B) into RTP packets. All NAL units share
+ * the RTP timestamp; the marker bit is on the last packet of the access unit.
+ * An access unit whose NAL units all fit one packet goes out as one
+ * Aggregation Packet (as H.264 uses STAP-A); otherwise each NAL is sent on its
+ * own, FU-fragmented when larger than a packet. */
+static int rtp_encoder_encode_h265(RtpEncoder* rtp_encoder, uint8_t* buf, size_t size) {
+  uint8_t* buf_end = buf + size;
+  uint8_t *pstart, *pend;
+  NaluInfo nalus[64];  /* max 64 NALUs per access unit */
+  int nalu_count = 0;
+
+  for (pstart = annexb_find_nalu(buf, buf_end); pstart < buf_end && nalu_count < 64; pstart = pend) {
+    pend = annexb_find_nalu(pstart, buf_end);
+    size_t nalu_size = (size_t)(pend - pstart);
+
+    if (pend != buf_end)
+      nalu_size--;
+
+    while (nalu_size > 0 && pstart[nalu_size - 1] == 0x00)
+      nalu_size--;
+
+    /* A NAL unit header is 2 bytes; anything shorter is not a NAL unit. */
+    if (nalu_size < H265_NAL_HDR_SIZE)
+      continue;
+
+    nalus[nalu_count].data = pstart;
+    nalus[nalu_count].size = nalu_size;
+    nalus[nalu_count].type = (uint8_t)((pstart[0] >> 1) & 0x3F);
+    nalu_count++;
+  }
+
+  size_t ap_size = H265_NAL_HDR_SIZE;
+  int all_fit_ap = (nalu_count > 1);
+  for (int i = 0; i < nalu_count && all_fit_ap; i++) {
+    ap_size += 2 + nalus[i].size;
+    if (ap_size > RTP_PAYLOAD_SIZE)
+      all_fit_ap = 0;
+  }
+
+  if (all_fit_ap) {
+    rtp_encoder_h265_ap(rtp_encoder, nalus, nalu_count);
+    return 0;
+  }
+  for (int i = 0; i < nalu_count; i++) {
+    int is_last = (i == nalu_count - 1);
+    if (nalus[i].size <= RTP_PAYLOAD_SIZE)
+      rtp_encoder_h265_single(rtp_encoder, &nalus[i], is_last);
+    else
+      rtp_encoder_h265_fu(rtp_encoder, &nalus[i], is_last);
+  }
+  return 0;
+}
+
+int rtp_video_pt(MediaCodec codec) {
+  switch (codec) {
+    case CODEC_H264:
+      return PT_H264;
+    case CODEC_H265:
+      return PT_H265;
+    default:
+      return -1;
+  }
+}
+
+int rtp_is_video_pt(int pt) {
+  return pt == PT_H264 || pt == PT_H265;
+}
+
 static int rtp_encoder_encode_generic(RtpEncoder* rtp_encoder, uint8_t* buf, size_t size) {
   RtpHeader* rtp_header = (RtpHeader*)rtp_encoder->buf;
   rtp_header->version = 2;
@@ -362,6 +520,12 @@ void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_
        * into RTP ticks via (ns * rate / 1e9).                           */
       rtp_encoder->clock_rate_hz = 90000;
       rtp_encoder->encode_func = rtp_encoder_encode_h264;
+      break;
+    case CODEC_H265:
+      rtp_encoder->type = PT_H265;
+      rtp_encoder->ssrc = SSRC_H265;
+      rtp_encoder->clock_rate_hz = 90000;
+      rtp_encoder->encode_func = rtp_encoder_encode_h265;
       break;
     case CODEC_PCMA:
       rtp_encoder->type = PT_PCMA;
@@ -409,7 +573,7 @@ int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size,
    * already the authoritative timebase and produces monotonic, regular
    * timestamps with no rate drift to correct for).
    */
-  if (rtp_encoder->type == PT_H264) {
+  if (rtp_is_video_pt(rtp_encoder->type)) {
     rtp_encoder->timestamp = rtp_timestamp_from_ns(capture_time_ns, rtp_encoder->clock_rate_hz);
   }
   return rtp_encoder->encode_func(rtp_encoder, (uint8_t*)buf, size);
