@@ -1,7 +1,42 @@
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "sdp.h"
+#include "twcc.h"
+
+/* transport-wide congestion control, offered on every media section: the
+ * feedback request for the media payload type and the sequence-number
+ * extension that feedback refers to. */
+static void sdp_append_transport_cc(char* sdp, int pt) {
+  sdp_append(sdp, "a=rtcp-fb:%d transport-cc", pt);
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_TRANSPORT_CC, TWCC_EXTMAP_URI);
+}
+
+int sdp_find_extmap_id(const char* sdp, const char* uri, uint8_t* id) {
+  size_t uri_len = strlen(uri);
+  const char* line = sdp;
+  while (line && *line) {
+    const char* eol = strstr(line, "\r\n");
+    size_t len = eol ? (size_t)(eol - line) : strlen(line);
+    if (len > 9 && strncmp(line, "a=extmap:", 9) == 0) {
+      char* end = NULL;
+      long v = strtol(line + 9, &end, 10);
+      /* "a=extmap:<id>[/<direction>] <uri>[ <attributes>]" */
+      const char* sp = memchr(line, ' ', len);
+      if (end != line + 9 && v >= 1 && v <= 14 && sp) {
+        const char* u = sp + 1;
+        size_t rest = len - (size_t)(u - line);
+        if (rest >= uri_len && strncmp(u, uri, uri_len) == 0 && (rest == uri_len || u[uri_len] == ' ')) {
+          *id = (uint8_t)v;
+          return 1;
+        }
+      }
+    }
+    line = eol ? eol + 2 : NULL;
+  }
+  return 0;
+}
 
 int sdp_append(char* sdp, const char* format, ...) {
   va_list argptr;
@@ -31,13 +66,7 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  /* goog-remb + abs-send-time (id 3, == RTP_EXT_ID_ABS_SEND_TIME). Asks the
-   * browser to run receive-side BWE and report it via RTCP AFB(REMB); the
-   * abs-send-time header ext (stamped per packet in peer_connection_outgoing_rtp_packet)
-   * is the per-packet send time its estimator needs. We deliberately do NOT
-   * offer transport-cc, so the browser falls back to REMB (ratecore §0/D1). */
-  sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
-  sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time");
+  sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
@@ -56,8 +85,7 @@ void sdp_append_h264_rtx(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
-  sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time");
+  sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
@@ -80,8 +108,7 @@ void sdp_append_h264_fec(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  sdp_append(sdp, "a=rtcp-fb:96 goog-remb");
-  sdp_append(sdp, "a=extmap:3 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time");
+  sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
@@ -97,6 +124,7 @@ void sdp_append_pcma(char* sdp) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 8");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:8 PCMA/8000");
+  sdp_append_transport_cc(sdp, 8);
   sdp_append(sdp, "a=ssrc:4 cname:webrtc-pcma");
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");
@@ -107,6 +135,7 @@ void sdp_append_pcmu(char* sdp) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 0");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:0 PCMU/8000");
+  sdp_append_transport_cc(sdp, 0);
   sdp_append(sdp, "a=ssrc:5 cname:webrtc-pcmu");
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");
@@ -117,6 +146,7 @@ void sdp_append_opus(char* sdp) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 111");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:111 opus/48000/2");
+  sdp_append_transport_cc(sdp, 111);
   sdp_append(sdp, "a=ssrc:6 cname:webrtc-opus");
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");

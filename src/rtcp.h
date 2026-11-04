@@ -58,13 +58,6 @@ typedef struct RtcpReportBlock {
 
 } RtcpReportBlock;
 
-typedef struct RtcpRr {
-  RtcpHeader header;
-  uint32_t ssrc;
-  RtcpReportBlock report_block[1];
-
-} RtcpRr;
-
 typedef struct RtcpFir {
   uint32_t ssrc;
   uint32_t seqnr;
@@ -84,15 +77,6 @@ int rtcp_probe(uint8_t* packet, size_t size);
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc);
 
 int rtcp_get_fir(uint8_t* packet, int len, int* seqnr);
-
-RtcpRr rtcp_parse_rr(uint8_t* packet);
-
-/* Parse a goog-remb RTCP PSFB (PT=206, fmt=15). `pkt` points at the RTCP
- * header; `len` is the bytes available from there. On a well-formed REMB,
- * writes the decoded bitrate (mantissa << exp) to *out_bps and returns 1.
- * Returns 0 if `pkt` is not a REMB or is truncated. Pure parser — golden
- * vector tested in test_rtp_ext.c. */
-int rtcp_parse_remb(const uint8_t* pkt, size_t len, uint32_t* out_bps);
 
 /* Build an RTCP Sender Report (PT=200, RFC 3550 §6.4.1) into `buf`.
  * `buf` must be at least 28 bytes.  Returns 28 (the fixed SR size).

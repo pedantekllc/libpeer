@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,12 +11,17 @@
 #include "agent.h"
 #include "config.h"
 #include "dtls_srtp.h"
+#include "pacer.h"
 #include "peer_connection.h"
 #include "ports.h"
 #include "rtcp.h"
+#include "rtcp_walk.h"
+#include "send_seq.h"
 #include "rtp.h"
 #include "sctp.h"
 #include "sdp.h"
+#include "twcc.h"
+#include "twcc_send.h"
 #include "utils.h"
 
 #define STATE_CHANGED(pc, curr_state)                                 \
@@ -74,7 +80,7 @@ struct PeerConnection {
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
-  void (*on_remb)(uint32_t bitrate_bps, void* user_data);
+  void (*on_transport_feedback)(const twcc_arrival* arrivals, size_t count, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
   uint8_t agent_buf[CONFIG_MTU];
@@ -127,7 +133,7 @@ struct PeerConnection {
 
   /* Last RTP timestamp seen at the send chokepoint.  A change from the
    * previous value marks the first packet of a new access unit.            */
-  uint32_t last_rtp_ts;
+  _Atomic uint32_t last_rtp_ts;  // also read by the probe thread
 
   /* RTCP SR counters — cumulative across the connection lifetime.           */
   uint32_t sr_packets_sent;  /* RTP packets sent for video SSRC */
@@ -136,20 +142,32 @@ struct PeerConnection {
   /* Wall-clock ms of the last SR send (from ports_get_epoch_time()).        */
   uint32_t last_sr_ms;
 
+  /* Round trip from receiver reports. sr_hist is touched only by the reactor
+   * (it sends the SRs and walks the RRs); the sample is read by any thread. */
+  rtcp_sr_history sr_hist;
+  _Atomic uint32_t rtt_us;
+  _Atomic int rtt_valid; /* set after rtt_us is first written */
+
   /* ── Send pacer (see PeerConfiguration.pacer_bps) ─────────────────────────
    * Token bucket drained at the send chokepoint. All state below is touched
    * ONLY on the send path's thread (per-lane send worker); pacer_bps itself
    * is also written by the controller thread via the setter (benign aligned-
    * word race). */
   uint32_t pacer_bps;             /* 0 = pacing disabled                      */
-  double pacer_budget_bytes;      /* current bucket level (may go negative)   */
-  struct timespec pacer_last;     /* last refill time (CLOCK_MONOTONIC)       */
+  pacer_state pacer;              /* token bucket (pacer.h)                   */
+  uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
+  uint64_t pace_queue_start_ns;   /* when that access unit entered the pacer  */
 
   /* ── ULPFEC/RED send state (see PeerConfiguration.fec) ────────────────────
    * All touched only on the send path (per-lane send worker). The chokepoint
    * owns the outgoing sequence space when FEC is on (media + FEC interleave
    * on one SSRC), so it re-stamps every header from out_seq. */
-  uint16_t out_seq;
+  uint16_t out_seq;                  /* send worker only: FEC media + repair seqs    */
+  /* Sequence space of the video SSRC without FEC. Media and padding-only probe
+   * packets both draw from it, under send_mtx at the transmit tail, so the seq
+   * order is the wire order and no two packets share a seq. Guarded by
+   * send_mtx. */
+  send_seq video_seq;
   int      fec_group_cnt;            /* media packets in the open group      */
   uint16_t fec_snbase;               /* seq of the group's first packet      */
   size_t   fec_maxlen;               /* protection length = max(len - 12)    */
@@ -175,6 +193,32 @@ struct PeerConnection {
    * OUTSIDE this lock so the reactor never waits on a pace. */
   pthread_mutex_t send_mtx;
 
+  /* ── Transport-wide congestion control (see twcc.h) ───────────────────────
+   * twcc_negotiated is set by the reactor when the answer carries the
+   * transport-cc extmap and rtcp-fb; twcc_ext_id is valid only then. twcc_tx
+   * (sequence counter, sent-record ring, probe cluster schedule) is guarded by
+   * send_mtx: every packet is stamped, tagged and recorded under it right
+   * before srtp_protect. twcc_clock is reactor-only. */
+  _Atomic uint8_t twcc_negotiated;
+  uint8_t twcc_ext_id;
+  uint8_t rtx_negotiated;          /* the answer accepted the RTX payload type */
+  twcc_sender twcc_tx;             /* ring allocated at negotiation */
+  twcc_ref_clock twcc_clock;
+
+  /* ── Probe sender (peer_connection_send_probe) ────────────────────────────
+   * One lazily started thread per connection paces padding-only packets so the
+   * caller (the reactor) never waits on a pace. Requests queue in twcc_tx under
+   * send_mtx; probe_mtx/probe_cv only wake the thread (probe_kick). */
+  pthread_mutex_t probe_mtx;
+  pthread_cond_t probe_cv;
+  pthread_t probe_thread;
+  int probe_thread_started;
+  int probe_kick;
+  _Atomic int probe_stop;
+
+  /* Selected-pair change counter; polled from one thread (the reactor). */
+  peer_pair_tracker pair_tracker;
+
   /* Per-peer inbound tallies at the agent layer (see peer_connection_get_session_diag).
    * data = DTLS/RTP/RTCP packets (agent_recv>0); stun = STUN handled internally
    * (agent_recv==0). A wedged peer with data=0 stun=0 receives NOTHING (dead
@@ -193,18 +237,6 @@ struct PeerConnection {
   uint64_t sr_ref_ntp;
 };
 
-/* Absolute send time in 6.18-fixed-point seconds, low 24 bits (RFC abs-send-
- * time). Monotonic source: only inter-packet DELTAS matter to the receiver's
- * delay-gradient estimator, and the 24-bit field wraps ~64s (handled by the
- * estimator). No wall-clock / NTP needed for the BWE path. */
-static uint32_t peer_connection_abs_send_time_24(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  uint64_t secs = (uint64_t)ts.tv_sec;
-  uint64_t frac = ((uint64_t)ts.tv_nsec << 18) / 1000000000ULL;  /* < 2^18 */
-  return (uint32_t)(((secs << 18) + frac) & 0x00FFFFFFULL);
-}
-
 static uint32_t rtx_now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -220,13 +252,6 @@ static size_t rtp_payload_offset(const uint8_t* data, size_t size) {
   }
   return hdr <= size ? hdr : size;
 }
-
-/* Burst allowance: a dozen MTUs may leave back-to-back before pacing kicks in,
- * so small frames (P-frames of a few packets) are never delayed at all. */
-#define PACER_BURST_BYTES 16384.0
-/* Per-packet sleep cap — guards against a pathological/zeroed rate stalling a
- * send worker for seconds. 50 ms at 1300 B implies a ~200 kbps floor. */
-#define PACER_MAX_SLEEP_S 0.05
 
 /*
  * Token-bucket send pacer. Refill at pacer_bps, spend per packet; when the
@@ -247,51 +272,83 @@ static inline uint64_t sb_mono_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void peer_connection_pace(PeerConnection* pc, size_t bytes) {
+static uint64_t sb_mono_us(void) {
+  return sb_mono_ns() / 1000u;
+}
+
+/* `video` packets draw on the access unit's backlog: the pace rate rises when
+ * the rest of the frame would not drain within PACER_QUEUE_LIMIT_NS. Other
+ * packets (audio) see no backlog. */
+static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
 
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  if (pc->pacer_last.tv_sec == 0 && pc->pacer_last.tv_nsec == 0) {
-    pc->pacer_last = now;
-    pc->pacer_budget_bytes = PACER_BURST_BYTES;
+  uint64_t now_ns = sb_mono_ns();
+  uint64_t queued = 0, queued_for = 0;
+  if (video) {
+    queued = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes : bytes;
+    queued_for = now_ns - pc->pace_queue_start_ns;
   }
-  double elapsed = (double)(now.tv_sec - pc->pacer_last.tv_sec) +
-                   (double)(now.tv_nsec - pc->pacer_last.tv_nsec) / 1e9;
-  pc->pacer_last = now;
-
-  pc->pacer_budget_bytes += elapsed * (double)bps / 8.0;
-  if (pc->pacer_budget_bytes > PACER_BURST_BYTES)
-    pc->pacer_budget_bytes = PACER_BURST_BYTES;
-
-  pc->pacer_budget_bytes -= (double)bytes;
-  if (pc->pacer_budget_bytes < 0) {
-    double wait_s = -pc->pacer_budget_bytes * 8.0 / (double)bps;
-    if (wait_s > PACER_MAX_SLEEP_S) wait_s = PACER_MAX_SLEEP_S;
-    struct timespec ts;
-    ts.tv_sec = (time_t)wait_s;
-    ts.tv_nsec = (long)((wait_s - (double)ts.tv_sec) * 1e9);
-    nanosleep(&ts, NULL);
-    /* The deficit is repaid by the elapsed-time refill on the next call. */
-  }
+  uint64_t wait_ns = pacer_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns);
+  if (video) pc->pace_queue_bytes = queued > bytes ? queued - bytes : 0;
+  if (wait_ns == 0) return;
+  struct timespec ts;
+  ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
+  ts.tv_nsec = (long)(wait_ns % 1000000000ull);
+  nanosleep(&ts, NULL);
 }
 
 void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
   if (pc) pc->pacer_bps = bps;
 }
 
+/* Room an RTP packet buffer keeps free for the SRTP trailer; extension growth
+ * stays inside the rest. Both encoders use CONFIG_MTU + 128 bytes. */
+#define RTP_SEND_BUF_CAP (CONFIG_MTU + 128 - 32)
+
+static int peer_connection_twcc_on(PeerConnection* pc) {
+  return atomic_load_explicit(&pc->twcc_negotiated, memory_order_acquire);
+}
+
+/* Give an outgoing RTP packet its transport-wide seq element (value zero until
+ * the send lock stamps it). Called at the send chokepoint for every packet so
+ * the packet that FEC protects and RTX stores has its final layout. */
+static size_t peer_connection_twcc_reserve(PeerConnection* pc, uint8_t* data, size_t size) {
+  if (!peer_connection_twcc_on(pc)) return size;
+  if (twcc_ext_reserve(data, &size, RTP_SEND_BUF_CAP, pc->twcc_ext_id) != 0) {
+    LOGW("twcc: cannot add the transport-wide seq extension; packet goes unstamped");
+  }
+  return size;
+}
+
+/* Stamp the next transport-wide seq, tag the packet with the active probe
+ * cluster and append its sent record. Caller holds send_mtx and calls this
+ * immediately before srtp_protect. */
+static void peer_connection_twcc_stamp(PeerConnection* pc, uint8_t* data, size_t size) {
+  if (!peer_connection_twcc_on(pc)) return;
+  twcc_sender_stamp(&pc->twcc_tx, data, size, sb_mono_us());
+}
+
+static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size);
+
 /* Final transmit tail shared by media and FEC packets: SRTP protect, pace,
  * send. (The pre-SRTP form is what FEC protects, so XOR accumulation happens
  * before this is called.) */
-static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t size) {
+static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t size, int video_media) {
   /* Pace BEFORE taking the send lock (sleeps must never hold it); budget on
    * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
   uint64_t t0 = sb_mono_ns();
-  peer_connection_pace(pc, size + 10);
+  peer_connection_pace(pc, size + 10, size >= 12 && ((data[1] & 0x7F) == PT_H264 || (data[1] & 0x7F) == PT_RED));
   uint64_t t1 = sb_mono_ns();
   pthread_mutex_lock(&pc->send_mtx);
   uint64_t t2 = sb_mono_ns();
+  if (video_media) {
+    /* The video seq is drawn here, under the lock that orders the wire, and
+     * only then does the retransmission history keep the packet. */
+    send_seq_write(&pc->video_seq, data);
+    peer_connection_rtx_store(pc, data, size);
+  }
+  peer_connection_twcc_stamp(pc, data, size);
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   uint64_t t2b = sb_mono_ns();
   agent_send(&pc->agent, data, size);
@@ -369,6 +426,7 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
     uint32_t rt0 = ports_get_epoch_time();
     pthread_mutex_lock(&pc->send_mtx);
     uint32_t rt1 = ports_get_epoch_time();
+    peer_connection_twcc_stamp(pc, buf, out_len);
     dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
     agent_send(&pc->agent, buf, out_len);
     pthread_mutex_unlock(&pc->send_mtx);
@@ -421,22 +479,22 @@ static void peer_connection_fec_accumulate(PeerConnection* pc, const uint8_t* da
   pc->fec_hdr_xor[1] ^= data[1];                 /* M, PT                     */
   for (int i = 0; i < 4; i++) pc->fec_ts_xor[i] ^= data[4 + i];
   pc->fec_len_xor ^= (uint16_t)plen;
-  /* XOR the post-header bytes, but with MUTABLE header extensions zeroed —
-   * libwebrtc's receiver zeroes abs-send-time (ext id 3) before FEC decode
-   * (RtpPacket::ZeroMutableExtensions, webrtc bug 7859), so parity computed
-   * over the live value yields corrupt recoveries. Our extension block layout
-   * is fixed (built by rtp_insert_extensions): 0xBEDE at [12], abs-send-time
-   * element data at [17..19]. abs-capture-time (id 4) is NOT mutable. */
-  size_t skip_lo = 0, skip_hi = 0;
-  if ((data[0] & 0x10) && size >= 20 &&
-      data[12] == 0xBE && data[13] == 0xDE &&
-      (data[16] >> 4) == 3 /* RTP_EXT_ID_ABS_SEND_TIME */) {
-    skip_lo = 17 - 12;   /* offsets relative to byte 12 */
-    skip_hi = 20 - 12;
+  /* XOR the post-header bytes, but with the MUTABLE header extension zeroed:
+   * libwebrtc's receiver zeroes the transport-wide seq before FEC decode
+   * (RtpPacket::ZeroMutableExtensions, webrtc bug 7859), and ours is stamped
+   * after FEC accumulation, so parity over the live value would yield corrupt
+   * recoveries. abs-capture-time (id 4) is NOT mutable. */
+  size_t tw_lo = 0, tw_hi = 0;
+  if (peer_connection_twcc_on(pc)) {
+    size_t off = 0, len = 0;
+    if (twcc_ext_find(data, size, pc->twcc_ext_id, &off, &len) && off >= 12) {
+      tw_lo = off - 12;
+      tw_hi = tw_lo + len;
+    }
   }
   for (size_t i = 0; i < plen; i++) {
     uint8_t b = data[12 + i];
-    if (skip_hi && i >= skip_lo && i < skip_hi) b = 0;
+    if (tw_hi && i >= tw_lo && i < tw_hi) b = 0;
     pc->fec_xor[i] ^= b;
   }
   if (plen > pc->fec_maxlen) pc->fec_maxlen = plen;
@@ -450,7 +508,7 @@ static void peer_connection_fec_flush(PeerConnection* pc) {
   int cnt = pc->fec_group_cnt;
   if (cnt < 2) { pc->fec_group_cnt = 0; return; }
 
-  uint8_t buf[12 + 1 + 10 + 4 + sizeof(pc->fec_xor)];
+  uint8_t buf[12 + 8 + 1 + 10 + 4 + sizeof(pc->fec_xor)];
   uint16_t seq = pc->out_seq++;
 
   /* RTP header: V=2, M=0, PT=RED; TS/SSRC from the last protected packet. */
@@ -462,6 +520,7 @@ static void peer_connection_fec_flush(PeerConnection* pc) {
   memcpy(buf + 8, pc->fec_last_hdr + 8, 4);   /* SSRC      */
 
   size_t off = 12;
+  off = peer_connection_twcc_reserve(pc, buf, off);   /* repair packets are stamped too */
   buf[off++] = PT_ULPFEC & 0x7F;              /* RED header: F=0, block PT   */
 
   /* FEC header (10 bytes, RFC 5109 §7.3): E=0, L=0 (16-bit mask). */
@@ -485,7 +544,7 @@ static void peer_connection_fec_flush(PeerConnection* pc) {
   off += pc->fec_maxlen;
 
   pc->fec_group_cnt = 0;
-  peer_connection_xmit_rtp(pc, buf, off);
+  peer_connection_xmit_rtp(pc, buf, off, 0);
 }
 
 /* RED-encapsulate a media packet in place: 1-byte RED header (F=0 | media PT)
@@ -508,14 +567,13 @@ static size_t peer_connection_red_wrap(uint8_t* data, size_t size) {
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
-  /* Stamp abs-send-time on every outgoing VIDEO RTP packet (PT_H264=96) so the
-   * browser's REMB estimator sees per-packet send time.  On the first packet of
-   * each access unit (detected by RTP-timestamp change) also add abs-capture-time
-   * so Chrome can compute skew-free glass-to-glass latency.
+  /* On the first packet of each outgoing VIDEO access unit (PT_H264=96,
+   * detected by RTP-timestamp change) add abs-capture-time so Chrome can
+   * compute skew-free glass-to-glass latency.
    *
    * All insertions happen here — a single send chokepoint — BEFORE srtp_protect
    * so the extension is authenticated.  rtp_insert_extensions always rebuilds the
-   * extension block from a clean 12-byte-header assumption (no X-bit guard): the
+   * extension state from a clean 12-byte-header assumption (no X-bit guard): the
    * FU-A packetizer sets extension=0 once before its fragment loop and reuses the
    * encoder buffer, so a stale X bit from fragment 1 persists into 2..N; guarding
    * on X there would forward X=1 packets with no real extension → ~75% loss.
@@ -527,10 +585,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     int is_first_packet = (rtp_ts != pc->last_rtp_ts);
     pc->last_rtp_ts = rtp_ts;
 
-    size = rtp_insert_extensions(data, size,
-                                 peer_connection_abs_send_time_24(),
-                                 is_first_packet,
-                                 pc->cur_frame_capture_ntp);
+    size = rtp_insert_extensions(data, size, is_first_packet, pc->cur_frame_capture_ntp);
 
     /* Track cumulative counters for RTCP SR.  Payload length = total packet
      * size minus the 12-byte RTP fixed header (the extension is already part
@@ -540,6 +595,9 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     if (size > 12)
       pc->sr_octets_sent += (uint32_t)(size - 12);
   }
+  /* Every outgoing RTP packet (video, audio) carries the transport-wide seq
+   * element; the value is stamped under send_mtx at the transmit tail. */
+  if (size >= 12) size = peer_connection_twcc_reserve(pc, data, size);
   if (pc->config.fec && size >= 12 && (data[1] & 0x7F) == PT_H264) {
     /* FEC path: the chokepoint owns the sequence space (media + repair
      * packets interleave on one SSRC), so re-stamp the encoder's seq. */
@@ -550,7 +608,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
 
     peer_connection_fec_accumulate(pc, data, size);   /* pre-RED media form  */
     size = peer_connection_red_wrap(data, size);
-    peer_connection_xmit_rtp(pc, data, size);
+    peer_connection_xmit_rtp(pc, data, size, 0);
 
     /* CRITICAL: the FU-A packetizer REUSES this buffer for the next fragment
      * and rewrites payload/seq/marker but NOT the PT byte (same buffer-reuse
@@ -566,10 +624,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     }
     return;
   }
-  if (pc->rtx_history && size >= 12 && (data[1] & 0x7F) == PT_H264) {
-    peer_connection_rtx_store(pc, data, size);
-  }
-  peer_connection_xmit_rtp(pc, data, size);
+  peer_connection_xmit_rtp(pc, data, size, size >= 12 && (data[1] & 0x7F) == PT_H264);
 }
 
 /*
@@ -899,62 +954,87 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   return agent_send(&pc->agent, buf, len);
 }
 
-static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
-  RtcpHeader* rtcp_header;
-  size_t pos = 0;
+/* RTPFB FMT 15: parse one transport-wide feedback and hand the per-packet
+ * arrivals (receiver clock) to the registered callback. Reactor thread; the
+ * estimator joins them with the sent records drained from this connection. */
+static void peer_connection_handle_twcc(PeerConnection* pc, const uint8_t* fb_pkt, size_t len) {
+  if (!pc->on_transport_feedback || !peer_connection_twcc_on(pc)) return;
 
-  while (pos < len) {
-    rtcp_header = (RtcpHeader*)(buf + pos);
-
-    switch (rtcp_header->type) {
-      case RTCP_RR:
-        LOGD("RTCP_RR");
-        /* Receiver-report loss → the rate controller's loss EWMA + emergency
-         * brake. Parse THIS report block (buf + pos), not buf — compound RTCP
-         * puts later packets past pos. fraction-lost is the top byte of the
-         * first word. Report EVERY RR including fraction==0: the ratecore loss
-         * EWMA only decays when it is fed clean intervals, so suppressing zeros
-         * makes it a one-way ratchet that stays pinned at a historical (or
-         * other-viewer) loss value forever, permanently throttling the grant. */
-        if (rtcp_header->rc > 0) {
-          RtcpRr rtcp_rr = rtcp_parse_rr(buf + pos);
-          uint32_t fraction = ntohl(rtcp_rr.report_block[0].flcnpl) >> 24;
-          uint32_t total = ntohl(rtcp_rr.report_block[0].flcnpl) & 0x00FFFFFF;
-          if (pc->on_receiver_packet_loss) {
-            pc->on_receiver_packet_loss((float)fraction / 256.0f, total, pc->config.user_data);
-          }
-        }
-        break;
-      case RTCP_RTPFB: {
-        /* Transport-layer FB; fmt 1 = Generic NACK -> RTX retransmits. */
-        if (rtcp_header->rc == 1) {
-          size_t fb_len = 4u * ntohs(rtcp_header->length) + 4u;
-          if (pos + fb_len <= len)
-            peer_connection_handle_nack(pc, buf + pos, fb_len);
-        }
-        break;
-      }
-      case RTCP_PSFB: {
-        int fmt = rtcp_header->rc;
-        LOGD("RTCP_PSFB %d", fmt);
-        if ((fmt == 1 || fmt == 4) && pc->config.on_request_keyframe) {
-          /* PLI (1) / FIR (4): request a keyframe. */
-          pc->config.on_request_keyframe(pc->config.user_data);
-        } else if (fmt == 15 && pc->on_remb) {
-          /* goog-remb (AFB, fmt 15): the browser's bandwidth estimate → the
-           * rate controller. */
-          uint32_t bps = 0;
-          if (rtcp_parse_remb(buf + pos, len - pos, &bps) && bps > 0)
-            pc->on_remb(bps, pc->config.user_data);
-        }
-        break;
-      }
-      default:
-        break;
-    }
-
-    pos += 4 * ntohs(rtcp_header->length) + 4;
+  twcc_feedback fb;
+  int rc = twcc_parse(fb_pkt, len, &fb);
+  if (rc != 0) {
+    LOGD("twcc: dropped malformed feedback (%d)", rc);
+    return;
   }
+  int64_t ref_us = twcc_ref_local_us(&pc->twcc_clock, fb.ref_time, (int64_t)sb_mono_us());
+  twcc_arrival* out = fb.count ? malloc(fb.count * sizeof(*out)) : NULL;
+  if (fb.count && !out) {
+    LOGE("twcc: arrivals alloc failed");
+    twcc_feedback_free(&fb);
+    return;
+  }
+  size_t n = twcc_arrivals(&fb, ref_us, out, fb.count);
+  if (n > 0) pc->on_transport_feedback(out, n, pc->config.user_data);
+  free(out);
+  twcc_feedback_free(&fb);
+}
+
+/* Receiver report → the rate controller's loss EWMA + emergency brake, and the
+ * round-trip sample. Loss is the first report block's fraction-lost (top byte
+ * of its second word). Report EVERY RR including fraction==0: the ratecore loss
+ * EWMA only decays when it is fed clean intervals, so suppressing zeros makes
+ * it a one-way ratchet that stays pinned at a historical (or other-viewer) loss
+ * value forever, permanently throttling the grant. */
+static void peer_connection_walk_rr(void* ctx, uint32_t sender_ssrc, const rtcp_report* blocks, size_t n) {
+  (void)sender_ssrc;
+  PeerConnection* pc = (PeerConnection*)ctx;
+  LOGD("RTCP_RR");
+  if (n == 0) return;
+  if (pc->on_receiver_packet_loss)
+    pc->on_receiver_packet_loss((float)blocks[0].fraction_lost / 256.0f, blocks[0].cum_lost, pc->config.user_data);
+
+  uint64_t now_us = sb_mono_us();
+  for (size_t i = 0; i < n; i++) {
+    uint32_t rtt;
+    if (blocks[i].ssrc != SSRC_H264) continue;
+    if (!rtcp_rtt_sample(&pc->sr_hist, blocks[i].lsr, blocks[i].dlsr, now_us, &rtt)) continue;
+    atomic_store(&pc->rtt_us, rtt);
+    atomic_store(&pc->rtt_valid, 1);
+  }
+}
+
+/* Transport-layer FB; fmt 1 = Generic NACK -> RTX retransmits. */
+static void peer_connection_walk_nack(void* ctx, const uint8_t* pkt, size_t len) {
+  peer_connection_handle_nack((PeerConnection*)ctx, pkt, len);
+}
+
+static void peer_connection_walk_twcc(void* ctx, const uint8_t* pkt, size_t len) {
+  peer_connection_handle_twcc((PeerConnection*)ctx, pkt, len);
+}
+
+/* PLI (1) / FIR (4): request a keyframe. */
+static void peer_connection_walk_keyframe(void* ctx) {
+  PeerConnection* pc = (PeerConnection*)ctx;
+  LOGD("RTCP_PSFB keyframe request");
+  if (pc->config.on_request_keyframe) pc->config.on_request_keyframe(pc->config.user_data);
+}
+
+static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size_t len) {
+  static const rtcp_walk_ops ops = {
+      .receiver_report = peer_connection_walk_rr,
+      .nack = peer_connection_walk_nack,
+      .twcc = peer_connection_walk_twcc,
+      .keyframe_request = peer_connection_walk_keyframe,
+  };
+  rtcp_walk_result res = rtcp_walk(buf, len, &ops, pc);
+  if (res.status != RTCP_WALK_OK) LOGD("rtcp: compound stopped after %zu packets (status %d)", res.packets, (int)res.status);
+}
+
+int peer_connection_rtt_ms(PeerConnection* pc, uint32_t* out) {
+  if (!pc || !out || !atomic_load(&pc->rtt_valid)) return -1;
+  uint32_t us = atomic_load(&pc->rtt_us);
+  *out = (us + 999u) / 1000u;
+  return 0;
 }
 
 const char* peer_connection_state_to_string(PeerConnectionState state) {
@@ -1032,6 +1112,157 @@ void* peer_connection_get_sctp(PeerConnection* pc) {
   return &pc->sctp;
 }
 
+/* ── Probe sender ─────────────────────────────────────────────────────────── */
+
+#define PROBE_MIN_BPS 64000u
+/* The probe thread sleeps in slices this long at most, so a stop request or a
+ * cluster ended by media is noticed within one slice. */
+#define PROBE_MAX_SLEEP_US 10000u
+
+/* Padding-only packets ride the RTX SSRC when RTX was negotiated; otherwise
+ * the video SSRC, drawing from the media sequence space. */
+static int peer_connection_probe_uses_rtx(PeerConnection* pc) {
+  return pc->config.rtx && pc->rtx_history && pc->rtx_negotiated;
+}
+
+static void peer_connection_probe_send_one(PeerConnection* pc) {
+  uint8_t buf[TWCC_PADDING_PACKET_SIZE + 64];
+  uint8_t pt;
+  uint32_t ssrc;
+  uint16_t seq = 0; /* the video SSRC's seq is written under send_mtx below */
+  int rtx = peer_connection_probe_uses_rtx(pc);
+  if (rtx) {
+    pt = PT_RTX;
+    ssrc = RTX_SSRC;
+    pthread_mutex_lock(&pc->rtx_mtx);
+    seq = pc->rtx_seq++;
+    pthread_mutex_unlock(&pc->rtx_mtx);
+  } else {
+    pt = PT_H264;
+    ssrc = pc->vrtp_encoder.ssrc;
+  }
+  size_t size = twcc_build_padding_packet(buf, sizeof(buf), pt, ssrc, seq, pc->last_rtp_ts, pc->twcc_ext_id);
+  if (size == 0) return;
+
+  pthread_mutex_lock(&pc->send_mtx);
+  if (!rtx) send_seq_write(&pc->video_seq, buf);
+  peer_connection_twcc_stamp(pc, buf, size);
+  dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&size);
+  agent_send(&pc->agent, buf, size);
+  pthread_mutex_unlock(&pc->send_mtx);
+}
+
+/* Wait until `wake_us` (sender monotonic clock) in slices, or until stopped. */
+static void peer_connection_probe_sleep_until(PeerConnection* pc, uint64_t wake_us) {
+  for (;;) {
+    uint64_t now = sb_mono_us();
+    if (atomic_load(&pc->probe_stop) || now >= wake_us) return;
+    uint64_t span = wake_us - now;
+    if (span > PROBE_MAX_SLEEP_US) span = PROBE_MAX_SLEEP_US;
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)(span * 1000u)};
+    nanosleep(&ts, NULL);
+  }
+}
+
+/* The probe thread: advance the cluster schedule under send_mtx, send the
+ * padding it asks for (each packet takes send_mtx on its own), sleep OUTSIDE
+ * the lock until the next due time. */
+static void* peer_connection_probe_main(void* arg) {
+  PeerConnection* pc = (PeerConnection*)arg;
+  while (!atomic_load(&pc->probe_stop)) {
+    pthread_mutex_lock(&pc->probe_mtx);
+    pc->probe_kick = 0;
+    pthread_mutex_unlock(&pc->probe_mtx);
+
+    pthread_mutex_lock(&pc->send_mtx);
+    int connected = pc->state == PEER_CONNECTION_COMPLETED;
+    if (!connected) twcc_sender_probe_cancel(&pc->twcc_tx);
+    twcc_probe_step step = twcc_sender_probe_step(&pc->twcc_tx, sb_mono_us());
+    pthread_mutex_unlock(&pc->send_mtx);
+
+    for (uint32_t i = 0; i < step.packets && !atomic_load(&pc->probe_stop); i++)
+      peer_connection_probe_send_one(pc);
+
+    if (step.wake_us != 0) {
+      peer_connection_probe_sleep_until(pc, step.wake_us);
+      continue;
+    }
+    pthread_mutex_lock(&pc->probe_mtx);
+    while (!atomic_load(&pc->probe_stop) && !pc->probe_kick)
+      pthread_cond_wait(&pc->probe_cv, &pc->probe_mtx);
+    pthread_mutex_unlock(&pc->probe_mtx);
+  }
+  return NULL;
+}
+
+int peer_connection_send_probe(PeerConnection* pc, uint16_t cluster_id, uint32_t bps, uint32_t min_bytes, uint32_t min_packets, uint32_t min_duration_ms) {
+  if (!pc || bps < PROBE_MIN_BPS || (min_bytes == 0 && min_packets == 0 && min_duration_ms == 0)) return PEER_PROBE_ERR_ARGS;
+  if (!peer_connection_twcc_on(pc)) return PEER_PROBE_ERR_NO_TRANSPORT_CC;
+  if (pc->state != PEER_CONNECTION_COMPLETED) return PEER_PROBE_ERR_NOT_CONNECTED;
+  /* Padding on the video SSRC would interleave with FEC's consecutive-seq
+   * groups and corrupt recovery. */
+  if (pc->config.fec && !peer_connection_probe_uses_rtx(pc)) return PEER_PROBE_ERR_UNSUPPORTED;
+
+  pthread_mutex_lock(&pc->probe_mtx);
+  if (!pc->probe_thread_started) {
+    if (pthread_create(&pc->probe_thread, NULL, peer_connection_probe_main, pc) != 0) {
+      pthread_mutex_unlock(&pc->probe_mtx);
+      LOGE("probe thread start failed");
+      return PEER_PROBE_ERR_THREAD;
+    }
+    pc->probe_thread_started = 1;
+  }
+  pthread_mutex_unlock(&pc->probe_mtx);
+
+  twcc_probe_req req = {cluster_id, bps, min_bytes, min_packets, min_duration_ms};
+  pthread_mutex_lock(&pc->send_mtx);
+  twcc_sender_probe_enqueue(&pc->twcc_tx, &req, sb_mono_us());
+  pthread_mutex_unlock(&pc->send_mtx);
+
+  pthread_mutex_lock(&pc->probe_mtx);
+  pc->probe_kick = 1;
+  pthread_cond_signal(&pc->probe_cv);
+  pthread_mutex_unlock(&pc->probe_mtx);
+  return 0;
+}
+
+size_t peer_connection_drain_sent(PeerConnection* pc, twcc_sent_record* out, size_t cap) {
+  if (!pc || !out || !peer_connection_twcc_on(pc)) return 0;
+  pthread_mutex_lock(&pc->send_mtx);
+  size_t n = twcc_sender_drain(&pc->twcc_tx, out, cap);
+  pthread_mutex_unlock(&pc->send_mtx);
+  return n;
+}
+
+size_t peer_connection_drain_probe_events(PeerConnection* pc, twcc_probe_event* out, size_t cap) {
+  if (!pc || !out || !peer_connection_twcc_on(pc)) return 0;
+  pthread_mutex_lock(&pc->send_mtx);
+  size_t n = twcc_sender_drain_probe_events(&pc->twcc_tx, out, cap);
+  pthread_mutex_unlock(&pc->send_mtx);
+  return n;
+}
+
+uint64_t peer_connection_sent_dropped(PeerConnection* pc) {
+  if (!pc || !peer_connection_twcc_on(pc)) return 0;
+  pthread_mutex_lock(&pc->send_mtx);
+  uint64_t n = twcc_sender_dropped(&pc->twcc_tx);
+  pthread_mutex_unlock(&pc->send_mtx);
+  return n;
+}
+
+/* The pair libpeer sends on is the agent's nominated pair (agent_send). */
+int peer_connection_selected_pair(PeerConnection* pc, peer_pair_info* out) {
+  if (!pc || !out) return -1;
+  peer_pair_info_from_pair(pc->agent.nominated_pair, out);
+  return out->valid ? 0 : -1;
+}
+
+uint32_t peer_connection_pair_generation(PeerConnection* pc) {
+  peer_pair_info cur;
+  peer_pair_info_from_pair(pc->agent.nominated_pair, &cur);
+  return peer_pair_tracker_update(&pc->pair_tracker, &cur);
+}
+
 PeerConnection* peer_connection_create(PeerConfiguration* config) {
   PeerConnection* pc = calloc(1, sizeof(PeerConnection));
   if (!pc) {
@@ -1053,6 +1284,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   /* RTX: history ring + lock (skipped entirely when disabled). */
   pthread_mutex_init(&pc->rtx_mtx, NULL);
   pthread_mutex_init(&pc->send_mtx, NULL);
+  pthread_mutex_init(&pc->probe_mtx, NULL);
+  pthread_cond_init(&pc->probe_cv, NULL);
   if (pc->config.rtx) {
     pc->rtx_history = calloc(RTX_HISTORY_SLOTS, sizeof(rtx_slot_t));
     if (!pc->rtx_history)
@@ -1091,6 +1324,13 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
 void peer_connection_destroy(PeerConnection* pc) {
   if (pc) {
+    if (pc->probe_thread_started) {
+      pthread_mutex_lock(&pc->probe_mtx);
+      atomic_store(&pc->probe_stop, 1);
+      pthread_cond_signal(&pc->probe_cv);
+      pthread_mutex_unlock(&pc->probe_mtx);
+      pthread_join(pc->probe_thread, NULL);
+    }
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
@@ -1100,8 +1340,11 @@ void peer_connection_destroy(PeerConnection* pc) {
       free(pc->frag_state);
     }
     free(pc->rtx_history);
+    twcc_sender_deinit(&pc->twcc_tx);
     pthread_mutex_destroy(&pc->rtx_mtx);
     pthread_mutex_destroy(&pc->send_mtx);
+    pthread_mutex_destroy(&pc->probe_mtx);
+    pthread_cond_destroy(&pc->probe_cv);
     free(pc);
     pc = NULL;
   }
@@ -1156,6 +1399,10 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
   sb_pace_ns = sb_lockwait_ns = sb_srtp_ns = sb_send_ns = 0;
   sb_pkts = 0;
   uint64_t sv_t0 = sb_mono_ns();
+  /* The frame's bytes are the pacer's backlog; packet headers and the SRTP
+   * trailer add ~3% on top, counted as the packets leave. */
+  pc->pace_queue_bytes = (uint64_t)len + len / 32;
+  pc->pace_queue_start_ns = sv_t0;
   int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
   uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
   if (total_ms >= 30) {
@@ -1527,6 +1774,7 @@ int peer_connection_loop(PeerConnection* pc) {
           dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, sr_buf, &sr_len);
           if (sr_len > 0) {
             agent_send(&pc->agent, sr_buf, (size_t)sr_len);
+            rtcp_sr_history_add(&pc->sr_hist, ntp_now, sb_mono_us());
             LOGD("RTCP SR sent: ntp=0x%016llx rtp_ts=%u pkts=%u octets=%u",
                  (unsigned long long)ntp_now, rtp_ts_now,
                  pc->sr_packets_sent, pc->sr_octets_sent);
@@ -1578,6 +1826,8 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
   int is_update = 0;
   Agent* agent = &pc->agent;
+  uint8_t twcc_id = 0;
+  int twcc_ext_found = 0, twcc_fb_found = 0, rtx_found = 0;
 
   while ((line = strstr(start, "\r\n"))) {
     line = strstr(start, "\r\n");
@@ -1586,6 +1836,12 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
     if (strstr(buf, "a=setup:passive")) {
       role = DTLS_SRTP_ROLE_CLIENT;
+    }
+
+    if (type == SDP_TYPE_ANSWER) {
+      if (!twcc_ext_found && sdp_find_extmap_id(buf, TWCC_EXTMAP_URI, &twcc_id)) twcc_ext_found = 1;
+      if (strstr(buf, "a=rtcp-fb:") && strstr(buf, " transport-cc")) twcc_fb_found = 1;
+      if (strstr(buf, "a=rtpmap:") && strstr(buf, "rtx/90000")) rtx_found = 1;
     }
 
     if (strstr(buf, "a=fingerprint")) {
@@ -1614,6 +1870,25 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
   if (is_update) {
     return;
+  }
+
+  if (type == SDP_TYPE_ANSWER) {
+    pc->rtx_negotiated = rtx_found ? 1 : 0;
+    /* The estimator exists only when the answer keeps both the sequence-number
+     * extension and the feedback request. */
+    if (twcc_ext_found && twcc_fb_found) {
+      if (!pc->twcc_tx.ring && twcc_sender_init(&pc->twcc_tx, twcc_id, TWCC_SENT_RING_CAP) != 0)
+        LOGW("twcc: sent ring alloc failed");
+      if (pc->twcc_tx.ring) {
+        pc->twcc_ext_id = twcc_id;
+        pc->twcc_tx.ext_id = twcc_id;
+        atomic_store_explicit(&pc->twcc_negotiated, 1, memory_order_release);
+      } else {
+        LOGW("twcc: transport-cc disabled for this peer");
+      }
+    } else {
+      atomic_store_explicit(&pc->twcc_negotiated, 0, memory_order_release);
+    }
   }
 
   agent_set_remote_description(&pc->agent, (char*)sdp);
@@ -1775,9 +2050,13 @@ void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
   pc->on_receiver_packet_loss = on_receiver_packet_loss;
 }
 
-void peer_connection_on_remb(PeerConnection* pc,
-                             void (*on_remb)(uint32_t bitrate_bps, void* userdata)) {
-  pc->on_remb = on_remb;
+void peer_connection_on_transport_feedback(PeerConnection* pc,
+                                           void (*on_transport_feedback)(const twcc_arrival* arrivals, size_t count, void* userdata)) {
+  pc->on_transport_feedback = on_transport_feedback;
+}
+
+int peer_connection_transport_cc_negotiated(PeerConnection* pc) {
+  return pc && peer_connection_twcc_on(pc);
 }
 
 int peer_connection_get_capture_ref(PeerConnection* pc, uint32_t* rtp, uint64_t* ntp) {
