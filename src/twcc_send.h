@@ -25,9 +25,10 @@ typedef struct {
   int32_t probe_cluster; /* cluster id, or TWCC_NO_CLUSTER */
 } twcc_sent_record;
 
-/* 32768 records hold more than 1 s of 275-byte padding packets at 60 Mbps
- * (27.3k) and of 1200-byte media at 60 Mbps (6.3k). */
-#define TWCC_SENT_RING_CAP 32768
+/* The reactor drains the ring every loop, so it only has to outlast a stalled
+ * loop: 8192 records hold 250 ms of 275-byte padding packets at 60 Mbps (6.8k)
+ * and more than 1 s of 1200-byte media at 60 Mbps (6.3k). */
+#define TWCC_SENT_RING_CAP 8192
 
 /* Padding-only packet size (twcc_build_padding_packet): 12 header + 8
  * extension + 255 padding. Kept equal to TWCC_PADDING_PACKET_SIZE in twcc.h. */

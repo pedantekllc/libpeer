@@ -294,14 +294,6 @@ const char* peer_connection_create_offer(PeerConnection* pc);
 
 const char* peer_connection_create_answer(PeerConnection* pc);
 
-/**
- * @brief register callback function to handle packet loss from RTCP receiver report
- * @param[in] peer connection
- * @param[in] callback function void (*cb)(float fraction_loss, uint32_t total_loss, void *userdata)
- * @param[in] userdata for callback function
- */
-void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
-                                             void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata));
 
 /**
  * @brief register callback for transport-wide congestion control feedback.

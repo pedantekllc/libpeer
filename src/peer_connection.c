@@ -79,7 +79,6 @@ struct PeerConnection {
   void (*onicecandidate)(char* sdp, void* user_data);
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
-  void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* user_data);
   void (*on_transport_feedback)(const twcc_arrival* arrivals, size_t count, void* user_data);
 
   uint8_t temp_buf[CONFIG_MTU];
@@ -979,20 +978,13 @@ static void peer_connection_handle_twcc(PeerConnection* pc, const uint8_t* fb_pk
   twcc_feedback_free(&fb);
 }
 
-/* Receiver report → the rate controller's loss EWMA + emergency brake, and the
- * round-trip sample. Loss is the first report block's fraction-lost (top byte
- * of its second word). Report EVERY RR including fraction==0: the ratecore loss
- * EWMA only decays when it is fed clean intervals, so suppressing zeros makes
- * it a one-way ratchet that stays pinned at a historical (or other-viewer) loss
- * value forever, permanently throttling the grant. */
+/* Receiver report → the round-trip sample for our video SSRC (LSR/DLSR against
+ * our own SR send times). Loss reaches the estimator through transport-cc
+ * feedback, not through the report's fraction-lost. */
 static void peer_connection_walk_rr(void* ctx, uint32_t sender_ssrc, const rtcp_report* blocks, size_t n) {
   (void)sender_ssrc;
   PeerConnection* pc = (PeerConnection*)ctx;
   LOGD("RTCP_RR");
-  if (n == 0) return;
-  if (pc->on_receiver_packet_loss)
-    pc->on_receiver_packet_loss((float)blocks[0].fraction_lost / 256.0f, blocks[0].cum_lost, pc->config.user_data);
-
   uint64_t now_us = sb_mono_us();
   for (size_t i = 0; i < n; i++) {
     uint32_t rtt;
@@ -2043,11 +2035,6 @@ int peer_connection_send_rtcp_pil(PeerConnection* pc, uint32_t ssrc) {
 // callbacks
 void peer_connection_on_connected(PeerConnection* pc, void (*on_connected)(void* userdata)) {
   pc->on_connected = on_connected;
-}
-
-void peer_connection_on_receiver_packet_loss(PeerConnection* pc,
-                                             void (*on_receiver_packet_loss)(float fraction_loss, uint32_t total_loss, void* userdata)) {
-  pc->on_receiver_packet_loss = on_receiver_packet_loss;
 }
 
 void peer_connection_on_transport_feedback(PeerConnection* pc,
