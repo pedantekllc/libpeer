@@ -25,9 +25,11 @@
 /* A dozen MTUs may leave back-to-back before pacing starts. */
 #define PACER_BURST_BYTES 16384.0
 
-/* The longest the queue may take to drain, live view (libwebrtc's default
- * kMaxQueueTime is 2 s; a live viewer wants frames fresher than that). */
-#define PACER_QUEUE_LIMIT_NS 500000000ull
+/* The longest the queue may take to drain: libwebrtc's kMaxExpectedQueueLength. A
+ * shorter limit releases a keyframe at line rate whenever the pace is a little under its
+ * size per limit, and a burst at line rate overflows a narrow uplink's queue. Live
+ * freshness is the ring's job (kfcore's flush limit), not the pacer's. */
+#define PACER_QUEUE_LIMIT_NS 2000000000ull
 
 /* Per-packet sleep cap: guards against a pathological rate stalling a worker. */
 #define PACER_MAX_SLEEP_NS 50000000ull
