@@ -35,3 +35,19 @@ uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_
   /* The deficit is repaid by the elapsed-time refill on the next call. */
   return (uint64_t)wait_ns;
 }
+
+void pacer_shared_init(pacer_shared* p) {
+  pthread_mutex_init(&p->mtx, NULL);
+  p->st = (pacer_state){0};
+}
+
+void pacer_shared_destroy(pacer_shared* p) {
+  pthread_mutex_destroy(&p->mtx);
+}
+
+uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
+  pthread_mutex_lock(&p->mtx);
+  uint64_t wait_ns = pacer_take(&p->st, bps, queued_bytes, queued_for_ns, bytes, now_ns);
+  pthread_mutex_unlock(&p->mtx);
+  return wait_ns;
+}

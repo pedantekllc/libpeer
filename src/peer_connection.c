@@ -55,6 +55,7 @@ typedef struct dtls_fragment_state_s dtls_fragment_state_t;
 #define RTX_SSRC          2u     /* media is a=ssrc:1; FID-paired in the SDP  */
 #define RTX_HISTORY_SLOTS 512    /* ~0.5-2.5s of video at typical rates       */
 #define RTX_SLOT_BYTES    (CONFIG_MTU + 128)
+#define RTX_QUEUE_SLOTS   256    /* NACKed seqs waiting for their pace         */
 /* Don't answer repeat-NACKs for the same seq more often than this. */
 #define RTX_MIN_RESEND_MS 40
 
@@ -153,7 +154,9 @@ struct PeerConnection {
    * is also written by the controller thread via the setter (benign aligned-
    * word race). */
   uint32_t pacer_bps;             /* 0 = pacing disabled                      */
-  pacer_state pacer;              /* token bucket (pacer.h)                   */
+  pacer_shared pacer;             /* token bucket (pacer.h), shared with the RTX thread */
+  peer_backlog_fn backlog_fn;     /* the caller's send queue behind the AU    */
+  void* backlog_ctx;
   uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
   uint64_t pace_queue_start_ns;   /* when that access unit entered the pacer  */
 
@@ -183,6 +186,19 @@ struct PeerConnection {
   rtx_slot_t* rtx_history;           /* RTX_HISTORY_SLOTS slots; NULL = off  */
   pthread_mutex_t rtx_mtx;
   uint16_t rtx_seq;                  /* RTX stream's own sequence space      */
+
+  /* Retransmission sender. NACK handling runs on the reactor and must never
+   * sleep, so it only queues the NACKed seq numbers (rtx_q, guarded by rtx_mtx)
+   * and wakes this lazily started thread, which draws each packet's budget from
+   * the shared pacer and sleeps outside every lock. The probe thread is the same
+   * pattern. */
+  uint16_t rtx_q[RTX_QUEUE_SLOTS];
+  unsigned rtx_q_first;
+  unsigned rtx_q_n;
+  pthread_cond_t rtx_cv;
+  pthread_t rtx_thread;
+  int rtx_thread_started;
+  _Atomic int rtx_stop;
 
   /* Serialises every srtp_protect/_rtcp + agent_send on this connection.
    * libsrtp sessions are NOT thread-safe, and three threads transmit: the
@@ -275,9 +291,10 @@ static uint64_t sb_mono_us(void) {
   return sb_mono_ns() / 1000u;
 }
 
-/* `video` packets draw on the access unit's backlog: the pace rate rises when
- * the rest of the frame would not drain within PACER_QUEUE_LIMIT_NS. Other
- * packets (audio) see no backlog. */
+/* `video` packets draw on the queue behind them: the rest of the access unit plus the
+ * bytes waiting in the caller's ring; the pace rate rises when that would not drain
+ * within PACER_QUEUE_LIMIT_NS. Other packets (audio, retransmissions) see no
+ * backlog but draw on the same bucket. */
 static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
@@ -287,14 +304,26 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   if (video) {
     queued = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes : bytes;
     queued_for = now_ns - pc->pace_queue_start_ns;
+    if (pc->backlog_fn) {
+      uint64_t ring_bytes = 0, ring_wait_ns = 0;
+      pc->backlog_fn(pc->backlog_ctx, &ring_bytes, &ring_wait_ns);
+      queued += ring_bytes;
+      if (ring_wait_ns > queued_for) queued_for = ring_wait_ns;
+    }
   }
-  uint64_t wait_ns = pacer_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns);
-  if (video) pc->pace_queue_bytes = queued > bytes ? queued - bytes : 0;
+  uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns);
+  if (video) pc->pace_queue_bytes = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes - bytes : 0;
   if (wait_ns == 0) return;
   struct timespec ts;
   ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
   ts.tv_nsec = (long)(wait_ns % 1000000000ull);
   nanosleep(&ts, NULL);
+}
+
+void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx) {
+  if (!pc) return;
+  pc->backlog_fn = fn;
+  pc->backlog_ctx = ctx;
 }
 
 void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
@@ -360,19 +389,6 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
   sb_pkts++;
 }
 
-/* TEMP INSTRUMENT (pc.loop phase decomposition): reactor-thread-only per-call
- * accumulators for time spent in peer_connection_rtx_resend()'s send_mtx
- * acquire vs. the subsequent encrypt+send. peer_connection_rtx_resend is
- * invoked nested (peer_connection_loop -> peer_connection_incoming_rtcp ->
- * peer_connection_handle_nack -> peer_connection_rtx_resend), and only the
- * single reactor thread ever walks that chain, so a plain __thread pair
- * (mirroring the sb_* pattern above) is simpler than threading an
- * accumulator pointer through three call levels. Reset at the top of the
- * PEER_CONNECTION_COMPLETED case in peer_connection_loop(); read at the end
- * of that case to build the "pc.loop slow" breakdown. Remove alongside the
- * rest of the pc.loop phase timing once the tail is found. */
-static __thread uint32_t pl_rtx_lockwait_ms, pl_rtx_send_ms;
-
 /* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
  * retransmission. Send-worker thread; the NACK reader holds the same mutex. */
 static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size) {
@@ -387,52 +403,85 @@ static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, s
   pthread_mutex_unlock(&pc->rtx_mtx);
 }
 
-/* Answer one NACKed sequence number with an RTX packet (RFC 4588: original
- * header with RTX SSRC/PT/seq, payload = 2-byte OSN + original payload).
- * Reactor thread — sends directly, NEVER through the pacer (a pacer sleep
- * here would stall signaling for every peer). */
-static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
-  uint8_t buf[RTX_SLOT_BYTES + 2 + 64];   /* +OSN +SRTP trailer slack */
+/* Build the RTX packet answering `seq` (RFC 4588: original header with RTX
+ * SSRC/PT/seq, payload = 2-byte OSN + original payload) into `buf`. Returns its
+ * length, 0 when the history no longer holds `seq`. RTX thread. */
+static size_t peer_connection_rtx_build(PeerConnection* pc, uint16_t seq, uint8_t* buf) {
   size_t out_len = 0;
-
   pthread_mutex_lock(&pc->rtx_mtx);
   rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
   if (slot->len >= 12 && slot->seq == seq) {
-    uint32_t now = rtx_now_ms();
-    if (slot->last_resend_ms == 0 || now - slot->last_resend_ms >= RTX_MIN_RESEND_MS) {
-      slot->last_resend_ms = now;
-      size_t off = rtp_payload_offset(slot->data, slot->len);
-      /* header + extensions verbatim, then OSN, then original payload */
-      memcpy(buf, slot->data, off);
-      buf[off]     = (uint8_t)(seq >> 8);          /* OSN */
-      buf[off + 1] = (uint8_t)(seq & 0xFF);
-      memcpy(buf + off + 2, slot->data + off, slot->len - off);
-      out_len = slot->len + 2;
-      /* rewrite identity: RTX PT (marker preserved), own seq, RTX SSRC */
-      uint16_t rseq = pc->rtx_seq++;
-      buf[1] = (uint8_t)((buf[1] & 0x80) | PT_RTX);
-      buf[2] = (uint8_t)(rseq >> 8);
-      buf[3] = (uint8_t)(rseq & 0xFF);
-      buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = RTX_SSRC;
-    }
+    size_t off = rtp_payload_offset(slot->data, slot->len);
+    /* header + extensions verbatim, then OSN, then original payload */
+    memcpy(buf, slot->data, off);
+    buf[off]     = (uint8_t)(seq >> 8);          /* OSN */
+    buf[off + 1] = (uint8_t)(seq & 0xFF);
+    memcpy(buf + off + 2, slot->data + off, slot->len - off);
+    out_len = slot->len + 2;
+    /* rewrite identity: RTX PT (marker preserved), own seq, RTX SSRC */
+    uint16_t rseq = pc->rtx_seq++;
+    buf[1] = (uint8_t)((buf[1] & 0x80) | PT_RTX);
+    buf[2] = (uint8_t)(rseq >> 8);
+    buf[3] = (uint8_t)(rseq & 0xFF);
+    buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = RTX_SSRC;
   }
   pthread_mutex_unlock(&pc->rtx_mtx);
+  return out_len;
+}
 
-  if (out_len > 0) {
-    /* TEMP INSTRUMENT (pc.loop phase decomposition): time the send_mtx
-     * acquire separately from the locked encrypt+send — see pl_rtx_lockwait_ms
-     * / pl_rtx_send_ms above. */
-    uint32_t rt0 = ports_get_epoch_time();
+/* The RTX thread: take a queued seq, draw its budget from the shared pacer
+ * (sleeping outside every lock), then send it. */
+static void* peer_connection_rtx_main(void* arg) {
+  PeerConnection* pc = (PeerConnection*)arg;
+  uint8_t buf[RTX_SLOT_BYTES + 2 + 64];   /* +OSN +SRTP trailer slack */
+  for (;;) {
+    pthread_mutex_lock(&pc->rtx_mtx);
+    while (!atomic_load(&pc->rtx_stop) && pc->rtx_q_n == 0)
+      pthread_cond_wait(&pc->rtx_cv, &pc->rtx_mtx);
+    if (atomic_load(&pc->rtx_stop)) {
+      pthread_mutex_unlock(&pc->rtx_mtx);
+      return NULL;
+    }
+    uint16_t seq = pc->rtx_q[pc->rtx_q_first];
+    pc->rtx_q_first = (pc->rtx_q_first + 1) % RTX_QUEUE_SLOTS;
+    pc->rtx_q_n--;
+    pthread_mutex_unlock(&pc->rtx_mtx);
+
+    size_t out_len = peer_connection_rtx_build(pc, seq, buf);
+    if (out_len == 0) continue;
+    peer_connection_pace(pc, out_len + 10, 0);
     pthread_mutex_lock(&pc->send_mtx);
-    uint32_t rt1 = ports_get_epoch_time();
     peer_connection_twcc_stamp(pc, buf, out_len);
     dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
     agent_send(&pc->agent, buf, out_len);
     pthread_mutex_unlock(&pc->send_mtx);
-    uint32_t rt2 = ports_get_epoch_time();
-    pl_rtx_lockwait_ms += (rt1 - rt0);
-    pl_rtx_send_ms += (rt2 - rt1);
   }
+}
+
+/* Queue one NACKed sequence number for retransmission. Reactor thread: takes
+ * only rtx_mtx and never sleeps; the pace happens on the RTX thread. A repeat
+ * NACK inside RTX_MIN_RESEND_MS, or one that finds the queue full, is dropped
+ * (the receiver NACKs again). */
+static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
+  pthread_mutex_lock(&pc->rtx_mtx);
+  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
+  uint32_t now = rtx_now_ms();
+  if (slot->len >= 12 && slot->seq == seq && pc->rtx_q_n < RTX_QUEUE_SLOTS &&
+      (slot->last_resend_ms == 0 || now - slot->last_resend_ms >= RTX_MIN_RESEND_MS)) {
+    if (!pc->rtx_thread_started) {
+      if (pthread_create(&pc->rtx_thread, NULL, peer_connection_rtx_main, pc) != 0) {
+        pthread_mutex_unlock(&pc->rtx_mtx);
+        LOGE("rtx thread start failed");
+        return;
+      }
+      pc->rtx_thread_started = 1;
+    }
+    slot->last_resend_ms = now;
+    pc->rtx_q[(pc->rtx_q_first + pc->rtx_q_n) % RTX_QUEUE_SLOTS] = seq;
+    pc->rtx_q_n++;
+    pthread_cond_signal(&pc->rtx_cv);
+  }
+  pthread_mutex_unlock(&pc->rtx_mtx);
 }
 
 /* Parse one RTCP Generic NACK (RTPFB fmt=1) and retransmit every named seq.
@@ -1279,6 +1328,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   pthread_mutex_init(&pc->send_mtx, NULL);
   pthread_mutex_init(&pc->probe_mtx, NULL);
   pthread_cond_init(&pc->probe_cv, NULL);
+  pthread_cond_init(&pc->rtx_cv, NULL);
+  pacer_shared_init(&pc->pacer);
   if (pc->config.rtx) {
     pc->rtx_history = calloc(RTX_HISTORY_SLOTS, sizeof(rtx_slot_t));
     if (!pc->rtx_history)
@@ -1324,6 +1375,13 @@ void peer_connection_destroy(PeerConnection* pc) {
       pthread_mutex_unlock(&pc->probe_mtx);
       pthread_join(pc->probe_thread, NULL);
     }
+    if (pc->rtx_thread_started) {
+      pthread_mutex_lock(&pc->rtx_mtx);
+      atomic_store(&pc->rtx_stop, 1);
+      pthread_cond_signal(&pc->rtx_cv);
+      pthread_mutex_unlock(&pc->rtx_mtx);
+      pthread_join(pc->rtx_thread, NULL);
+    }
     sctp_destroy_association(&pc->sctp);
     dtls_srtp_deinit(&pc->dtls_srtp);
     agent_destroy(&pc->agent);
@@ -1338,6 +1396,8 @@ void peer_connection_destroy(PeerConnection* pc) {
     pthread_mutex_destroy(&pc->send_mtx);
     pthread_mutex_destroy(&pc->probe_mtx);
     pthread_cond_destroy(&pc->probe_cv);
+    pthread_cond_destroy(&pc->rtx_cv);
+    pacer_shared_destroy(&pc->pacer);
     free(pc);
     pc = NULL;
   }
@@ -1599,16 +1659,12 @@ int peer_connection_loop(PeerConnection* pc) {
       /* TEMP INSTRUMENT (pc.loop phase decomposition — see PC_LOOP_SLOW_MS
        * above): per-phase wall-clock accumulators for THIS call of
        * peer_connection_loop(), same clock (ports_get_epoch_time, ms) as the
-       * caller's "slow pc.loop" timer in sigshell.c. Reset every call; the
-       * pl_rtx_* pair is __thread (nested through incoming_rtcp/handle_nack)
-       * and reset here too. Logged once at the end of this case iff the
+       * caller's "slow pc.loop" timer in sigshell.c. Reset every call. Logged once at the end of this case iff the
        * case's total wall time exceeds PC_LOOP_SLOW_MS — no per-call spam. */
       uint32_t pl_case_start_ms = ports_get_epoch_time();
       uint32_t pl_recv_ms = 0, pl_dtls_resend_ms = 0, pl_rtcp_ms = 0,
                pl_dtls_read_ms = 0, pl_rtp_ms = 0,
                pl_sr_lockwait_ms = 0, pl_sr_send_ms = 0;
-      pl_rtx_lockwait_ms = 0;
-      pl_rtx_send_ms = 0;
 
       /* Drain all pending packets from the socket.
        * STUN consent requests arrive frequently (~16/sec) and we must respond
@@ -1677,11 +1733,6 @@ int peer_connection_loop(PeerConnection* pc) {
           LOGD("Got RTCP packet");
           uint32_t pl_rtcp_t0 = ports_get_epoch_time();
           dtls_srtp_decrypt_rtcp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
-          /* NOTE: peer_connection_incoming_rtcp may itself call
-           * peer_connection_rtx_resend() (NACK -> RTX retransmit), which
-           * accumulates into pl_rtx_lockwait_ms/pl_rtx_send_ms — so pl_rtcp_ms
-           * below is a SUPERSET that includes any nested RTX resend time; the
-           * two rtx_* fields in the final log break that portion back out. */
           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
           pl_rtcp_ms += ports_get_epoch_time() - pl_rtcp_t0;
 
@@ -1781,16 +1832,15 @@ int peer_connection_loop(PeerConnection* pc) {
 
       /* TEMP INSTRUMENT (pc.loop phase decomposition — see PC_LOOP_SLOW_MS
        * above): one line, only when this call of the COMPLETED case ran long,
-       * pinpointing which phase ate the time. rtcp_ms is a superset of
-       * rtx_lockwait_ms+rtx_send_ms (see the note at the RTCP branch above). */
+       * pinpointing which phase ate the time. */
       {
         uint32_t pl_total_ms = ports_get_epoch_time() - pl_case_start_ms;
         if (pl_total_ms >= PC_LOOP_SLOW_MS) {
           LOGI("pc.loop slow dur_ms=%u [recv=%u dtlsresend=%u rtcp=%u "
-               "rtx_lockwait=%u rtx_send=%u dtlsread=%u rtp=%u "
+               "dtlsread=%u rtp=%u "
                "sr_lockwait=%u sr_send=%u]",
                pl_total_ms, pl_recv_ms, pl_dtls_resend_ms, pl_rtcp_ms,
-               pl_rtx_lockwait_ms, pl_rtx_send_ms, pl_dtls_read_ms, pl_rtp_ms,
+               pl_dtls_read_ms, pl_rtp_ms,
                pl_sr_lockwait_ms, pl_sr_send_ms);
         }
       }
