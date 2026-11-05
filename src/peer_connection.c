@@ -337,7 +337,7 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
   /* Pace BEFORE taking the send lock (sleeps must never hold it); budget on
    * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
   uint64_t t0 = sb_mono_ns();
-  peer_connection_pace(pc, size + 10, size >= 12 && ((data[1] & 0x7F) == PT_H264 || (data[1] & 0x7F) == PT_RED));
+  peer_connection_pace(pc, size + 10, size >= 12 && (rtp_is_video_pt(data[1] & 0x7F) || (data[1] & 0x7F) == PT_RED));
   uint64_t t1 = sb_mono_ns();
   pthread_mutex_lock(&pc->send_mtx);
   uint64_t t2 = sb_mono_ns();
@@ -566,8 +566,8 @@ static size_t peer_connection_red_wrap(uint8_t* data, size_t size) {
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
-  /* On the first packet of each outgoing VIDEO access unit (PT_H264=96,
-   * detected by RTP-timestamp change) add abs-capture-time so Chrome can
+  /* On the first packet of each outgoing VIDEO access unit (the connection's
+   * video PT, PT_H264 or PT_H265; detected by RTP-timestamp change) add abs-capture-time so Chrome can
    * compute skew-free glass-to-glass latency.
    *
    * All insertions happen here — a single send chokepoint — BEFORE srtp_protect
@@ -577,7 +577,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
    * encoder buffer, so a stale X bit from fragment 1 persists into 2..N; guarding
    * on X there would forward X=1 packets with no real extension → ~75% loss.
    * Verified by the live-decode E2E (framesDecoded>0, zero loss).               */
-  if (size >= 12 && (data[1] & 0x7f) == PT_H264) {
+  if (size >= 12 && rtp_is_video_pt(data[1] & 0x7f)) {
     /* Extract the RTP timestamp from the packet (bytes 4..7, big-endian). */
     uint32_t rtp_ts = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16)
                     | ((uint32_t)data[6] <<  8) |  (uint32_t)data[7];
@@ -597,9 +597,10 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
   /* Every outgoing RTP packet (video, audio) carries the transport-wide seq
    * element; the value is stamped under send_mtx at the transmit tail. */
   if (size >= 12) size = peer_connection_twcc_reserve(pc, data, size);
-  if (pc->config.fec && size >= 12 && (data[1] & 0x7F) == PT_H264) {
+  if (pc->config.fec && size >= 12 && rtp_is_video_pt(data[1] & 0x7F)) {
     /* FEC path: the chokepoint owns the sequence space (media + repair
      * packets interleave on one SSRC), so re-stamp the encoder's seq. */
+    uint8_t media_pt = data[1] & 0x7F;
     uint16_t seq = pc->out_seq++;
     data[2] = (uint8_t)(seq >> 8);
     data[3] = (uint8_t)(seq & 0xFF);
@@ -615,7 +616,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
      * every subsequent fragment skip this branch and go out unstamped/unwrapped
      * on the encoder's own seq space — two interleaved sequence spaces, and
      * the receiver rejects nearly everything. Restore the media PT. */
-    data[1] = (uint8_t)((frame_end ? 0x80 : 0x00) | PT_H264);
+    data[1] = (uint8_t)((frame_end ? 0x80 : 0x00) | media_pt);
 
     if (pc->fec_group_cnt >= FEC_GROUP_SIZE ||
         (frame_end && pc->fec_group_cnt >= 2)) {
@@ -623,7 +624,7 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     }
     return;
   }
-  peer_connection_xmit_rtp(pc, data, size, size >= 12 && (data[1] & 0x7F) == PT_H264);
+  peer_connection_xmit_rtp(pc, data, size, size >= 12 && rtp_is_video_pt(data[1] & 0x7F));
 }
 
 /*
@@ -1130,7 +1131,7 @@ static void peer_connection_probe_send_one(PeerConnection* pc) {
     seq = pc->rtx_seq++;
     pthread_mutex_unlock(&pc->rtx_mtx);
   } else {
-    pt = PT_H264;
+    pt = (uint8_t)rtp_video_pt(pc->config.video_codec);
     ssrc = pc->vrtp_encoder.ssrc;
   }
   size_t size = twcc_build_padding_packet(buf, sizeof(buf), pt, ssrc, seq, pc->last_rtp_ts, pc->twcc_ext_id);
@@ -1937,6 +1938,13 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
       sdp_append_h264_rtx(pc->sdp);
     else
       sdp_append_h264(pc->sdp);
+  } else if (pc->config.video_codec == CODEC_H265) {
+    if (pc->config.fec)
+      sdp_append_h265_fec(pc->sdp);
+    else if (pc->config.rtx && pc->rtx_history)
+      sdp_append_h265_rtx(pc->sdp);
+    else
+      sdp_append_h265(pc->sdp);
   }
 
   switch (pc->config.audio_codec) {

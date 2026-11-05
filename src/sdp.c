@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "rtp.h"
 #include "sdp.h"
 #include "twcc.h"
 
@@ -118,6 +119,52 @@ void sdp_append_h264_fec(char* sdp) {
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:video");
   sdp_append(sdp, "a=rtcp-mux");
+}
+
+/* H.265 video m-section (RFC 7798). Same feedback, extmaps and ssrc lines as
+ * H.264 on PT_H265; `rtx` adds the RFC 4588 pair (apt=98) and `fec` adds
+ * RED + ULPFEC. fmtp carries the RFC 7798 §7.1 receive parameters at their
+ * defaults, spelled out the way Chromium offers them (level-id 93 = level 3.1,
+ * profile-id 1 = Main, tier-flag 0 = Main tier, tx-mode SRST = single RTP
+ * stream/single session); VPS/SPS/PPS travel in-band, so no sprop-* is sent. */
+static void sdp_append_h265_section(char* sdp, int rtx, int fec) {
+  const char* extra_pts = rtx ? " 97" : (fec ? " 118 119" : "");
+  sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF %d%s", PT_H265, extra_pts);
+  sdp_append(sdp, "c=IN IP4 0.0.0.0");
+  sdp_append(sdp, "a=rtcp-fb:%d nack", PT_H265);
+  sdp_append(sdp, "a=rtcp-fb:%d nack pli", PT_H265);
+  sdp_append_transport_cc(sdp, PT_H265);
+  sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=fmtp:%d level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST", PT_H265);
+  sdp_append(sdp, "a=rtpmap:%d H265/90000", PT_H265);
+  if (rtx) {
+    sdp_append(sdp, "a=rtpmap:%d rtx/90000", PT_RTX);
+    sdp_append(sdp, "a=fmtp:%d apt=%d", PT_RTX, PT_H265);
+    sdp_append(sdp, "a=ssrc-group:FID 1 2");
+  }
+  if (fec) {
+    sdp_append(sdp, "a=rtpmap:%d red/90000", PT_RED);
+    sdp_append(sdp, "a=rtpmap:%d ulpfec/90000", PT_ULPFEC);
+  }
+  sdp_append(sdp, "a=ssrc:1 cname:webrtc-h265");
+  if (rtx) {
+    sdp_append(sdp, "a=ssrc:2 cname:webrtc-h265");
+  }
+  sdp_append(sdp, "a=sendrecv");
+  sdp_append(sdp, "a=mid:video");
+  sdp_append(sdp, "a=rtcp-mux");
+}
+
+void sdp_append_h265(char* sdp) {
+  sdp_append_h265_section(sdp, 0, 0);
+}
+
+void sdp_append_h265_rtx(char* sdp) {
+  sdp_append_h265_section(sdp, 1, 0);
+}
+
+void sdp_append_h265_fec(char* sdp) {
+  sdp_append_h265_section(sdp, 0, 1);
 }
 
 void sdp_append_pcma(char* sdp) {
