@@ -22,8 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* A dozen MTUs may leave back-to-back before pacing starts. */
-#define PACER_BURST_BYTES 16384.0
+/* Three MTUs may leave back-to-back: libwebrtc's pacer releases about one 5 ms process
+ * interval of budget at a time, a few packets at a live-view rate. A larger allowance
+ * doubles the short-term rate, and a narrow uplink's shallow queue drops the excess. */
+#define PACER_BURST_BYTES 4096.0
 
 /* The longest the queue may take to drain: libwebrtc's kMaxExpectedQueueLength. A
  * shorter limit releases a keyframe at line rate whenever the pace is a little under its
