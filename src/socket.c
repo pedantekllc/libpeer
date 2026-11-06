@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "socket.h"
@@ -170,7 +171,25 @@ int udp_socket_sendto(UdpSocket* udp_socket, Address* addr, const uint8_t* buf, 
     return -1;
   }
 
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  unsigned long long bin = ((unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec) / UDP_PEAK_BIN_NS;
+  if (atomic_exchange_explicit(&udp_socket->peak_bin, bin, memory_order_relaxed) != bin) {
+    atomic_store_explicit(&udp_socket->bin_pkts, 0, memory_order_relaxed);
+    atomic_store_explicit(&udp_socket->bin_bytes, 0, memory_order_relaxed);
+  }
+  unsigned p = atomic_fetch_add_explicit(&udp_socket->bin_pkts, 1, memory_order_relaxed) + 1;
+  unsigned b = atomic_fetch_add_explicit(&udp_socket->bin_bytes, (unsigned)ret, memory_order_relaxed) + (unsigned)ret;
+  if (p > atomic_load_explicit(&udp_socket->peak_pkts, memory_order_relaxed))
+    atomic_store_explicit(&udp_socket->peak_pkts, p, memory_order_relaxed);
+  if (b > atomic_load_explicit(&udp_socket->peak_bytes, memory_order_relaxed))
+    atomic_store_explicit(&udp_socket->peak_bytes, b, memory_order_relaxed);
   return ret;
+}
+
+void udp_socket_take_peak(UdpSocket* udp_socket, uint32_t* pkts, uint32_t* bytes) {
+  *pkts = atomic_exchange_explicit(&udp_socket->peak_pkts, 0, memory_order_relaxed);
+  *bytes = atomic_exchange_explicit(&udp_socket->peak_bytes, 0, memory_order_relaxed);
 }
 
 int udp_socket_recvfrom(UdpSocket* udp_socket, Address* addr, uint8_t* buf, int len) {

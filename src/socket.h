@@ -3,10 +3,23 @@
 
 #include "address.h"
 
+#include <stdatomic.h>
+#include <stdint.h>
+
+/* The densest UDP_PEAK_BIN_NS of sends since the last take: what actually reached the
+ * socket, after every pacer and queue above it. Several threads send on one socket, so
+ * the counters are atomic and a bin boundary may split a burst; it is a readout. */
+#define UDP_PEAK_BIN_NS 10000000ull
+
 typedef struct UdpSocket {
   int fd;
   Address bind_addr;
+  atomic_ullong peak_bin;
+  atomic_uint bin_pkts, bin_bytes, peak_pkts, peak_bytes;
 } UdpSocket;
+
+/* The densest bin since the last call, then reset. */
+void udp_socket_take_peak(UdpSocket* udp_socket, uint32_t* pkts, uint32_t* bytes);
 
 typedef struct TcpSocket {
   int fd;

@@ -144,6 +144,13 @@ typedef struct PeerConnection PeerConnection;
  * controller thread, read by the send path — a benign aligned-word race. */
 void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps);
 
+/* The caller's send queue behind the access unit being sent: its bytes and how long its
+ * oldest entry has waited. Called by the pacer on the send path, once per video packet. */
+typedef void (*peer_backlog_fn)(void* ctx, uint64_t* bytes, uint64_t* oldest_wait_ns);
+
+/* The pacer counts this backlog in its queue-time rule (pacer.h). NULL clears it. */
+void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx);
+
 const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
