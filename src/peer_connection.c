@@ -1127,12 +1127,14 @@ void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len)
     ltype = (int)sp->local->type;
   }
   if (sp && sp->remote) rtype = (int)sp->remote->type;
+  uint32_t peak_pkts = 0, peak_bytes = 0;
+  udp_socket_take_peak(&pc->agent.udp_sockets[0], &peak_pkts, &peak_bytes);
   snprintf(buf, len,
-      "state=%d sctp=%d stunAgeMs=%llu consentSent=%u inData=%u inStun=%u ncFloods=%u pair=%s ltype=%d rtype=%d iface=%s",
+      "state=%d sctp=%d stunAgeMs=%llu consentSent=%u inData=%u inStun=%u ncFloods=%u pair=%s ltype=%d rtype=%d iface=%s sockPeak10ms=%upkt/%uB",
       (int)pc->state, sctp_is_connected(&pc->sctp),
       (unsigned long long)peer_connection_get_last_stun_rx_age_ms(pc),
       pc->agent.consent_sent_total, pc->in_data_pkts, pc->in_stun_pkts, pc->sctp_nc_logs,
-      local, ltype, rtype, pc->config.bind_iface[0] ? pc->config.bind_iface : "-");
+      local, ltype, rtype, pc->config.bind_iface[0] ? pc->config.bind_iface : "-", peak_pkts, peak_bytes);
 }
 
 void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out) {
