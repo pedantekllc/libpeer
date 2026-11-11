@@ -106,6 +106,54 @@ size_t rtp_insert_extensions(uint8_t* data, size_t size, int has_capture_time, u
   return size + 16;
 }
 
+void rtp_playout_delay_encode(uint32_t min_ms, uint32_t max_ms, uint8_t out[3]) {
+  uint32_t lo = (min_ms > RTP_PLAYOUT_DELAY_MAX_MS ? RTP_PLAYOUT_DELAY_MAX_MS : min_ms);
+  uint32_t hi = (max_ms > RTP_PLAYOUT_DELAY_MAX_MS ? RTP_PLAYOUT_DELAY_MAX_MS : max_ms);
+  lo = (lo + 5) / 10;
+  hi = (hi + 5) / 10;
+  if (hi < lo)
+    hi = lo;
+  out[0] = (uint8_t)(lo >> 4);
+  out[1] = (uint8_t)(((lo & 0x0F) << 4) | (hi >> 8));
+  out[2] = (uint8_t)(hi & 0xFF);
+}
+
+size_t rtp_insert_extensions_pd(uint8_t* data, size_t size, int has_capture_time, uint64_t capture_ntp, uint8_t pd_id,
+                                const uint8_t pd[3]) {
+  if (pd_id == 0 || pd_id > 14 || !pd)
+    return rtp_insert_extensions(data, size, has_capture_time, capture_ntp);
+  if (size < 12)
+    return size;
+
+  /* Same clean-header rule as rtp_insert_extensions: clear X, rebuild the block.
+   * Elements, in order: abs-capture-time (id 4, 8 B) when asked, playout-delay
+   * (pd_id, 3 B). The data region is padded to a word boundary. */
+  const size_t hdr = 12;
+  uint8_t el[16];
+  size_t k = 0;
+  data[0] &= (uint8_t)~0x10;
+  if (has_capture_time) {
+    el[k++] = (uint8_t)((RTP_EXT_ID_ABS_CAPTURE_TIME << 4) | 0x07);
+    for (int i = 7; i >= 0; i--)
+      el[k++] = (uint8_t)((capture_ntp >> (8 * i)) & 0xFF);
+  }
+  el[k++] = (uint8_t)((pd_id << 4) | 0x02);
+  el[k++] = pd[0];
+  el[k++] = pd[1];
+  el[k++] = pd[2];
+  size_t words = (k + 3) / 4;
+  size_t add = 4 + 4 * words;
+  memmove(data + hdr + add, data + hdr, size - hdr);
+  data[hdr + 0] = 0xBE;
+  data[hdr + 1] = 0xDE;
+  data[hdr + 2] = (uint8_t)(words >> 8);
+  data[hdr + 3] = (uint8_t)(words & 0xFF);
+  memcpy(data + hdr + 4, el, k);
+  memset(data + hdr + 4 + k, 0, 4 * words - k);
+  data[0] |= 0x10;
+  return size + add;
+}
+
 int rtp_packet_validate(uint8_t* packet, size_t size) {
   if (size < 12)
     return 0;

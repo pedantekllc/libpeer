@@ -143,6 +143,19 @@ struct RtpEncoder {
  * literals in sdp.c. */
 #define RTP_EXT_ID_ABS_CAPTURE_TIME 4
 
+/* RFC 8285 id and URI of the playout-delay extension (video only). The offer
+ * carries the id; the answer's id is the one written (peer_connection reads it
+ * back). Keep in sync with the extmap literals in sdp.c. */
+#define RTP_EXT_ID_PLAYOUT_DELAY 6
+#define RTP_PLAYOUT_DELAY_URI "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
+/* Largest value either field carries: 12 bits of 10 ms units. */
+#define RTP_PLAYOUT_DELAY_MAX_MS (4095u * 10u)
+
+/* The 3 data bytes of the playout-delay extension: 12-bit minimum then 12-bit
+ * maximum, big-endian, in 10 ms units (rounded to nearest, clamped to
+ * RTP_PLAYOUT_DELAY_MAX_MS; the maximum is raised to the minimum when below it). */
+void rtp_playout_delay_encode(uint32_t min_ms, uint32_t max_ms, uint8_t out[3]);
+
 /* Convert a CLOCK_REALTIME (or realtime-derived) nanosecond timestamp to a
  * 64-bit NTP timestamp (RFC 3550):
  *   high 32 bits = seconds since NTP epoch (1900-01-01), i.e. unix_sec + 2208988800
@@ -157,6 +170,13 @@ uint64_t unix_ns_to_ntp(uint64_t unix_ns);
  * FU-A buffer-reuse rationale. Caller must guarantee >= 16 bytes headroom past
  * `size`. Returns the new packet length. */
 size_t rtp_insert_extensions(uint8_t* data, size_t size, int has_capture_time, uint64_t capture_ntp);
+
+/* rtp_insert_extensions plus the playout-delay element: when `pd_id` is non-zero
+ * the 3 bytes of `pd` (rtp_playout_delay_encode) go into the same one-byte block
+ * under that id. Up to 20 bytes are inserted, so the caller guarantees >= 20 bytes
+ * headroom. With `pd_id` 0 this is rtp_insert_extensions. */
+size_t rtp_insert_extensions_pd(uint8_t* data, size_t size, int has_capture_time, uint64_t capture_ntp, uint8_t pd_id,
+                                const uint8_t pd[3]);
 
 int rtp_packet_validate(uint8_t* packet, size_t size);
 

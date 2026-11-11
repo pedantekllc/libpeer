@@ -144,6 +144,19 @@ typedef struct PeerConnection PeerConnection;
  * controller thread, read by the send path — a benign aligned-word race. */
 void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps);
 
+/* The pacer rate now in force (0 = pacing disabled). */
+uint32_t peer_connection_pacer_bps(PeerConnection* pc);
+
+/* 1 when the answer kept the playout-delay extension, else 0. Decided when the answer
+ * is set; stays 0 before that. */
+int peer_connection_playout_delay_negotiated(PeerConnection* pc);
+
+/* Set the playout-delay the next frames carry: `min_ms`/`max_ms` (rtp.h encoding) and
+ * whether packets of the NEXT peer_connection_send_video frame carry the extension.
+ * Call on the lane's send worker immediately before peer_connection_send_video; the
+ * extension is written only when negotiated. */
+void peer_connection_set_playout_delay(PeerConnection* pc, uint32_t min_ms, uint32_t max_ms, int include);
+
 /* The caller's send queue behind the access unit being sent: its bytes and how long its
  * oldest entry has waited. Called by the pacer on the send path, once per video packet. */
 typedef void (*peer_backlog_fn)(void* ctx, uint64_t* bytes, uint64_t* oldest_wait_ns);

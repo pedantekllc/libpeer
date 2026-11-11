@@ -69,6 +69,7 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
   sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_PLAYOUT_DELAY, RTP_PLAYOUT_DELAY_URI);
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
@@ -88,6 +89,7 @@ void sdp_append_h264_rtx(char* sdp) {
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
   sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_PLAYOUT_DELAY, RTP_PLAYOUT_DELAY_URI);
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=rtpmap:97 rtx/90000");
@@ -111,6 +113,7 @@ void sdp_append_h264_fec(char* sdp) {
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
   sdp_append_transport_cc(sdp, 96);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_PLAYOUT_DELAY, RTP_PLAYOUT_DELAY_URI);
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=rtpmap:118 red/90000");
@@ -135,6 +138,7 @@ static void sdp_append_h265_section(char* sdp, int rtx, int fec) {
   sdp_append(sdp, "a=rtcp-fb:%d nack pli", PT_H265);
   sdp_append_transport_cc(sdp, PT_H265);
   sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_PLAYOUT_DELAY, RTP_PLAYOUT_DELAY_URI);
   sdp_append(sdp, "a=fmtp:%d level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST", PT_H265);
   sdp_append(sdp, "a=rtpmap:%d H265/90000", PT_H265);
   if (rtx) {
