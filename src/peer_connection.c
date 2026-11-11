@@ -154,6 +154,7 @@ struct PeerConnection {
    * is also written by the controller thread via the setter (benign aligned-
    * word race). */
   uint32_t pacer_bps;             /* 0 = pacing disabled                      */
+  uint32_t pacer_ceil_bps;        /* the queue-drain raise stops here; 0 = none */
   pacer_shared pacer;             /* token bucket (pacer.h), shared with the RTX thread */
   peer_backlog_fn backlog_fn;     /* the caller's send queue behind the AU    */
   void* backlog_ctx;
@@ -318,7 +319,7 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
       if (ring_wait_ns > queued_for) queued_for = ring_wait_ns;
     }
   }
-  uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns);
+  uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, pc->pacer_ceil_bps, queued, queued_for, bytes, now_ns);
   if (video) pc->pace_queue_bytes = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes - bytes : 0;
   if (wait_ns == 0) return;
   struct timespec ts;
@@ -333,8 +334,10 @@ void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, vo
   pc->backlog_ctx = ctx;
 }
 
-void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
-  if (pc) pc->pacer_bps = bps;
+void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps, uint32_t ceil_bps) {
+  if (!pc) return;
+  pc->pacer_bps = bps;
+  pc->pacer_ceil_bps = ceil_bps;
 }
 
 uint32_t peer_connection_pacer_bps(PeerConnection* pc) {

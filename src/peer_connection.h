@@ -140,9 +140,10 @@ typedef struct PeerConfiguration {
 
 typedef struct PeerConnection PeerConnection;
 
-/* Update the send pacer rate at runtime (0 = disable). Written by the
+/* Update the send pacer rate at runtime (0 = disable) and the ceiling of its queue-drain
+ * raise (0 = none; pacer.h). Written by the
  * controller thread, read by the send path — a benign aligned-word race. */
-void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps);
+void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps, uint32_t ceil_bps);
 
 /* The pacer rate now in force (0 = pacing disabled). */
 uint32_t peer_connection_pacer_bps(PeerConnection* pc);

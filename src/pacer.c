@@ -2,7 +2,8 @@
 
 #define PACER_MIN_LEFT_NS 1000000ull
 
-uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns) {
+uint32_t pacer_effective_bps(uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes,
+                             uint64_t queued_for_ns) {
   if (bps == 0) return 0;
   uint64_t left = PACER_QUEUE_LIMIT_NS > queued_for_ns ? PACER_QUEUE_LIMIT_NS - queued_for_ns : 0;
   if (left < PACER_MIN_LEFT_NS) left = PACER_MIN_LEFT_NS;
@@ -10,12 +11,13 @@ uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queue
    * with a millisecond left cannot overflow. */
   double needed = (double)queued_bytes * 8.0 * 1e9 / (double)left;
   if (needed <= (double)bps) return bps;
+  if (ceil_bps != 0 && needed > (double)ceil_bps) return ceil_bps > bps ? ceil_bps : bps;
   return needed >= 4294967295.0 ? UINT32_MAX : (uint32_t)needed;
 }
 
-uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
+uint64_t pacer_take(pacer_state* p, uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
   if (bps == 0) return 0;
-  uint32_t rate = pacer_effective_bps(bps, queued_bytes, queued_for_ns);
+  uint32_t rate = pacer_effective_bps(bps, ceil_bps, queued_bytes, queued_for_ns);
 
   if (!p->started) {
     p->started = 1;
@@ -45,9 +47,9 @@ void pacer_shared_destroy(pacer_shared* p) {
   pthread_mutex_destroy(&p->mtx);
 }
 
-uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
+uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
   pthread_mutex_lock(&p->mtx);
-  uint64_t wait_ns = pacer_take(&p->st, bps, queued_bytes, queued_for_ns, bytes, now_ns);
+  uint64_t wait_ns = pacer_take(&p->st, bps, ceil_bps, queued_bytes, queued_for_ns, bytes, now_ns);
   pthread_mutex_unlock(&p->mtx);
   return wait_ns;
 }

@@ -54,16 +54,19 @@ void pacer_shared_destroy(pacer_shared* p);
 
 /* The rate to pace at: `bps`, or more when `queued_bytes` would not drain
  * within the time left of PACER_QUEUE_LIMIT_NS after `queued_for_ns` already
- * spent (at least 1 ms is always left). Never below `bps`. */
-uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns);
+ * spent (at least 1 ms is always left). Never below `bps`, and the raise never goes
+ * above `ceil_bps` (0 = no ceiling): the caller that capped the rate (an uplink group's
+ * share) is not overrun by a backlog it could not drain; what the capped rate cannot drain
+ * in time is the lane ring's to drop. */
+uint32_t pacer_effective_bps(uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes, uint64_t queued_for_ns);
 
 /* Spend `bytes` of a packet sent at `now_ns` with `queued_bytes` (this packet
  * included) still queued, the queue having waited `queued_for_ns`. Returns the
  * nanoseconds to sleep before sending (0 = send now). `bps` 0 disables pacing. */
-uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
+uint64_t pacer_take(pacer_state* p, uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
 
 /* pacer_take on the shared bucket. Media and retransmissions both come through
  * here, so a retransmission is charged against the same budget as the media. */
-uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
+uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint32_t ceil_bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
 
 #endif  // PACER_H_
