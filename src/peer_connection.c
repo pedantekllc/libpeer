@@ -217,6 +217,13 @@ struct PeerConnection {
   _Atomic uint8_t twcc_negotiated;
   uint8_t twcc_ext_id;
   uint8_t rtx_negotiated;          /* the answer accepted the RTX payload type */
+  /* Playout-delay extension (rtp.h): pd_ext_id is the answer's id for it, 0 when the
+   * answer dropped it (the reactor writes it once, at the answer). pd_send and pd_bytes
+   * are written by peer_connection_set_playout_delay and read at the send chokepoint,
+   * both on the lane's send worker, so they need no lock. */
+  _Atomic uint8_t pd_ext_id;
+  uint8_t pd_send;
+  uint8_t pd_bytes[3];
   twcc_sender twcc_tx;             /* ring allocated at negotiation */
   twcc_ref_clock twcc_clock;
 
@@ -328,6 +335,20 @@ void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, vo
 
 void peer_connection_set_pacer_bps(PeerConnection* pc, uint32_t bps) {
   if (pc) pc->pacer_bps = bps;
+}
+
+uint32_t peer_connection_pacer_bps(PeerConnection* pc) {
+  return pc ? pc->pacer_bps : 0;
+}
+
+int peer_connection_playout_delay_negotiated(PeerConnection* pc) {
+  return pc && atomic_load_explicit(&pc->pd_ext_id, memory_order_acquire) != 0;
+}
+
+void peer_connection_set_playout_delay(PeerConnection* pc, uint32_t min_ms, uint32_t max_ms, int include) {
+  if (!pc) return;
+  rtp_playout_delay_encode(min_ms, max_ms, pc->pd_bytes);
+  pc->pd_send = include ? 1 : 0;
 }
 
 /* Room an RTP packet buffer keeps free for the SRTP trailer; extension growth
@@ -633,7 +654,10 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
     int is_first_packet = (rtp_ts != pc->last_rtp_ts);
     pc->last_rtp_ts = rtp_ts;
 
-    size = rtp_insert_extensions(data, size, is_first_packet, pc->cur_frame_capture_ntp);
+    /* Playout-delay rides every packet of a frame the caller marked, only when the
+     * answer kept the extension. */
+    uint8_t pd_id = pc->pd_send ? atomic_load_explicit(&pc->pd_ext_id, memory_order_acquire) : 0;
+    size = rtp_insert_extensions_pd(data, size, is_first_packet, pc->cur_frame_capture_ntp, pd_id, pc->pd_bytes);
 
     /* Track cumulative counters for RTCP SR.  Payload length = total packet
      * size minus the 12-byte RTP fixed header (the extension is already part
@@ -1871,8 +1895,8 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
   int is_update = 0;
   Agent* agent = &pc->agent;
-  uint8_t twcc_id = 0;
-  int twcc_ext_found = 0, twcc_fb_found = 0, rtx_found = 0;
+  uint8_t twcc_id = 0, pd_id = 0;
+  int twcc_ext_found = 0, twcc_fb_found = 0, rtx_found = 0, pd_found = 0;
 
   while ((line = strstr(start, "\r\n"))) {
     line = strstr(start, "\r\n");
@@ -1885,6 +1909,7 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
     if (type == SDP_TYPE_ANSWER) {
       if (!twcc_ext_found && sdp_find_extmap_id(buf, TWCC_EXTMAP_URI, &twcc_id)) twcc_ext_found = 1;
+      if (!pd_found && sdp_find_extmap_id(buf, RTP_PLAYOUT_DELAY_URI, &pd_id)) pd_found = 1;
       if (strstr(buf, "a=rtcp-fb:") && strstr(buf, " transport-cc")) twcc_fb_found = 1;
       if (strstr(buf, "a=rtpmap:") && strstr(buf, "rtx/90000")) rtx_found = 1;
     }
@@ -1919,6 +1944,7 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
   if (type == SDP_TYPE_ANSWER) {
     pc->rtx_negotiated = rtx_found ? 1 : 0;
+    atomic_store_explicit(&pc->pd_ext_id, pd_found && pd_id >= 1 && pd_id <= 14 ? pd_id : 0, memory_order_release);
     /* The estimator exists only when the answer keeps both the sequence-number
      * extension and the feedback request. */
     if (twcc_ext_found && twcc_fb_found) {
