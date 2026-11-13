@@ -751,16 +751,45 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
   return 0;
 }
 
+/* The payload of a received packet: past the CSRC list and the header-extension block
+ * (a browser sets X once transport-cc is negotiated) and short of RTP padding. False for a
+ * packet whose header claims more than it carries. */
+static int rtp_payload_span(const uint8_t* buf, size_t size, size_t* off, size_t* len) {
+  if (size < sizeof(RtpHeader)) return 0;
+  const RtpHeader* h = (const RtpHeader*)buf;
+  size_t o = sizeof(RtpHeader) + 4u * h->csrccount;
+  if (h->extension) {
+    if (size < o + 4) return 0;
+    o += 4 + 4u * (((size_t)buf[o + 2] << 8) | buf[o + 3]);
+  }
+  size_t end = size;
+  if (h->padding) {
+    size_t pad = buf[size - 1];
+    if (pad == 0 || pad > end) return 0;
+    end -= pad;
+  }
+  if (o > end) return 0;
+  *off = o;
+  *len = end - o;
+  return 1;
+}
+
 static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
-  RtpPacket* rtp_packet = (RtpPacket*)buf;
-  if (rtp_decoder->on_packet != NULL)
-    rtp_decoder->on_packet(rtp_packet->payload, size - sizeof(RtpHeader), rtp_decoder->user_data);
+  size_t off, len;
+  if (!rtp_payload_span(buf, size, &off, &len)) return (int)size;
+  if (len > 0 && rtp_decoder->on_audio_packet != NULL) {
+    const RtpHeader* h = (const RtpHeader*)buf;
+    rtp_decoder->on_audio_packet(buf + off, len, ntohl(h->timestamp), ntohs(h->seq_number),
+                                 rtp_decoder->user_data);
+  } else if (rtp_decoder->on_packet != NULL && len > 0)
+    rtp_decoder->on_packet(buf + off, len, rtp_decoder->user_data);
   // even if there is no callback set, assume everything is ok for caller and do not return an error
   return (int)size;
 }
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data) {
   rtp_decoder->on_packet = on_packet;
+  rtp_decoder->on_audio_packet = NULL;
   rtp_decoder->user_data = user_data;
   rtp_decoder->nalu_buf = NULL;
   rtp_decoder->nalu_offset = 0;

@@ -1373,8 +1373,8 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
     rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
                      peer_connection_outgoing_rtp_packet, (void*)pc);
 
-    rtp_decoder_init(&pc->artp_decoder, pc->config.audio_codec,
-                     pc->config.onaudiotrack, pc->config.user_data);
+    rtp_decoder_init(&pc->artp_decoder, pc->config.audio_codec, NULL, pc->config.user_data);
+    pc->artp_decoder.on_audio_packet = pc->config.onaudiotrack;
   }
 
   if (pc->config.video_codec) {
