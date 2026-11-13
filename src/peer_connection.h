@@ -414,6 +414,26 @@ int peer_connection_selected_pair(PeerConnection* pc, peer_pair_info* out);
  * included). Call from one thread (the reactor), once per tick. */
 uint32_t peer_connection_pair_generation(PeerConnection* pc);
 
+/** What server-reflexive/relay gathering reports after the offer is created. */
+typedef enum {
+  PEER_GATHER_STARTED = 0, /* servers are being asked; fired inside create_offer/create_answer   */
+  PEER_GATHER_CANDIDATE,   /* one local candidate; `candidate` is "candidate:..." (no "a=")      */
+  PEER_GATHER_DONE         /* every server answered, gave up or was abandoned; no more follow    */
+} PeerGatherEvent;
+
+/**
+ * @brief Set the callback for gathering that continues after the offer.
+ *
+ * The offer carries the host candidates and is returned without waiting on a
+ * STUN/TURN server. PEER_GATHER_STARTED fires inside create_offer only when
+ * there is something to gather; the candidates and DONE then fire from
+ * peer_connection_loop. `candidate` is NULL except for PEER_GATHER_CANDIDATE.
+ * The ICE servers are named by the host ice_dns table (ice_dns.h), which the
+ * embedder keeps resolved.
+ */
+void peer_connection_ongathering(PeerConnection* pc,
+                                 void (*ongathering)(PeerGatherEvent event, const char* candidate, void* userdata));
+
 /**
  * @brief Set the callback function to handle onicecandidate event.
  * @param A PeerConnection.

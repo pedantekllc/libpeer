@@ -57,6 +57,40 @@ typedef struct AgentPendingMdns {
 
 typedef struct Agent Agent;
 
+/* One STUN/TURN server being gathered against. A task is a small state machine
+ * advanced by agent_gather_poll and agent_gather_on_stun; nothing in it waits. */
+typedef enum AgentGatherPhase {
+  AGENT_GATHER_DONE = 0,
+  AGENT_GATHER_WAIT_DNS,     /* the server name has no remembered address yet     */
+  AGENT_GATHER_WAIT_BINDING, /* STUN: Binding request out                          */
+  AGENT_GATHER_WAIT_CHALLENGE, /* TURN: unauthenticated Allocate out               */
+  AGENT_GATHER_WAIT_ALLOCATE   /* TURN: authenticated Allocate out                 */
+} AgentGatherPhase;
+
+#define AGENT_MAX_GATHER_TASKS 5
+
+#define AGENT_STASH_MAX 16
+typedef struct AgentStashed {
+  Address from;
+  int len;
+  uint8_t buf[1500];
+} AgentStashed;
+
+typedef struct AgentGatherTask {
+  AgentGatherPhase phase;
+  int is_turn;
+  char host[64];
+  int port;
+  /* Copies: the caller's ICE server strings may be replaced (TURN credential
+   * refresh) while gathering is still running. */
+  char username[128];
+  char credential[128];
+  Address server;       /* valid once the phase has left WAIT_DNS */
+  uint32_t deadline_ms; /* the phase gives up at this time        */
+  uint32_t next_send_ms;
+  StunMessage req;      /* the request being (re)sent             */
+} AgentGatherTask;
+
 #define AGENT_CONSENT_OUTSTANDING 4
 
 struct Agent {
@@ -170,6 +204,12 @@ struct Agent {
    * candidates, and after its answer). Set by agent_set_remote_description /
    * agent_set_remote_end_of_candidates; reset per attempt. */
   int      remote_end_of_candidates;
+
+  /* Server-reflexive and relay gathering runs after the offer is out. */
+  AgentGatherTask gather_tasks[AGENT_MAX_GATHER_TASKS];
+  int gather_tasks_num;
+  AgentStashed stash[AGENT_STASH_MAX]; /* datagrams read by agent_gather_recv for agent_recv */
+  int stash_count;
 };
 
 /* 1 when no further remote candidate can arrive: the remote has signalled
@@ -184,7 +224,40 @@ int agent_mdns_pending(const Agent* agent);
 /* Record the remote's end-of-candidates signal (trickle form). */
 void agent_set_remote_end_of_candidates(Agent* agent);
 
-void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
+/* The host candidates (and nothing that touches the network). */
+void agent_gather_host_candidates(Agent* agent);
+
+/* Queue gathering against one ICE server URL. Returns 1 when a task was queued,
+ * 0 when the URL is not usable (malformed, or stuns:/turns:, whose TLS
+ * transports libpeer does not implement). Never resolves a name and never
+ * waits: agent_gather_poll runs the exchange. */
+int agent_gather_begin(Agent* agent, const char* urls, const char* username, const char* credential);
+
+/* Advance every gathering task: send and resend requests, give up on the ones
+ * past their deadline. Non-blocking. */
+void agent_gather_poll(Agent* agent, uint32_t now_ms);
+
+/* 1 while any task is still waiting for its server. */
+int agent_gathering(const Agent* agent);
+
+/* Abandon the tasks still running (the connection no longer needs more paths). */
+void agent_gather_cancel(Agent* agent);
+
+/* Read the socket for gathering replies only. A datagram that is not a reply
+ * from a server being gathered (a browser's early connectivity check, say) is
+ * kept and handed to agent_recv, in arrival order, the next time it is called:
+ * the loop reads the socket for its own purposes only once there are pairs,
+ * and processing those packets any earlier changes what the agent learns
+ * before the answer. */
+void agent_gather_recv(Agent* agent);
+
+/* Offer a STUN response read from `from` to the gathering tasks. 1 when a task
+ * took it. Called by agent_recv. */
+int agent_gather_on_stun(Agent* agent, StunMessage* msg, const Address* from);
+
+/* Pair a local candidate gathered after the remote description with every
+ * remote candidate already known. */
+void agent_pair_local_candidate(Agent* agent, IceCandidate* local);
 
 void agent_create_ice_credential(Agent* agent);
 
