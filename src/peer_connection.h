@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "pacer.h"
 #include "pair_info.h"
 #include "twcc.h"
 #include "twcc_send.h"
@@ -297,9 +298,15 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t
  *     3. gettimeofday-derived ns (less robust to NTP jumps).
  *
  *   The absolute value doesn't matter to receivers; consistency across
- *   frames on the same SSRC does.
+ *   frames on the same SSRC does: a frame captured earlier than the last one sent
+ *   on this pc is rebased (rtp_video_clock_map), so the RTP timestamp,
+ *   abs-capture-time and RTCP SR never step back.
+ *
+ *   `queue_limit_ns` is the pacer queue limit (pacer.h) this access unit is paced
+ *   against: PACER_QUEUE_LIMIT_NS, or a shorter limit for an access unit that must
+ *   leave on its own (pacer_video_queue). It applies to this frame's media packets only.
  */
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns);
+int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns, uint64_t queue_limit_ns);
 
 /* Latest capture reference: the most recent frame's on-wire RTP timestamp and
  * its capture NTP (the same (RTP, NTP) pair the RTCP SR uses). Lets the app

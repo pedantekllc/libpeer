@@ -203,6 +203,20 @@ int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* data, size_t size
 /* RTP timestamp for a capture time in ns at clock_rate_hz, mod 2^32. */
 uint32_t rtp_timestamp_from_ns(uint64_t capture_time_ns, uint32_t clock_rate_hz);
 
+/* The capture clock one video stream (one SSRC) is sent on. */
+typedef struct {
+  int started;
+  uint64_t last_ns;  /* the last frame's capture time on the wire clock */
+  int64_t offset_ns; /* added to the caller's capture times (rebases a step back) */
+} RtpVideoClock;
+
+/* The capture time to send a frame with: `capture_time_ns` plus the clock's offset,
+ * which grows whenever a frame's capture time is earlier than the previous frame's.
+ * The frame is then sent one RTP tick after the previous one and the frames after it
+ * keep their spacing, so the RTP timestamp, abs-capture-time and RTCP SR of a stream
+ * never step back. */
+uint64_t rtp_video_clock_map(RtpVideoClock* clock, uint64_t capture_time_ns);
+
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 void rtp_decoder_deinit(RtpDecoder* rtp_decoder);
 

@@ -611,6 +611,22 @@ uint32_t rtp_timestamp_from_ns(uint64_t capture_time_ns, uint32_t clock_rate_hz)
   return (uint32_t)(sec * clock_rate_hz + (rem * clock_rate_hz) / 1000000000ULL);
 }
 
+/* One RTP tick of the 90 kHz video clock, rounded up so a rebased frame's timestamp
+ * is strictly above the last one's. */
+#define RTP_VIDEO_TICK_NS 11112ULL
+
+uint64_t rtp_video_clock_map(RtpVideoClock* clock, uint64_t capture_time_ns) {
+  uint64_t mapped = (uint64_t)((int64_t)capture_time_ns + clock->offset_ns);
+  if (clock->started && mapped < clock->last_ns) {
+    const uint64_t target = clock->last_ns + RTP_VIDEO_TICK_NS;
+    clock->offset_ns += (int64_t)(target - mapped);
+    mapped = target;
+  }
+  clock->started = 1;
+  clock->last_ns = mapped;
+  return mapped;
+}
+
 int rtp_encoder_encode(RtpEncoder* rtp_encoder, const uint8_t* buf, size_t size, uint64_t capture_time_ns) {
   /* Video path: stamp RTP timestamp from the caller's capture time so
    * the receiver plays frames at the wall-clock pace they were produced,

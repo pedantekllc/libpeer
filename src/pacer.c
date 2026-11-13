@@ -2,9 +2,9 @@
 
 #define PACER_MIN_LEFT_NS 1000000ull
 
-uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns) {
+uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, uint64_t queue_limit_ns) {
   if (bps == 0) return 0;
-  uint64_t left = PACER_QUEUE_LIMIT_NS > queued_for_ns ? PACER_QUEUE_LIMIT_NS - queued_for_ns : 0;
+  uint64_t left = queue_limit_ns > queued_for_ns ? queue_limit_ns - queued_for_ns : 0;
   if (left < PACER_MIN_LEFT_NS) left = PACER_MIN_LEFT_NS;
   /* bits per second = bytes * 8 / seconds; kept in double so a large queue
    * with a millisecond left cannot overflow. */
@@ -13,9 +13,18 @@ uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queue
   return needed >= 4294967295.0 ? UINT32_MAX : (uint32_t)needed;
 }
 
-uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
+pacer_queue pacer_video_queue(uint64_t queue_limit_ns, uint64_t au_bytes, uint64_t au_age_ns, uint64_t ring_bytes, uint64_t ring_wait_ns) {
+  if (queue_limit_ns < PACER_QUEUE_LIMIT_NS) {
+    pacer_queue own = {au_bytes, au_age_ns};
+    return own;
+  }
+  pacer_queue whole = {au_bytes + ring_bytes, au_age_ns > ring_wait_ns ? au_age_ns : ring_wait_ns};
+  return whole;
+}
+
+uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns) {
   if (bps == 0) return 0;
-  uint32_t rate = pacer_effective_bps(bps, queued_bytes, queued_for_ns);
+  uint32_t rate = pacer_effective_bps(bps, queued_bytes, queued_for_ns, queue_limit_ns);
 
   if (!p->started) {
     p->started = 1;
@@ -45,9 +54,9 @@ void pacer_shared_destroy(pacer_shared* p) {
   pthread_mutex_destroy(&p->mtx);
 }
 
-uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns) {
+uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns) {
   pthread_mutex_lock(&p->mtx);
-  uint64_t wait_ns = pacer_take(&p->st, bps, queued_bytes, queued_for_ns, bytes, now_ns);
+  uint64_t wait_ns = pacer_take(&p->st, bps, queued_bytes, queued_for_ns, bytes, now_ns, queue_limit_ns);
   pthread_mutex_unlock(&p->mtx);
   return wait_ns;
 }
