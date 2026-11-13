@@ -53,17 +53,36 @@ void pacer_shared_init(pacer_shared* p);
 void pacer_shared_destroy(pacer_shared* p);
 
 /* The rate to pace at: `bps`, or more when `queued_bytes` would not drain
- * within the time left of PACER_QUEUE_LIMIT_NS after `queued_for_ns` already
- * spent (at least 1 ms is always left). Never below `bps`. */
-uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns);
+ * within the time left of `queue_limit_ns` after `queued_for_ns` already
+ * spent (at least 1 ms is always left). Never below `bps`. The limit is
+ * PACER_QUEUE_LIMIT_NS unless the caller paces an access unit that must leave
+ * sooner. */
+uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, uint64_t queue_limit_ns);
+
+/* What a video packet's pace draws on. */
+typedef struct {
+  uint64_t bytes;     /* the queue, in bytes */
+  uint64_t waited_ns; /* how long it has waited */
+} pacer_queue;
+
+/* The queue a video packet is paced against. With the default limit it is the whole
+ * queue: the rest of the access unit in hand (`au_bytes`, waiting `au_age_ns` since the
+ * access unit entered the pacer) plus the caller's ring behind it (`ring_bytes`, its
+ * oldest frame having waited `ring_wait_ns`), the longer wait of the two. A limit
+ * shorter than the default belongs to an access unit that must leave on its own, so it
+ * is measured from that access unit's own start and covers its bytes only: the ring
+ * behind it, however long it waited for the connection, neither shortens that time nor
+ * adds to what must drain in it. */
+pacer_queue pacer_video_queue(uint64_t queue_limit_ns, uint64_t au_bytes, uint64_t au_age_ns, uint64_t ring_bytes, uint64_t ring_wait_ns);
 
 /* Spend `bytes` of a packet sent at `now_ns` with `queued_bytes` (this packet
- * included) still queued, the queue having waited `queued_for_ns`. Returns the
- * nanoseconds to sleep before sending (0 = send now). `bps` 0 disables pacing. */
-uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
+ * included) still queued, the queue having waited `queued_for_ns` against
+ * `queue_limit_ns`. Returns the nanoseconds to sleep before sending (0 = send
+ * now). `bps` 0 disables pacing. */
+uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns);
 
 /* pacer_take on the shared bucket. Media and retransmissions both come through
  * here, so a retransmission is charged against the same budget as the media. */
-uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns);
+uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns);
 
 #endif  // PACER_H_

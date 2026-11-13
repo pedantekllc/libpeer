@@ -88,6 +88,7 @@ struct PeerConnection {
 
   RtpEncoder artp_encoder;
   RtpEncoder vrtp_encoder;
+  RtpVideoClock video_clock; /* send_video's capture clock: never steps back (rtp.h) */
   RtpDecoder vrtp_decoder;
   RtpDecoder artp_decoder;
 
@@ -158,6 +159,7 @@ struct PeerConnection {
   void* backlog_ctx;
   uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
   uint64_t pace_queue_start_ns;   /* when that access unit entered the pacer  */
+  uint64_t pace_queue_limit_ns;   /* queue limit of the access unit in hand (send_video's argument) */
 
   /* ── ULPFEC/RED send state (see PeerConfiguration.fec) ────────────────────
    * All touched only on the send path (per-lane send worker). The chokepoint
@@ -297,27 +299,28 @@ static uint64_t sb_mono_us(void) {
   return sb_mono_ns() / 1000u;
 }
 
-/* `video` packets draw on the queue behind them: the rest of the access unit plus the
- * bytes waiting in the caller's ring; the pace rate rises when that would not drain
- * within PACER_QUEUE_LIMIT_NS. Other packets (audio, retransmissions) see no
- * backlog but draw on the same bucket. */
+/* `video` packets draw on the queue behind them (pacer_video_queue): the rest of the
+ * access unit and the bytes waiting in the caller's ring, against the queue limit
+ * send_video was given for that access unit; the pace rate rises when that would not
+ * drain within it. Other packets (audio, retransmissions) see no backlog but draw on the
+ * same bucket. */
 static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
 
   uint64_t now_ns = sb_mono_ns();
   uint64_t queued = 0, queued_for = 0;
+  uint64_t queue_limit_ns = PACER_QUEUE_LIMIT_NS;
   if (video) {
-    queued = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes : bytes;
-    queued_for = now_ns - pc->pace_queue_start_ns;
-    if (pc->backlog_fn) {
-      uint64_t ring_bytes = 0, ring_wait_ns = 0;
-      pc->backlog_fn(pc->backlog_ctx, &ring_bytes, &ring_wait_ns);
-      queued += ring_bytes;
-      if (ring_wait_ns > queued_for) queued_for = ring_wait_ns;
-    }
+    uint64_t ring_bytes = 0, ring_wait_ns = 0;
+    if (pc->backlog_fn) pc->backlog_fn(pc->backlog_ctx, &ring_bytes, &ring_wait_ns);
+    queue_limit_ns = pc->pace_queue_limit_ns;
+    pacer_queue q = pacer_video_queue(queue_limit_ns, pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes : bytes,
+                                      now_ns - pc->pace_queue_start_ns, ring_bytes, ring_wait_ns);
+    queued = q.bytes;
+    queued_for = q.waited_ns;
   }
-  uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns);
+  uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns, queue_limit_ns);
   if (video) pc->pace_queue_bytes = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes - bytes : 0;
   if (wait_ns == 0) return;
   struct timespec ts;
@@ -1436,14 +1439,21 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
   return rtp_encoder_encode(&pc->artp_encoder, buf, len, 0);
 }
 
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns) {
+int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns, uint64_t queue_limit_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
     return -1;
   }
+  /* A frame captured earlier than the last one sent on this pc (a join's keyframe
+   * after frames already sent) is rebased onto the stream's clock: the RTP timestamp,
+   * abs-capture-time and SR below all derive from the rebased time, so none of them
+   * steps back. */
+  capture_time_ns = rtp_video_clock_map(&pc->video_clock, capture_time_ns);
   /* Derive the frame's capture WALL-CLOCK (→ abs-capture-time) and refresh the
    * SR reference pair. capture_time_ns is the frame's timestamp; on a real
    * sensor it is CLOCK_MONOTONIC, so latency = (mono_now − capture) is a small
-   * positive number and capture_realtime = now − latency is exact. Some sources
+   * positive number and capture_realtime = now − latency is exact; a rebased
+   * frame sits slightly ahead of the clock, a small negative latency, which keeps
+   * the NTP on the same rebased line. Some sources
    * (notably the emulator) stamp frames with a synthetic stream-relative clock
    * that is NOT comparable to CLOCK_MONOTONIC; an implausible latency detects
    * that and we fall back to "captured ≈ now" (a valid wall-clock; g2g then
@@ -1456,7 +1466,7 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
     int64_t rt_ns   = (int64_t)rt.tv_sec   * 1000000000LL + rt.tv_nsec;
     int64_t mono_ns = (int64_t)mono.tv_sec * 1000000000LL + mono.tv_nsec;
     int64_t latency_ns = mono_ns - (int64_t)capture_time_ns;
-    int64_t capture_realtime_ns = (latency_ns >= 0 && latency_ns < 5000000000LL)
+    int64_t capture_realtime_ns = (latency_ns > -5000000000LL && latency_ns < 5000000000LL)
                                     ? rt_ns - latency_ns
                                     : rt_ns;
     pc->cur_frame_capture_ntp = unix_ns_to_ntp((uint64_t)capture_realtime_ns);
@@ -1475,6 +1485,7 @@ int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t le
    * trailer add ~3% on top, counted as the packets leave. */
   pc->pace_queue_bytes = (uint64_t)len + len / 32;
   pc->pace_queue_start_ns = sv_t0;
+  pc->pace_queue_limit_ns = queue_limit_ns;
   int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
   uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
   if (total_ms >= 30) {

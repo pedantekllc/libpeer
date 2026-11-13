@@ -65,7 +65,7 @@ static GstFlowReturn on_video_data(GstElement* sink, void* data) {
      * — exactly the capture-relative monotonic value libpeer wants. */
     GstClockTime pts = GST_BUFFER_PTS(buffer);
     uint64_t capture_ns = (pts != GST_CLOCK_TIME_NONE) ? (uint64_t)pts : 0;
-    peer_connection_send_video(g_pc, info.data, info.size, capture_ns);
+    peer_connection_send_video(g_pc, info.data, info.size, capture_ns, PACER_QUEUE_LIMIT_NS);
 
     gst_buffer_unmap(buffer, &info);
     gst_sample_unref(sample);

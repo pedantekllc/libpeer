@@ -138,7 +138,7 @@ int main(int argc, char* argv[]) {
           struct timespec ts;
           clock_gettime(CLOCK_MONOTONIC, &ts);
           uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-          peer_connection_send_video(g_pc, buf, size, now_ns);
+          peer_connection_send_video(g_pc, buf, size, now_ns, PACER_QUEUE_LIMIT_NS);
           // need to free the buffer
           free(buf);
           buf = NULL;
