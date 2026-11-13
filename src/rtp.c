@@ -777,7 +777,11 @@ static int rtp_payload_span(const uint8_t* buf, size_t size, size_t* off, size_t
 static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
   size_t off, len;
   if (!rtp_payload_span(buf, size, &off, &len)) return (int)size;
-  if (rtp_decoder->on_packet != NULL && len > 0)
+  if (len > 0 && rtp_decoder->on_audio_packet != NULL) {
+    const RtpHeader* h = (const RtpHeader*)buf;
+    rtp_decoder->on_audio_packet(buf + off, len, ntohl(h->timestamp), ntohs(h->seq_number),
+                                 rtp_decoder->user_data);
+  } else if (rtp_decoder->on_packet != NULL && len > 0)
     rtp_decoder->on_packet(buf + off, len, rtp_decoder->user_data);
   // even if there is no callback set, assume everything is ok for caller and do not return an error
   return (int)size;
@@ -785,6 +789,7 @@ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size
 
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data) {
   rtp_decoder->on_packet = on_packet;
+  rtp_decoder->on_audio_packet = NULL;
   rtp_decoder->user_data = user_data;
   rtp_decoder->nalu_buf = NULL;
   rtp_decoder->nalu_offset = 0;

@@ -99,10 +99,15 @@ typedef struct RtpMap {
 typedef struct RtpEncoder RtpEncoder;
 typedef struct RtpDecoder RtpDecoder;
 typedef void (*RtpOnPacket)(uint8_t* packet, size_t bytes, void* user_data);
+/* A received audio payload with the packet's RTP timestamp and sequence number (host
+ * order), for a consumer that re-times the stream (a jitter buffer). */
+typedef void (*RtpOnAudioPacket)(uint8_t* payload, size_t bytes, uint32_t rtp_ts, uint16_t seq,
+                                 void* user_data);
 
 struct RtpDecoder {
   RtpPayloadType type;
   RtpOnPacket on_packet;
+  RtpOnAudioPacket on_audio_packet; /* generic (audio) payloads: wins over on_packet */
   int (*decode_func)(RtpDecoder* rtp_decoder, uint8_t* data, size_t size);
   void* user_data;
   /* Per-decoder H.264 FU-A reassembly state (replaces static locals in

@@ -82,7 +82,8 @@ typedef struct PeerConfiguration {
   MediaCodec video_codec;
   DataChannelType datachannel;
 
-  void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
+  /* One received audio payload with its RTP timestamp and sequence number. */
+  void (*onaudiotrack)(uint8_t* data, size_t size, uint32_t rtp_ts, uint16_t seq, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);
   void (*on_request_keyframe)(void* userdata);
   void* user_data;
