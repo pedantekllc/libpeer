@@ -69,6 +69,13 @@ typedef enum AgentGatherPhase {
 
 #define AGENT_MAX_GATHER_TASKS 5
 
+#define AGENT_STASH_MAX 16
+typedef struct AgentStashed {
+  Address from;
+  int len;
+  uint8_t buf[1500];
+} AgentStashed;
+
 typedef struct AgentGatherTask {
   AgentGatherPhase phase;
   int is_turn;
@@ -201,6 +208,8 @@ struct Agent {
   /* Server-reflexive and relay gathering runs after the offer is out. */
   AgentGatherTask gather_tasks[AGENT_MAX_GATHER_TASKS];
   int gather_tasks_num;
+  AgentStashed stash[AGENT_STASH_MAX]; /* datagrams read by agent_gather_recv for agent_recv */
+  int stash_count;
 };
 
 /* 1 when no further remote candidate can arrive: the remote has signalled
@@ -233,6 +242,14 @@ int agent_gathering(const Agent* agent);
 
 /* Abandon the tasks still running (the connection no longer needs more paths). */
 void agent_gather_cancel(Agent* agent);
+
+/* Read the socket for gathering replies only. A datagram that is not a reply
+ * from a server being gathered (a browser's early connectivity check, say) is
+ * kept and handed to agent_recv, in arrival order, the next time it is called:
+ * the loop reads the socket for its own purposes only once there are pairs,
+ * and processing those packets any earlier changes what the agent learns
+ * before the answer. */
+void agent_gather_recv(Agent* agent);
 
 /* Offer a STUN response read from `from` to the gathering tasks. 1 when a task
  * took it. Called by agent_recv. */

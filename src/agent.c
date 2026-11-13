@@ -43,6 +43,7 @@ void agent_clear_candidates(Agent* agent) {
   agent->selected_remote_type = -1;
   agent->remote_end_of_candidates = 0;
   agent->gather_tasks_num = 0;
+  agent->stash_count = 0;
   agent->has_liveness = 0;
   agent->last_liveness_ms = 0;
   agent->has_peer_request = 0;
@@ -369,6 +370,34 @@ int agent_gathering(const Agent* agent) {
 
 void agent_gather_cancel(Agent* agent) {
   for (int i = 0; i < agent->gather_tasks_num; i++) agent->gather_tasks[i].phase = AGENT_GATHER_DONE;
+}
+
+void agent_gather_recv(Agent* agent) {
+  uint8_t buf[sizeof(agent->stash[0].buf)];
+  for (int i = 0; i < 8; i++) {
+    Address from;
+    int n = agent_socket_recv(agent, &from, buf, sizeof(buf));
+    if (n <= 0) return;
+    if (stun_probe(buf, n) == 0 && (size_t)n <= STUN_ATTR_BUF_SIZE) {
+      StunMessage msg;
+      memset(&msg, 0, sizeof(msg));
+      memcpy(msg.buf, buf, (size_t)n);
+      msg.size = n;
+      stun_parse_msg_buf(&msg);
+      if ((msg.stunclass == STUN_CLASS_RESPONSE || msg.stunclass == STUN_CLASS_ERROR) &&
+          agent_gather_on_stun(agent, &msg, &from)) {
+        continue;
+      }
+    }
+    if (agent->stash_count >= AGENT_STASH_MAX) {
+      memmove(&agent->stash[0], &agent->stash[1], sizeof(agent->stash[0]) * (AGENT_STASH_MAX - 1));
+      agent->stash_count--;
+    }
+    AgentStashed* st = &agent->stash[agent->stash_count++];
+    st->from = from;
+    st->len = n;
+    memcpy(st->buf, buf, (size_t)n);
+  }
 }
 
 int agent_gather_on_stun(Agent* agent, StunMessage* msg, const Address* from) {
@@ -870,7 +899,17 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
   int ret = -1;
   StunMessage stun_msg;
   Address addr;
-  if ((ret = agent_socket_recv(agent, &addr, buf, len)) > 0 && stun_probe(buf, len) == 0) {
+  if (agent->stash_count > 0) {
+    AgentStashed* first = &agent->stash[0];
+    ret = first->len < len ? first->len : len;
+    memcpy(buf, first->buf, (size_t)ret);
+    addr = first->from;
+    memmove(&agent->stash[0], &agent->stash[1], sizeof(agent->stash[0]) * (size_t)(agent->stash_count - 1));
+    agent->stash_count--;
+  } else {
+    ret = agent_socket_recv(agent, &addr, buf, len);
+  }
+  if (ret > 0 && stun_probe(buf, len) == 0) {
     if ((size_t)ret > sizeof(stun_msg.buf)) {
       /* Oversized STUN datagram: a legitimate STUN message never approaches
        * STUN_ATTR_BUF_SIZE. Drop it rather than truncating into

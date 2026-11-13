@@ -1603,8 +1603,7 @@ static void peer_connection_gather_step(PeerConnection* pc) {
    * nothing else, and while checking with no pair yet nothing does either; once
    * pairs exist the connectivity check reads it. */
   if (pc->state != PEER_CONNECTION_CHECKING || pc->agent.candidate_pairs_num == 0) {
-    for (int i = 0; i < 4 && agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf)) == 0; i++) {
-    }
+    agent_gather_recv(&pc->agent);
   }
 
   agent_gather_poll(&pc->agent, ports_get_epoch_time());
