@@ -261,9 +261,14 @@ static void gather_build_allocate(AgentGatherTask* t, const StunMessage* challen
   }
 }
 
+/* A send the socket refuses ends the task: the route to that server is not
+ * there, and resending every AGENT_GATHER_RESEND_MS into it only fills the log
+ * and costs the lane's loop a failed syscall per attempt. */
 static void gather_send(Agent* agent, AgentGatherTask* t, uint32_t now) {
   if (agent_socket_send(agent, &t->server, t->req.buf, t->req.size) == -1) {
-    LOGE("gather: failed to send request to %s", t->host);
+    LOGE("gather: failed to send request to %s; giving up on it", t->host);
+    t->phase = AGENT_GATHER_DONE;
+    return;
   }
   t->next_send_ms = now + AGENT_GATHER_RESEND_MS;
 }
