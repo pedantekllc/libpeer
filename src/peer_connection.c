@@ -77,6 +77,12 @@ struct PeerConnection {
   char sdp[CONFIG_SDP_BUFFER_SIZE];
 
   void (*onicecandidate)(char* sdp, void* user_data);
+  void (*ongathering)(PeerGatherEvent event, const char* candidate, void* user_data);
+  /* Server-reflexive/relay gathering after the offer: 1 from the moment tasks
+   * are queued until DONE has been reported. gather_reported counts the local
+   * candidates already delivered (the host ones ride in the SDP). */
+  int gather_started;
+  int gather_reported;
   void (*oniceconnectionstatechange)(PeerConnectionState state, void* user_data);
   void (*on_connected)(void* userdata);
   void (*on_transport_feedback)(const twcc_arrival* arrivals, size_t count, void* user_data);
@@ -1582,6 +1588,44 @@ static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
 }
 
+/* Advance server-reflexive/relay gathering one non-blocking step and report
+ * what it produced: each new candidate, then DONE once every server has
+ * answered or given up. Once the connection is up no further path is needed,
+ * so the servers still pending are abandoned. */
+static void peer_connection_gather_step(PeerConnection* pc) {
+  if (!pc->gather_started) return;
+
+  if (pc->state == PEER_CONNECTION_CONNECTED || pc->state == PEER_CONNECTION_COMPLETED) {
+    agent_gather_cancel(&pc->agent);
+  }
+
+  /* The replies arrive on the agent's socket. Before the answer the loop reads
+   * nothing else, and while checking with no pair yet nothing does either; once
+   * pairs exist the connectivity check reads it. */
+  if (pc->state != PEER_CONNECTION_CHECKING || pc->agent.candidate_pairs_num == 0) {
+    for (int i = 0; i < 4 && agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf)) == 0; i++) {
+    }
+  }
+
+  agent_gather_poll(&pc->agent, ports_get_epoch_time());
+
+  for (; pc->gather_reported < pc->agent.local_candidates_count; pc->gather_reported++) {
+    char line[256];
+    line[0] = '\0';
+    ice_candidate_to_description(&pc->agent.local_candidates[pc->gather_reported], line, sizeof(line));
+    /* The trickle form is the candidate attribute's value: no "a=", no CRLF. */
+    char* value = strncmp(line, "a=", 2) == 0 ? line + 2 : line;
+    size_t n = strlen(value);
+    while (n > 0 && (value[n - 1] == '\r' || value[n - 1] == '\n')) value[--n] = '\0';
+    if (pc->ongathering) pc->ongathering(PEER_GATHER_CANDIDATE, value, pc->config.user_data);
+  }
+
+  if (!agent_gathering(&pc->agent)) {
+    pc->gather_started = 0;
+    if (pc->ongathering) pc->ongathering(PEER_GATHER_DONE, NULL, pc->config.user_data);
+  }
+}
+
 int peer_connection_loop(PeerConnection* pc) {
   uint32_t ssrc = 0;
   memset(pc->agent_buf, 0, sizeof(pc->agent_buf));
@@ -1590,6 +1634,7 @@ int peer_connection_loop(PeerConnection* pc) {
   /* Pump async mDNS (.local) candidate resolution — no-op unless the remote
    * offered mDNS-obfuscated candidates that are still resolving. */
   agent_poll_mdns_candidates(&pc->agent);
+  peer_connection_gather_step(pc);
 
   /* Per-iteration — must stay LOGD (like agent_recv/RTCP/DTLS below), else it
    * floods every connected session: the loop runs ~75 Hz per PeerConnection, so
@@ -2048,7 +2093,7 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 
   pc->b_local_description_created = 1;
 
-  agent_gather_candidate(&pc->agent, NULL, NULL, NULL);  // host address
+  agent_gather_host_candidates(&pc->agent);
 
   /* Inject an extra host candidate when host_candidate_override is set (e.g.
    * "127.0.0.1:PORT" so a browser on the Docker host can reach the mapped
@@ -2081,18 +2126,28 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
     }
   }
 
-  for (int i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
-    if (pc->config.ice_servers[i].urls) {
-      LOGI("ice server: %s", pc->config.ice_servers[i].urls);
-      agent_gather_candidate(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username, pc->config.ice_servers[i].credential);
-    }
-  }
-
+  /* The SDP carries the host candidates only. srflx and relay candidates are
+   * gathered afterwards (peer_connection_gather_step) and reported through
+   * ongathering, so the offer does not wait on a STUN or TURN server. */
   agent_get_local_description(&pc->agent, description, sizeof(pc->temp_buf));
   sdp_append(pc->sdp, description);
 
   if (pc->onicecandidate) {
     pc->onicecandidate(pc->sdp, pc->config.user_data);
+  }
+
+  pc->gather_reported = pc->agent.local_candidates_count;
+  pc->gather_started = 0;
+  for (size_t i = 0; i < sizeof(pc->config.ice_servers) / sizeof(pc->config.ice_servers[0]); ++i) {
+    if (pc->config.ice_servers[i].urls) {
+      LOGI("ice server: %s", pc->config.ice_servers[i].urls);
+      agent_gather_begin(&pc->agent, pc->config.ice_servers[i].urls, pc->config.ice_servers[i].username,
+                         pc->config.ice_servers[i].credential);
+    }
+  }
+  if (pc->agent.gather_tasks_num > 0) {
+    pc->gather_started = 1;
+    if (pc->ongathering) pc->ongathering(PEER_GATHER_STARTED, NULL, pc->config.user_data);
   }
 
   return pc->sdp;
@@ -2146,6 +2201,11 @@ int peer_connection_get_capture_ref(PeerConnection* pc, uint32_t* rtp, uint64_t*
 
 void peer_connection_onicecandidate(PeerConnection* pc, void (*onicecandidate)(char* sdp, void* userdata)) {
   pc->onicecandidate = onicecandidate;
+}
+
+void peer_connection_ongathering(PeerConnection* pc,
+                                 void (*ongathering)(PeerGatherEvent event, const char* candidate, void* userdata)) {
+  pc->ongathering = ongathering;
 }
 
 void peer_connection_oniceconnectionstatechange(PeerConnection* pc,

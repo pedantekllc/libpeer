@@ -8,6 +8,7 @@
 #include "base64.h"
 #include "config.h"
 #include "ice.h"
+#include "ice_dns.h"
 #include "mdns.h"
 #include "ports.h"
 #include "socket.h"
@@ -41,6 +42,7 @@ void agent_clear_candidates(Agent* agent) {
   agent->mdns_timed_out = 0;
   agent->selected_remote_type = -1;
   agent->remote_end_of_candidates = 0;
+  agent->gather_tasks_num = 0;
   agent->has_liveness = 0;
   agent->last_liveness_ms = 0;
   agent->has_peer_request = 0;
@@ -61,7 +63,7 @@ int agent_mdns_pending(const Agent* agent) {
 }
 
 int agent_ice_exhausted(const Agent* agent) {
-  return agent->remote_end_of_candidates && agent_mdns_pending(agent) == 0;
+  return agent->remote_end_of_candidates && agent_mdns_pending(agent) == 0 && !agent_gathering(agent);
 }
 
 void agent_set_remote_end_of_candidates(Agent* agent) {
@@ -155,56 +157,7 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len)
   return ret;
 }
 
-/* One request/response exchange for candidate gathering: send `req` to
- * `serv_addr` and wait up to AGENT_GATHER_TIMEOUT_MS for a datagram whose STUN
- * method matches `method`, re-sending the request every AGENT_GATHER_RESEND_MS
- * to ride out UDP loss.
- *
- * agent_socket_recv() waits at most AGENT_POLL_TIMEOUT (1 ms) per call, so
- * this loop provides the actual wait. It replaces a recv helper that gave up
- * on the FIRST 1 ms timeout — a server had to answer within ~1 ms of the
- * request, which only ever happens against localhost (e2e/CI). On real
- * hardware the STUN/TURN replies always arrived after that window, so devices
- * gathered no srflx/relay candidate at all, and the late replies then sat in
- * the socket buffer to be mis-read as the response of the NEXT exchange
- * ("Invalid TURN Binding Response"). Non-matching datagrams are drained and
- * discarded here instead of aborting the exchange.
- *
- * Gathering runs on the signaling reactor, so the wait is deliberately
- * bounded: worst case (server unreachable) is AGENT_GATHER_TIMEOUT_MS per
- * exchange, ≤3 exchanges per peer connection. */
-#define AGENT_GATHER_TIMEOUT_MS 500
-#define AGENT_GATHER_RESEND_MS 150
-
 static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, int len);
-
-static int agent_gather_exchange(Agent* agent, Address* serv_addr, StunMessage* req,
-                                 StunMessage* resp, uint16_t method) {
-  uint32_t now = ports_get_epoch_time();
-  uint32_t deadline = now + AGENT_GATHER_TIMEOUT_MS;
-  uint32_t next_send = now;
-  int ret;
-
-  while ((now = ports_get_epoch_time()) < deadline) {
-    if (now >= next_send) {
-      if (agent_socket_send(agent, serv_addr, req->buf, req->size) == -1) {
-        LOGE("gather: failed to send request (method 0x%04x)", method);
-        return -1;
-      }
-      next_send = now + AGENT_GATHER_RESEND_MS;
-    }
-    ret = agent_socket_recv(agent, NULL, resp->buf, sizeof(resp->buf));
-    if (ret > 0) {
-      stun_parse_msg_buf(resp);
-      if (resp->stunmethod == method) {
-        return ret;
-      }
-      LOGD("gather: discarding non-matching datagram (method 0x%04x, want 0x%04x)",
-           resp->stunmethod, method);
-    }
-  }
-  return -1;
-}
 
 static int agent_socket_send(Agent* agent, Address* addr, const uint8_t* buf, int len) {
   switch (addr->family) {
@@ -252,144 +205,207 @@ static int agent_create_host_addr(Agent* agent) {
   return 0;
 }
 
-static int agent_create_stun_addr(Agent* agent, Address* serv_addr) {
-  int ret = -1;
-  Address bind_addr;
-  StunMessage send_msg;
-  StunMessage recv_msg;
-  memset(&send_msg, 0, sizeof(send_msg));
-  memset(&recv_msg, 0, sizeof(recv_msg));
+void agent_gather_host_candidates(Agent* agent) { agent_create_host_addr(agent); }
 
-  stun_msg_create(&send_msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+/* ── Server-reflexive and relay gathering ──────────────────────────────────
+ *
+ * Gathering is a set of small state machines, one per ICE server, advanced by
+ * agent_gather_poll (sends, resends, deadlines) and agent_gather_on_stun (the
+ * replies, which agent_recv hands over — it is the only reader of the socket).
+ * Nothing waits: the offer carries the host candidates and goes out first, and
+ * each srflx/relay candidate is reported when its server answers.
+ *
+ * A server's address comes from the remembered table in ice_dns.c, never from
+ * a lookup here. A name with no remembered address yet leaves its task in
+ * WAIT_DNS until the background resolver has one or the wait runs out.
+ *
+ * A request is re-sent every AGENT_GATHER_RESEND_MS to ride out UDP loss and a
+ * phase gives up after AGENT_GATHER_TIMEOUT_MS, so a task is over within
+ * AGENT_GATHER_DNS_WAIT_MS + 2 * AGENT_GATHER_TIMEOUT_MS whatever the server
+ * does. Replies are matched to a task by the server's address and the STUN
+ * method: transaction ids are not distinct (see stun_msg_create). */
+#define AGENT_GATHER_TIMEOUT_MS 500
+#define AGENT_GATHER_RESEND_MS 150
+#define AGENT_GATHER_DNS_WAIT_MS 1500
 
-  ret = agent_gather_exchange(agent, serv_addr, &send_msg, &recv_msg, STUN_METHOD_BINDING);
-  if (ret <= 0) {
-    LOGW("STUN gather: no Binding Response — srflx candidate unavailable");
+static int gather_time_reached(uint32_t now, uint32_t at) { return (int32_t)(now - at) >= 0; }
+
+static int agent_add_local_candidate(Agent* agent, IceCandidateType type, const Address* addr) {
+  if (agent->local_candidates_count >= AGENT_MAX_CANDIDATES) {
+    LOGW("gather: local candidate table full");
     return -1;
   }
-
-  memcpy(&bind_addr, &recv_msg.mapped_addr, sizeof(Address));
-  IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
-  ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_SRFLX, &bind_addr);
-  return ret;
+  IceCandidate* c = agent->local_candidates + agent->local_candidates_count++;
+  ice_candidate_create(c, agent->local_candidates_count, type, (Address*)addr);
+  /* Pair it with the remote candidates already known: the answer may have
+   * landed while this server was still replying. */
+  agent_pair_local_candidate(agent, c);
+  return 0;
 }
 
-static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* username, const char* credential) {
-  int ret = -1;
+static void gather_build_binding(AgentGatherTask* t) {
+  memset(&t->req, 0, sizeof(t->req));
+  stun_msg_create(&t->req, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+}
+
+static void gather_build_allocate(AgentGatherTask* t, const StunMessage* challenge) {
   uint32_t attr = ntohl(0x11000000);
-  Address turn_addr;
-  StunMessage send_msg;
-  StunMessage recv_msg;
-  memset(&recv_msg, 0, sizeof(recv_msg));
-  memset(&send_msg, 0, sizeof(send_msg));
-  stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
-  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
-  stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
-
-  ret = agent_gather_exchange(agent, serv_addr, &send_msg, &recv_msg, STUN_METHOD_ALLOCATE);
-  if (ret <= 0) {
-    LOGW("TURN gather: no Allocate reply — relay candidate unavailable");
-    return -1;
+  memset(&t->req, 0, sizeof(t->req));
+  stun_msg_create(&t->req, STUN_METHOD_ALLOCATE);
+  stun_msg_write_attr(&t->req, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
+  stun_msg_write_attr(&t->req, STUN_ATTR_TYPE_USERNAME, strlen(t->username), t->username);
+  if (challenge) {
+    stun_msg_write_attr(&t->req, STUN_ATTR_TYPE_NONCE, strlen(challenge->nonce), (char*)challenge->nonce);
+    stun_msg_write_attr(&t->req, STUN_ATTR_TYPE_REALM, strlen(challenge->realm), (char*)challenge->realm);
+    stun_msg_finish(&t->req, STUN_CREDENTIAL_LONG_TERM, t->credential, strlen(t->credential));
   }
-
-  if (recv_msg.stunclass == STUN_CLASS_ERROR) {
-    /* Expected first reply: the 401 challenge carrying realm+nonce for the
-     * authenticated retry (long-term credential mechanism). */
-    if (recv_msg.nonce[0] == '\0' || recv_msg.realm[0] == '\0') {
-      LOGW("TURN gather: Allocate error without realm/nonce challenge");
-      return -1;
-    }
-    memset(&send_msg, 0, sizeof(send_msg));
-    stun_msg_create(&send_msg, STUN_METHOD_ALLOCATE);
-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REQUESTED_TRANSPORT, sizeof(attr), (char*)&attr);  // UDP
-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_USERNAME, strlen(username), (char*)username);
-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_NONCE, strlen(recv_msg.nonce), recv_msg.nonce);
-    stun_msg_write_attr(&send_msg, STUN_ATTR_TYPE_REALM, strlen(recv_msg.realm), recv_msg.realm);
-    stun_msg_finish(&send_msg, STUN_CREDENTIAL_LONG_TERM, credential, strlen(credential));
-
-    memset(&recv_msg, 0, sizeof(recv_msg));
-    ret = agent_gather_exchange(agent, serv_addr, &send_msg, &recv_msg, STUN_METHOD_ALLOCATE);
-    if (ret <= 0) {
-      LOGW("TURN gather: no authenticated Allocate reply");
-      return -1;
-    }
-    if (recv_msg.stunclass != STUN_CLASS_RESPONSE) {
-      LOGW("TURN gather: authenticated Allocate rejected (class=0x%04x)", recv_msg.stunclass);
-      agent->turn_alloc_rejected++;
-      return -1;
-    }
-  } else if (recv_msg.stunclass != STUN_CLASS_RESPONSE) {
-    LOGW("TURN gather: unexpected Allocate reply (class=0x%04x)", recv_msg.stunclass);
-    return -1;
-  }
-
-  memcpy(&turn_addr, &recv_msg.relayed_addr, sizeof(Address));
-  IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
-  ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_RELAY, &turn_addr);
-  agent->turn_alloc_ok++;
-  return ret;
 }
 
-void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential) {
-  char* pos;
-  int port;
-  char hostname[64];
-  char addr_string[ADDRSTRLEN];
-  int i;
-  int addr_type[1] = {AF_INET};  // ipv6 no need stun
-  Address resolved_addr;
-  memset(hostname, 0, sizeof(hostname));
+static void gather_send(Agent* agent, AgentGatherTask* t, uint32_t now) {
+  if (agent_socket_send(agent, &t->server, t->req.buf, t->req.size) == -1) {
+    LOGE("gather: failed to send request to %s", t->host);
+  }
+  t->next_send_ms = now + AGENT_GATHER_RESEND_MS;
+}
 
-  if (urls == NULL) {
-    agent_create_host_addr(agent);
-    return;
+static void gather_enter(Agent* agent, AgentGatherTask* t, AgentGatherPhase phase, uint32_t now) {
+  t->phase = phase;
+  t->deadline_ms = now + AGENT_GATHER_TIMEOUT_MS;
+  gather_send(agent, t, now);
+}
+
+int agent_gather_begin(Agent* agent, const char* urls, const char* username, const char* credential) {
+  bool is_tls = false;
+  char host[64];
+  int port = 0;
+
+  if (ice_dns_parse_url(urls, &is_tls, host, sizeof(host), &port) != 0) {
+    LOGE("Invalid ICE server URL");
+    return 0;
+  }
+  /* stuns:/turns: need a TLS transport libpeer does not implement; it is
+   * skipped before its name is ever looked at. */
+  if (is_tls) {
+    LOGD("Skipping unsupported ICE server scheme: %s", urls);
+    return 0;
+  }
+  const int is_turn = strncmp(urls, "turn:", 5) == 0;
+  if (!is_turn && strncmp(urls, "stun:", 5) != 0) {
+    LOGE("Unknown ICE server scheme: %s", urls);
+    return 0;
+  }
+  if (is_turn && (!username || !username[0] || !credential || !credential[0])) {
+    LOGW("TURN server %s has no credentials; skipped", host);
+    return 0;
+  }
+  if (agent->gather_tasks_num >= AGENT_MAX_GATHER_TASKS) {
+    LOGW("gather: too many ICE servers; %s skipped", host);
+    return 0;
   }
 
-  // urls is "scheme:host:port" (scheme = stun | turn | stuns | turns). Scan for
-  // the scheme delimiter instead of assuming a 5-char scheme: "turns:"/"stuns:"
-  // are 6 chars, and the old fixed `urls + 5` slice mis-parsed them into
-  // "Cannot parse port" failures on every gather.
-  const char* host = strchr(urls, ':');
-  if (host == NULL) {
-    LOGE("Invalid URL");
-    return;
+  AgentGatherTask* t = &agent->gather_tasks[agent->gather_tasks_num];
+  memset(t, 0, sizeof(*t));
+  t->is_turn = is_turn;
+  t->port = port;
+  snprintf(t->host, sizeof(t->host), "%s", host);
+  if (is_turn) {
+    if (snprintf(t->username, sizeof(t->username), "%s", username) >= (int)sizeof(t->username) ||
+        snprintf(t->credential, sizeof(t->credential), "%s", credential) >= (int)sizeof(t->credential)) {
+      LOGW("TURN credentials for %s do not fit; skipped", host);
+      return 0;
+    }
   }
-  host++;
+  t->phase = AGENT_GATHER_WAIT_DNS;
+  t->deadline_ms = ports_get_epoch_time() + AGENT_GATHER_DNS_WAIT_MS;
+  agent->gather_tasks_num++;
+  ice_dns_watch(host);
+  return 1;
+}
 
-  if ((pos = strstr(host, ":")) == NULL) {
-    LOGE("Invalid URL");
-    return;
-  }
+void agent_gather_poll(Agent* agent, uint32_t now) {
+  for (int i = 0; i < agent->gather_tasks_num; i++) {
+    AgentGatherTask* t = &agent->gather_tasks[i];
+    if (t->phase == AGENT_GATHER_DONE) continue;
 
-  port = atoi(pos + 1);
-  if (port <= 0) {
-    LOGE("Cannot parse port");
-    return;
-  }
-
-  snprintf(hostname, pos - host + 1, "%s", host);
-
-  for (i = 0; i < sizeof(addr_type) / sizeof(addr_type[0]); i++) {
-    if (ports_resolve_addr(hostname, &resolved_addr) == 0) {
-      addr_set_port(&resolved_addr, port);
-      addr_to_string(&resolved_addr, addr_string, sizeof(addr_string));
-      LOGI("Resolved stun/turn server %s:%d", addr_string, port);
-
-      if (strncmp(urls, "stun:", 5) == 0) {
-        LOGD("Create stun addr");
-        agent_create_stun_addr(agent, &resolved_addr);
-      } else if (strncmp(urls, "turn:", 5) == 0) {
-        LOGD("Create turn addr");
-        agent_create_turn_addr(agent, &resolved_addr, username, credential);
-      } else {
-        /* stuns:/turns: — TLS transports libpeer does not implement; skip
-         * cleanly rather than mis-driving them over plain UDP. */
-        LOGD("Skipping unsupported ICE server scheme: %s", urls);
+    if (t->phase == AGENT_GATHER_WAIT_DNS) {
+      IceDnsLookup found = ice_dns_lookup(t->host);
+      if (found.state == ICE_DNS_RESOLVED) {
+        t->server = found.addr;
+        addr_set_port(&t->server, (uint16_t)t->port);
+        if (t->is_turn) {
+          gather_build_allocate(t, NULL);
+          gather_enter(agent, t, AGENT_GATHER_WAIT_CHALLENGE, now);
+        } else {
+          gather_build_binding(t);
+          gather_enter(agent, t, AGENT_GATHER_WAIT_BINDING, now);
+        }
+      } else if (gather_time_reached(now, t->deadline_ms)) {
+        LOGW("gather: %s has no resolved address; skipped", t->host);
+        t->phase = AGENT_GATHER_DONE;
       }
+      continue;
+    }
+
+    if (gather_time_reached(now, t->deadline_ms)) {
+      LOGW("%s gather: no reply from %s", t->is_turn ? "TURN" : "STUN", t->host);
+      t->phase = AGENT_GATHER_DONE;
+    } else if (gather_time_reached(now, t->next_send_ms)) {
+      gather_send(agent, t, now);
     }
   }
 }
 
+int agent_gathering(const Agent* agent) {
+  for (int i = 0; i < agent->gather_tasks_num; i++) {
+    if (agent->gather_tasks[i].phase != AGENT_GATHER_DONE) return 1;
+  }
+  return 0;
+}
+
+void agent_gather_cancel(Agent* agent) {
+  for (int i = 0; i < agent->gather_tasks_num; i++) agent->gather_tasks[i].phase = AGENT_GATHER_DONE;
+}
+
+int agent_gather_on_stun(Agent* agent, StunMessage* msg, const Address* from) {
+  const uint32_t now = ports_get_epoch_time();
+  for (int i = 0; i < agent->gather_tasks_num; i++) {
+    AgentGatherTask* t = &agent->gather_tasks[i];
+    if (t->phase == AGENT_GATHER_DONE || t->phase == AGENT_GATHER_WAIT_DNS) continue;
+    if (!addr_equal(&t->server, from)) continue;
+
+    if (t->phase == AGENT_GATHER_WAIT_BINDING && msg->stunmethod == STUN_METHOD_BINDING &&
+        msg->stunclass == STUN_CLASS_RESPONSE) {
+      agent_add_local_candidate(agent, ICE_CANDIDATE_TYPE_SRFLX, &msg->mapped_addr);
+      t->phase = AGENT_GATHER_DONE;
+      return 1;
+    }
+    if ((t->phase == AGENT_GATHER_WAIT_CHALLENGE || t->phase == AGENT_GATHER_WAIT_ALLOCATE) &&
+        msg->stunmethod == STUN_METHOD_ALLOCATE) {
+      if (msg->stunclass == STUN_CLASS_ERROR && t->phase == AGENT_GATHER_WAIT_CHALLENGE) {
+        /* Expected first reply: the 401 challenge carrying realm+nonce for the
+         * authenticated retry (long-term credential mechanism). */
+        if (msg->nonce[0] == '\0' || msg->realm[0] == '\0') {
+          LOGW("TURN gather: Allocate error without realm/nonce challenge");
+          t->phase = AGENT_GATHER_DONE;
+        } else {
+          gather_build_allocate(t, msg);
+          gather_enter(agent, t, AGENT_GATHER_WAIT_ALLOCATE, now);
+        }
+        return 1;
+      }
+      if (msg->stunclass == STUN_CLASS_RESPONSE) {
+        agent_add_local_candidate(agent, ICE_CANDIDATE_TYPE_RELAY, &msg->relayed_addr);
+        agent->turn_alloc_ok++;
+      } else {
+        LOGW("TURN gather: Allocate rejected (class=0x%04x)", msg->stunclass);
+        if (t->phase == AGENT_GATHER_WAIT_ALLOCATE) agent->turn_alloc_rejected++;
+      }
+      t->phase = AGENT_GATHER_DONE;
+      return 1;
+    }
+  }
+  return 0;
+}
 void agent_create_ice_credential(Agent* agent) {
   memset(agent->local_ufrag, 0, sizeof(agent->local_ufrag));
   memset(agent->local_upwd, 0, sizeof(agent->local_upwd));
@@ -574,6 +590,24 @@ void agent_pair_remote_candidate(Agent* agent, IceCandidate* remote) {
     pair->local = &agent->local_candidates[i];
     pair->remote = remote;
     pair->priority = (uint64_t)agent->local_candidates[i].priority + (uint64_t)remote->priority;
+    pair->state = ICE_CANDIDATE_STATE_FROZEN;
+    pair->conncheck = 0;
+    agent->candidate_pairs_num++;
+  }
+}
+
+void agent_pair_local_candidate(Agent* agent, IceCandidate* local) {
+  for (int j = 0; j < agent->remote_candidates_count; j++) {
+    IceCandidate* remote = &agent->remote_candidates[j];
+    if (local->addr.family != remote->addr.family || agent_pair_exists(agent, local, remote)) continue;
+    if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
+      LOGW("Cannot pair local candidate: candidate pair table full");
+      return;
+    }
+    IceCandidatePair* pair = &agent->candidate_pairs[agent->candidate_pairs_num];
+    pair->local = local;
+    pair->remote = remote;
+    pair->priority = (uint64_t)local->priority + (uint64_t)remote->priority;
     pair->state = ICE_CANDIDATE_STATE_FROZEN;
     pair->conncheck = 0;
     agent->candidate_pairs_num++;
@@ -850,9 +884,12 @@ int agent_recv(Agent* agent, uint8_t* buf, int len) {
         agent_process_stun_request(agent, &stun_msg, &addr, ports_get_epoch_time());
         break;
       case STUN_CLASS_RESPONSE:
-        agent_process_stun_response(agent, &stun_msg, &addr, ports_get_epoch_time());
+        if (!agent_gather_on_stun(agent, &stun_msg, &addr)) {
+          agent_process_stun_response(agent, &stun_msg, &addr, ports_get_epoch_time());
+        }
         break;
       case STUN_CLASS_ERROR:
+        (void)agent_gather_on_stun(agent, &stun_msg, &addr);
         break;
       default:
         break;
