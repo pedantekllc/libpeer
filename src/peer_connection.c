@@ -18,6 +18,7 @@
 #include "rtcp_walk.h"
 #include "send_seq.h"
 #include "rtp.h"
+#include "rtx_history.h"
 #include "sctp.h"
 #include "sdp.h"
 #include "twcc.h"
@@ -53,18 +54,16 @@ typedef struct dtls_fragment_state_s dtls_fragment_state_t;
 /* ── RTX retransmission machinery (RFC 4588) ──────────────────────────────── */
 
 #define RTX_SSRC          2u     /* media is a=ssrc:1; FID-paired in the SDP  */
-#define RTX_HISTORY_SLOTS 512    /* ~0.5-2.5s of video at typical rates       */
-#define RTX_SLOT_BYTES    (CONFIG_MTU + 128)
-#define RTX_QUEUE_SLOTS   256    /* NACKed seqs waiting for their pace         */
+/* The history grows to twice the largest frame's packets (rtx_history.h): a
+ * 5 MP camera's 1 MB keyframe is about 870 packets, 2048 slots, about 2.9 MB per
+ * viewer. The maximum holds a 5 MB keyframe, about 11.7 MB. */
+#define RTX_HISTORY_INITIAL_SLOTS 512
+#define RTX_HISTORY_MAX_SLOTS     8192
+/* NACKed seqs waiting for their pace: every packet the history can hold, so a
+ * loss burst across a whole keyframe is queued at once. */
+#define RTX_QUEUE_SLOTS   RTX_HISTORY_MAX_SLOTS
 /* Don't answer repeat-NACKs for the same seq more often than this. */
 #define RTX_MIN_RESEND_MS 40
-
-typedef struct {
-  uint16_t seq;            /* media seq stored here (slot = seq % SLOTS)      */
-  uint16_t len;            /* 0 = empty                                       */
-  uint32_t last_resend_ms; /* monotonic ms of last retransmit of this seq     */
-  uint8_t  data[RTX_SLOT_BYTES];   /* final pre-SRTP media packet             */
-} rtx_slot_t;
 
 
 struct PeerConnection {
@@ -183,7 +182,7 @@ struct PeerConnection {
    * History is WRITTEN by the send path (per-lane send worker, at the
    * chokepoint) and READ by the NACK handler (reactor thread, inside
    * incoming_rtcp) — guarded by rtx_mtx. */
-  rtx_slot_t* rtx_history;           /* RTX_HISTORY_SLOTS slots; NULL = off  */
+  rtx_history rtx_hist;              /* rtx_hist.slots NULL = off            */
   pthread_mutex_t rtx_mtx;
   uint16_t rtx_seq;                  /* RTX stream's own sequence space      */
 
@@ -413,14 +412,9 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
 /* Record one outgoing media packet (final pre-SRTP form) for NACK-driven
  * retransmission. Send-worker thread; the NACK reader holds the same mutex. */
 static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size) {
-  if (!pc->rtx_history || size < 12 || size > RTX_SLOT_BYTES) return;
-  uint16_t seq = (uint16_t)((data[2] << 8) | data[3]);
-  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
+  if (!pc->rtx_hist.slots) return;
   pthread_mutex_lock(&pc->rtx_mtx);
-  slot->seq = seq;
-  slot->len = (uint16_t)size;
-  slot->last_resend_ms = 0;
-  memcpy(slot->data, data, size);
+  rtx_history_store(&pc->rtx_hist, data, size);
   pthread_mutex_unlock(&pc->rtx_mtx);
 }
 
@@ -430,8 +424,8 @@ static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, s
 static size_t peer_connection_rtx_build(PeerConnection* pc, uint16_t seq, uint8_t* buf) {
   size_t out_len = 0;
   pthread_mutex_lock(&pc->rtx_mtx);
-  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
-  if (slot->len >= 12 && slot->seq == seq) {
+  rtx_slot_t* slot = rtx_history_find(&pc->rtx_hist, seq);
+  if (slot) {
     size_t off = rtp_payload_offset(slot->data, slot->len);
     /* header + extensions verbatim, then OSN, then original payload */
     memcpy(buf, slot->data, off);
@@ -485,9 +479,9 @@ static void* peer_connection_rtx_main(void* arg) {
  * (the receiver NACKs again). */
 static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_lock(&pc->rtx_mtx);
-  rtx_slot_t* slot = &pc->rtx_history[seq % RTX_HISTORY_SLOTS];
+  rtx_slot_t* slot = rtx_history_find(&pc->rtx_hist, seq);
   uint32_t now = rtx_now_ms();
-  if (slot->len >= 12 && slot->seq == seq && pc->rtx_q_n < RTX_QUEUE_SLOTS &&
+  if (slot && pc->rtx_q_n < RTX_QUEUE_SLOTS &&
       (slot->last_resend_ms == 0 || now - slot->last_resend_ms >= RTX_MIN_RESEND_MS)) {
     if (!pc->rtx_thread_started) {
       if (pthread_create(&pc->rtx_thread, NULL, peer_connection_rtx_main, pc) != 0) {
@@ -508,7 +502,7 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
 /* Parse one RTCP Generic NACK (RTPFB fmt=1) and retransmit every named seq.
  * FCI = N x { PID(16) | BLP(16) }: PID itself plus each set BLP bit (PID+i+1). */
 static void peer_connection_handle_nack(PeerConnection* pc, const uint8_t* fb, size_t len) {
-  if (!pc->config.rtx || !pc->rtx_history || len < 16) return;
+  if (!pc->config.rtx || !pc->rtx_hist.slots || len < 16) return;
   size_t fci = 12;                       /* hdr(4) + sender ssrc + media ssrc */
   while (fci + 4 <= len) {
     uint16_t pid = (uint16_t)((fb[fci] << 8) | fb[fci + 1]);
@@ -1190,7 +1184,7 @@ void* peer_connection_get_sctp(PeerConnection* pc) {
 /* Padding-only packets ride the RTX SSRC when RTX was negotiated; otherwise
  * the video SSRC, drawing from the media sequence space. */
 static int peer_connection_probe_uses_rtx(PeerConnection* pc) {
-  return pc->config.rtx && pc->rtx_history && pc->rtx_negotiated;
+  return pc->config.rtx && pc->rtx_hist.slots && pc->rtx_negotiated;
 }
 
 static void peer_connection_probe_send_one(PeerConnection* pc) {
@@ -1357,8 +1351,7 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   pthread_cond_init(&pc->rtx_cv, NULL);
   pacer_shared_init(&pc->pacer);
   if (pc->config.rtx) {
-    pc->rtx_history = calloc(RTX_HISTORY_SLOTS, sizeof(rtx_slot_t));
-    if (!pc->rtx_history)
+    if (rtx_history_init(&pc->rtx_hist, RTX_HISTORY_INITIAL_SLOTS, RTX_HISTORY_MAX_SLOTS) != 0)
       LOGW("rtx history alloc failed - retransmissions disabled for this peer");
   }
 
@@ -1416,7 +1409,7 @@ void peer_connection_destroy(PeerConnection* pc) {
     if (pc->frag_state) {
       free(pc->frag_state);
     }
-    free(pc->rtx_history);
+    rtx_history_free(&pc->rtx_hist);
     twcc_sender_deinit(&pc->twcc_tx);
     pthread_mutex_destroy(&pc->rtx_mtx);
     pthread_mutex_destroy(&pc->send_mtx);
@@ -2012,14 +2005,14 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   if (pc->config.video_codec == CODEC_H264) {
     if (pc->config.fec)
       sdp_append_h264_fec(pc->sdp);
-    else if (pc->config.rtx && pc->rtx_history)
+    else if (pc->config.rtx && pc->rtx_hist.slots)
       sdp_append_h264_rtx(pc->sdp);
     else
       sdp_append_h264(pc->sdp);
   } else if (pc->config.video_codec == CODEC_H265) {
     if (pc->config.fec)
       sdp_append_h265_fec(pc->sdp);
-    else if (pc->config.rtx && pc->rtx_history)
+    else if (pc->config.rtx && pc->rtx_hist.slots)
       sdp_append_h265_rtx(pc->sdp);
     else
       sdp_append_h265(pc->sdp);
