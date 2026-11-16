@@ -1463,6 +1463,10 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
   return rtp_encoder_encode(&pc->artp_encoder, buf, len, 0);
 }
 
+void peer_connection_mark_stream_switch(PeerConnection* pc) {
+  rtp_video_clock_switch(&pc->video_clock);
+}
+
 int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, const uint8_t* buf, size_t len, uint64_t capture_time_ns, uint64_t queue_limit_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
     return -1;

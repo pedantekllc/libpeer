@@ -226,7 +226,15 @@ typedef struct {
   int started;
   uint64_t last_ns;  /* the last frame's capture time on the wire clock */
   int64_t offset_ns; /* added to the caller's capture times (rebases a step back) */
+  int switch_next;   /* the next frame is the first of another source (rtp_video_clock_switch) */
+  uint64_t interval_ns; /* the spacing of the last two frames, the step a switch frame takes */
 } RtpVideoClock;
+
+/* The next frame mapped is the first of another source on this SSRC (a lane join or switch): its
+ * capture clock has its own origin, so that frame goes out one frame interval (the spacing of
+ * the last two frames) after the last one whichever way its time points, and the frames after
+ * it keep their own spacing. */
+void rtp_video_clock_switch(RtpVideoClock* clock);
 
 /* The capture time to send a frame with: `capture_time_ns` plus the clock's offset,
  * which grows whenever a frame's capture time is earlier than the previous frame's.

@@ -635,14 +635,27 @@ uint32_t rtp_timestamp_from_ns(uint64_t capture_time_ns, uint32_t clock_rate_hz)
  * is strictly above the last one's. */
 #define RTP_VIDEO_TICK_NS 11112ULL
 
+void rtp_video_clock_switch(RtpVideoClock* clock) { clock->switch_next = 1; }
+
 uint64_t rtp_video_clock_map(RtpVideoClock* clock, uint64_t capture_time_ns) {
   uint64_t mapped = (uint64_t)((int64_t)capture_time_ns + clock->offset_ns);
-  if (clock->started && mapped < clock->last_ns) {
+  if (clock->started && clock->switch_next) {
+    /* Another source's first frame: its clock's origin says nothing about this stream's, so
+     * the offset is replaced (not added to) and the frame goes out one frame interval after the
+     * last, where the old source's next frame would have been. */
+    mapped = clock->last_ns + (clock->interval_ns ? clock->interval_ns : RTP_VIDEO_TICK_NS);
+    clock->offset_ns = (int64_t)mapped - (int64_t)capture_time_ns;
+  } else if (clock->started && mapped < clock->last_ns) {
     const uint64_t target = clock->last_ns + RTP_VIDEO_TICK_NS;
     clock->offset_ns += (int64_t)(target - mapped);
     mapped = target;
   }
+  /* A frame interval, not a stall: a step of a second or more is not taken as the spacing. */
+  if (clock->started && !clock->switch_next && mapped > clock->last_ns &&
+      mapped - clock->last_ns < 1000000000ULL)
+    clock->interval_ns = mapped - clock->last_ns;
   clock->started = 1;
+  clock->switch_next = 0;
   clock->last_ns = mapped;
   return mapped;
 }

@@ -312,6 +312,12 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t
  */
 int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns, uint64_t queue_limit_ns);
 
+/* The next video frame sent on this pc is the first from another source (a lane join or
+ * switch): its capture clock has its own origin, so it goes out one RTP tick after the last
+ * frame sent, whichever way its time points (rtp_video_clock_switch). Call on the lane's send
+ * worker immediately before peer_connection_send_video. */
+void peer_connection_mark_stream_switch(PeerConnection* pc);
+
 /* The video codecs the connection can send, as bits (1u << MediaCodec): the offered ones
  * until the answer arrives, then the ones it kept. send_video refuses a codec outside it. */
 unsigned peer_connection_negotiated_video_codecs(const PeerConnection* pc);
