@@ -68,6 +68,11 @@ int rtp_is_video_pt(int pt);
  * its codec. -1 for a PT that is not video. */
 int rtp_rtx_pt(int orig_pt, int dual);
 
+/* Re-point a video encoder at another video codec: the next access unit is packetized
+ * with that codec's payload type and NAL layout. SSRC, timestamp and sequence state
+ * continue. The caller switches only between access units, at a keyframe. */
+void rtp_encoder_set_video_codec(RtpEncoder* rtp_encoder, MediaCodec codec);
+
 typedef struct RtpHeader {
 #if __BYTE_ORDER == __BIG_ENDIAN
   uint16_t version : 2;

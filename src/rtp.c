@@ -533,8 +533,23 @@ int rtp_is_video_pt(int pt) {
 }
 
 int rtp_rtx_pt(int orig_pt, int dual) {
-  (void)dual;
-  return rtp_is_video_pt(orig_pt) ? PT_RTX : -1;
+  if (!rtp_is_video_pt(orig_pt)) return -1;
+  return dual && orig_pt == PT_H265 ? PT_RTX_H265 : PT_RTX;
+}
+
+void rtp_encoder_set_video_codec(RtpEncoder* rtp_encoder, MediaCodec codec) {
+  switch (codec) {
+    case CODEC_H264:
+      rtp_encoder->type = PT_H264;
+      rtp_encoder->encode_func = rtp_encoder_encode_h264;
+      break;
+    case CODEC_H265:
+      rtp_encoder->type = PT_H265;
+      rtp_encoder->encode_func = rtp_encoder_encode_h265;
+      break;
+    default:
+      break;
+  }
 }
 
 static int rtp_encoder_encode_generic(RtpEncoder* rtp_encoder, uint8_t* buf, size_t size) {

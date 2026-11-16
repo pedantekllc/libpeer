@@ -80,6 +80,9 @@ typedef struct PeerConfiguration {
 
   MediaCodec audio_codec;
   MediaCodec video_codec;
+  /* A second video codec to offer on the same m-line (CODEC_NONE: one codec). The answer
+   * keeps one or both; see peer_connection_negotiated_video_codecs. Ignored with `fec`. */
+  MediaCodec video_codec_alt;
   DataChannelType datachannel;
 
   /* One received audio payload with its RTP timestamp and sequence number. */
@@ -307,7 +310,11 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* packet, size_t
  *   against: PACER_QUEUE_LIMIT_NS, or a shorter limit for an access unit that must
  *   leave on its own (pacer_video_queue). It applies to this frame's media packets only.
  */
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns, uint64_t queue_limit_ns);
+int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, const uint8_t* packet, size_t bytes, uint64_t capture_time_ns, uint64_t queue_limit_ns);
+
+/* The video codecs the connection can send, as bits (1u << MediaCodec): the offered ones
+ * until the answer arrives, then the ones it kept. send_video refuses a codec outside it. */
+unsigned peer_connection_negotiated_video_codecs(const PeerConnection* pc);
 
 /* Latest capture reference: the most recent frame's on-wire RTP timestamp and
  * its capture NTP (the same (RTP, NTP) pair the RTCP SR uses). Lets the app
