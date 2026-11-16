@@ -650,8 +650,9 @@ uint64_t rtp_video_clock_map(RtpVideoClock* clock, uint64_t capture_time_ns) {
     clock->offset_ns += (int64_t)(target - mapped);
     mapped = target;
   }
-  /* A frame interval, not a stall: a step of a second or more is not taken as the spacing. */
-  if (clock->started && !clock->switch_next && mapped > clock->last_ns &&
+  /* A frame interval: not a stall (a second or more), not a join's 1 ms fast-forward spacing or
+   * a backward rebase's tick (1 ms or less), and not the step a switch itself took. */
+  if (clock->started && !clock->switch_next && mapped > clock->last_ns + 1000000ULL &&
       mapped - clock->last_ns < 1000000000ULL)
     clock->interval_ns = mapped - clock->last_ns;
   clock->started = 1;
