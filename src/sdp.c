@@ -159,6 +159,12 @@ static void sdp_append_h265_section(char* sdp, int rtx, int fec) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
+void sdp_append_h264_h265(char* sdp, int rtx, int h265_first) {
+  (void)sdp;
+  (void)rtx;
+  (void)h265_first;
+}
+
 void sdp_append_h265(char* sdp) {
   sdp_append_h265_section(sdp, 0, 0);
 }

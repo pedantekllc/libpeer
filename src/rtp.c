@@ -532,6 +532,11 @@ int rtp_is_video_pt(int pt) {
   return pt == PT_H264 || pt == PT_H265;
 }
 
+int rtp_rtx_pt(int orig_pt, int dual) {
+  (void)dual;
+  return rtp_is_video_pt(orig_pt) ? PT_RTX : -1;
+}
+
 static int rtp_encoder_encode_generic(RtpEncoder* rtp_encoder, uint8_t* buf, size_t size) {
   RtpHeader* rtp_header = (RtpHeader*)rtp_encoder->buf;
   rtp_header->version = 2;
