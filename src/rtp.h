@@ -39,7 +39,9 @@ typedef enum RtpPayloadType {
   /* RTX retransmissions (RFC 4588): separate SSRC (RTX_SSRC), own sequence
    * space, payload = 2-byte OSN + original payload. Offered as
    * "a=rtpmap:97 rtx/90000" + "a=fmtp:97 apt=<video PT>" + ssrc-group:FID. */
-  PT_RTX = 97
+  PT_RTX = 97,
+  /* The RTX PT of H.265 in a session that offers both codecs (97 stays H.264's). */
+  PT_RTX_H265 = 99
 
 } RtpPayloadType;
 
@@ -59,6 +61,12 @@ int rtp_video_pt(MediaCodec codec);
 
 /* 1 when `pt` is the payload type of a codec rtp_video_pt() knows. */
 int rtp_is_video_pt(int pt);
+
+/* The RTX payload type that retransmits a packet of video payload type `orig_pt`: the
+ * pair the offer made for it. A session that offers both codecs (`dual`) pairs each
+ * codec with its own (96 -> 97, 98 -> 99); a single-codec session uses PT_RTX whatever
+ * its codec. -1 for a PT that is not video. */
+int rtp_rtx_pt(int orig_pt, int dual);
 
 typedef struct RtpHeader {
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -187,6 +195,11 @@ int rtp_packet_validate(uint8_t* packet, size_t size);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 
+/* Re-point a video encoder at another video codec: the next access unit is packetized
+ * with that codec's payload type and NAL layout. SSRC, timestamp and sequence state
+ * continue. The caller switches only between access units, at a keyframe. */
+void rtp_encoder_set_video_codec(RtpEncoder* rtp_encoder, MediaCodec codec);
+
 /**
  * Packetise and emit an access unit / audio packet.
  *
@@ -213,7 +226,15 @@ typedef struct {
   int started;
   uint64_t last_ns;  /* the last frame's capture time on the wire clock */
   int64_t offset_ns; /* added to the caller's capture times (rebases a step back) */
+  int switch_next;   /* the next frame is the first of another source (rtp_video_clock_switch) */
+  uint64_t interval_ns; /* the spacing of the last two frames, the step a switch frame takes */
 } RtpVideoClock;
+
+/* The next frame mapped is the first of another source on this SSRC (a lane join or switch): its
+ * capture clock has its own origin, so that frame goes out one frame interval (the spacing of
+ * the last two frames) after the last one whichever way its time points, and the frames after
+ * it keep their own spacing. */
+void rtp_video_clock_switch(RtpVideoClock* clock);
 
 /* The capture time to send a frame with: `capture_time_ns` plus the clock's offset,
  * which grows whenever a frame's capture time is earlier than the previous frame's.

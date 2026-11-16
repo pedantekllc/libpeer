@@ -223,7 +223,14 @@ struct PeerConnection {
    * before srtp_protect. twcc_clock is reactor-only. */
   _Atomic uint8_t twcc_negotiated;
   uint8_t twcc_ext_id;
-  uint8_t rtx_negotiated;          /* the answer accepted the RTX payload type */
+  /* Video codecs, as bits (1u << MediaCodec). video_dual: the offer carried both codecs.
+   * video_negotiated: the codecs the answer kept (the offered ones until it arrives).
+   * rtx_codecs: the codecs whose RTX pair the answer kept. cur_video_codec: the codec
+   * the encoder packetizes now; it changes only at a keyframe, in send_video. */
+  uint8_t video_dual;
+  uint8_t video_negotiated;
+  uint8_t rtx_codecs;
+  _Atomic int cur_video_codec;
   /* Playout-delay extension (rtp.h): pd_ext_id is the answer's id for it, 0 when the
    * answer dropped it (the reactor writes it once, at the answer). pd_send and pd_bytes
    * are written by peer_connection_set_playout_delay and read at the send chokepoint,
@@ -434,7 +441,11 @@ static size_t peer_connection_rtx_build(PeerConnection* pc, uint16_t seq, uint8_
   size_t out_len = 0;
   pthread_mutex_lock(&pc->rtx_mtx);
   rtx_slot_t* slot = rtx_history_find(&pc->rtx_hist, seq);
-  if (slot) {
+  /* The pair the offer made for the original's codec; none when the answer kept no RTX for it. */
+  const int orig_pt = slot ? (slot->data[1] & 0x7f) : -1;
+  const int rtx_pt = rtp_rtx_pt(orig_pt, pc->video_dual);
+  const MediaCodec orig_codec = orig_pt == PT_H265 ? CODEC_H265 : CODEC_H264;
+  if (slot && rtx_pt >= 0 && (pc->rtx_codecs & (1u << orig_codec))) {
     size_t off = rtp_payload_offset(slot->data, slot->len);
     /* header + extensions verbatim, then OSN, then original payload */
     memcpy(buf, slot->data, off);
@@ -444,7 +455,7 @@ static size_t peer_connection_rtx_build(PeerConnection* pc, uint16_t seq, uint8_
     out_len = slot->len + 2;
     /* rewrite identity: RTX PT (marker preserved), own seq, RTX SSRC */
     uint16_t rseq = pc->rtx_seq++;
-    buf[1] = (uint8_t)((buf[1] & 0x80) | PT_RTX);
+    buf[1] = (uint8_t)((buf[1] & 0x80) | rtx_pt);
     buf[2] = (uint8_t)(rseq >> 8);
     buf[3] = (uint8_t)(rseq & 0xFF);
     buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = RTX_SSRC;
@@ -1193,7 +1204,8 @@ void* peer_connection_get_sctp(PeerConnection* pc) {
 /* Padding-only packets ride the RTX SSRC when RTX was negotiated; otherwise
  * the video SSRC, drawing from the media sequence space. */
 static int peer_connection_probe_uses_rtx(PeerConnection* pc) {
-  return pc->config.rtx && pc->rtx_hist.slots && pc->rtx_negotiated;
+  return pc->config.rtx && pc->rtx_hist.slots &&
+         (pc->rtx_codecs & (1u << atomic_load(&pc->cur_video_codec)));
 }
 
 static void peer_connection_probe_send_one(PeerConnection* pc) {
@@ -1203,13 +1215,13 @@ static void peer_connection_probe_send_one(PeerConnection* pc) {
   uint16_t seq = 0; /* the video SSRC's seq is written under send_mtx below */
   int rtx = peer_connection_probe_uses_rtx(pc);
   if (rtx) {
-    pt = PT_RTX;
+    pt = (uint8_t)rtp_rtx_pt(rtp_video_pt(atomic_load(&pc->cur_video_codec)), pc->video_dual);
     ssrc = RTX_SSRC;
     pthread_mutex_lock(&pc->rtx_mtx);
     seq = pc->rtx_seq++;
     pthread_mutex_unlock(&pc->rtx_mtx);
   } else {
-    pt = (uint8_t)rtp_video_pt(pc->config.video_codec);
+    pt = (uint8_t)rtp_video_pt(atomic_load(&pc->cur_video_codec));
     ssrc = pc->vrtp_encoder.ssrc;
   }
   size_t size = twcc_build_padding_packet(buf, sizeof(buf), pt, ssrc, seq, pc->last_rtp_ts, pc->twcc_ext_id);
@@ -1384,6 +1396,12 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   }
 
   if (pc->config.video_codec) {
+    /* Both codecs are offered when a second one is configured and FEC is off (RED/ULPFEC
+     * have no dual variant); the offer is the set until the answer narrows it. */
+    pc->video_dual = pc->config.video_codec_alt != CODEC_NONE && !pc->config.fec ? 1 : 0;
+    pc->video_negotiated = (uint8_t)(1u << pc->config.video_codec);
+    if (pc->video_dual) pc->video_negotiated |= (uint8_t)(1u << pc->config.video_codec_alt);
+    atomic_store(&pc->cur_video_codec, (int)pc->config.video_codec);
     rtp_encoder_init(&pc->vrtp_encoder, pc->config.video_codec,
                      peer_connection_outgoing_rtp_packet, (void*)pc);
 
@@ -1445,9 +1463,24 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
   return rtp_encoder_encode(&pc->artp_encoder, buf, len, 0);
 }
 
-int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len, uint64_t capture_time_ns, uint64_t queue_limit_ns) {
+void peer_connection_mark_stream_switch(PeerConnection* pc) {
+  rtp_video_clock_switch(&pc->video_clock);
+}
+
+int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, const uint8_t* buf, size_t len, uint64_t capture_time_ns, uint64_t queue_limit_ns) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
     return -1;
+  }
+  if (!(pc->video_negotiated & (1u << codec))) {
+    return -1;
+  }
+  if ((int)codec != atomic_load(&pc->cur_video_codec)) {
+    /* The codec changes between access units and only at a keyframe: a frame of another
+     * codec that is not one is dropped, so a packet of one codec never carries the other's
+     * payload type mid-frame or ahead of its parameter sets. */
+    if (!key) return 0;
+    rtp_encoder_set_video_codec(&pc->vrtp_encoder, codec);
+    atomic_store(&pc->cur_video_codec, (int)codec);
   }
   /* A frame captured earlier than the last one sent on this pc (a join's keyframe
    * after frames already sent) is rebased onto the stream's clock: the RTP timestamp,
@@ -1945,6 +1978,8 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   Agent* agent = &pc->agent;
   uint8_t twcc_id = 0, pd_id = 0;
   int twcc_ext_found = 0, twcc_fb_found = 0, rtx_found = 0, pd_found = 0;
+  uint8_t answered_codecs = 0, answered_rtx = 0;
+  int in_video = 0;
 
   while ((line = strstr(start, "\r\n"))) {
     line = strstr(start, "\r\n");
@@ -1960,6 +1995,17 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
       if (!pd_found && sdp_find_extmap_id(buf, RTP_PLAYOUT_DELAY_URI, &pd_id)) pd_found = 1;
       if (strstr(buf, "a=rtcp-fb:") && strstr(buf, " transport-cc")) twcc_fb_found = 1;
       if (strstr(buf, "a=rtpmap:") && strstr(buf, "rtx/90000")) rtx_found = 1;
+      if (strstr(buf, "m=video")) in_video = 1;
+      else if (strstr(buf, "m=")  == buf) in_video = 0;
+      if (in_video && strstr(buf, "a=rtpmap:")) {
+        if (strstr(buf, " H264/90000")) answered_codecs |= (uint8_t)(1u << CODEC_H264);
+        if (strstr(buf, " H265/90000")) answered_codecs |= (uint8_t)(1u << CODEC_H265);
+      }
+      if (in_video && strstr(buf, "a=fmtp:") && strstr(buf, "apt=")) {
+        const int apt = atoi(strstr(buf, "apt=") + 4);
+        if (apt == PT_H264) answered_rtx |= (uint8_t)(1u << CODEC_H264);
+        if (apt == PT_H265) answered_rtx |= (uint8_t)(1u << CODEC_H265);
+      }
     }
 
     if (strstr(buf, "a=fingerprint")) {
@@ -1991,7 +2037,20 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   }
 
   if (type == SDP_TYPE_ANSWER) {
-    pc->rtx_negotiated = rtx_found ? 1 : 0;
+    if (pc->config.video_codec != CODEC_NONE) {
+      /* The answer's codecs narrow the offered set; an answer that names none leaves it. */
+      if (answered_codecs) pc->video_negotiated = answered_codecs;
+      /* A single-codec offer has one RTX pair, so an answer that keeps RTX keeps it for the
+       * codec; a dual offer's pairs are told apart by their apt. */
+      if (rtx_found && !answered_rtx && !pc->video_dual) answered_rtx = pc->video_negotiated;
+      pc->rtx_codecs = rtx_found ? (uint8_t)(answered_rtx & pc->video_negotiated) : 0;
+      /* An answer that keeps only one of the offered codecs leaves the encoder on it. */
+      if (!(pc->video_negotiated & (1u << atomic_load(&pc->cur_video_codec)))) {
+        const MediaCodec kept = (pc->video_negotiated & (1u << CODEC_H264)) ? CODEC_H264 : CODEC_H265;
+        rtp_encoder_set_video_codec(&pc->vrtp_encoder, kept);
+        atomic_store(&pc->cur_video_codec, (int)kept);
+      }
+    }
     atomic_store_explicit(&pc->pd_ext_id, pd_found && pd_id >= 1 && pd_id <= 14 ? pd_id : 0, memory_order_release);
     /* The estimator exists only when the answer keeps both the sequence-number
      * extension and the feedback request. */
@@ -2057,7 +2116,10 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   sdp_append(pc->sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
   sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
 
-  if (pc->config.video_codec == CODEC_H264) {
+  if (pc->video_dual) {
+    sdp_append_h264_h265(pc->sdp, pc->config.rtx && pc->rtx_hist.slots ? 1 : 0,
+                         pc->config.video_codec == CODEC_H265);
+  } else if (pc->config.video_codec == CODEC_H264) {
     if (pc->config.fec)
       sdp_append_h264_fec(pc->sdp);
     else if (pc->config.rtx && pc->rtx_hist.slots)
@@ -2188,6 +2250,10 @@ void peer_connection_on_transport_feedback(PeerConnection* pc,
 
 int peer_connection_transport_cc_negotiated(PeerConnection* pc) {
   return pc && peer_connection_twcc_on(pc);
+}
+
+unsigned peer_connection_negotiated_video_codecs(const PeerConnection* pc) {
+  return pc->video_negotiated;
 }
 
 int peer_connection_get_capture_ref(PeerConnection* pc, uint32_t* rtp, uint64_t* ntp) {

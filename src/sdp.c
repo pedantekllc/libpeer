@@ -62,6 +62,11 @@ void sdp_reset(char* sdp) {
   memset(sdp, 0, CONFIG_SDP_BUFFER_SIZE);
 }
 
+/* The RTX PT paired with video PT `pt` in a dual-codec offer. */
+static int rtx_pt_of(int pt) {
+  return rtp_rtx_pt(pt, 1);
+}
+
 void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 96");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
@@ -154,6 +159,46 @@ static void sdp_append_h265_section(char* sdp, int rtx, int fec) {
   if (rtx) {
     sdp_append(sdp, "a=ssrc:2 cname:webrtc-h265");
   }
+  sdp_append(sdp, "a=sendrecv");
+  sdp_append(sdp, "a=mid:video");
+  sdp_append(sdp, "a=rtcp-mux");
+}
+
+void sdp_append_h264_h265(char* sdp, int rtx, int h265_first) {
+  const int first = h265_first ? PT_H265 : PT_H264;
+  const int second = h265_first ? PT_H264 : PT_H265;
+  /* Each codec's RTX PT directly follows it in the m-line: 96 97 98 99. */
+  if (rtx) {
+    sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF %d %d %d %d", first, rtx_pt_of(first), second, rtx_pt_of(second));
+  } else {
+    sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF %d %d", first, second);
+  }
+  sdp_append(sdp, "c=IN IP4 0.0.0.0");
+  const int pts[2] = {first, second};
+  for (int i = 0; i < 2; i++) {
+    sdp_append(sdp, "a=rtcp-fb:%d nack", pts[i]);
+    sdp_append(sdp, "a=rtcp-fb:%d nack pli", pts[i]);
+    sdp_append(sdp, "a=rtcp-fb:%d transport-cc", pts[i]);
+  }
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_TRANSPORT_CC, TWCC_EXTMAP_URI);
+  sdp_append(sdp, "a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time");
+  sdp_append(sdp, "a=extmap:%d %s", RTP_EXT_ID_PLAYOUT_DELAY, RTP_PLAYOUT_DELAY_URI);
+  for (int i = 0; i < 2; i++) {
+    if (pts[i] == PT_H264) {
+      sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
+      sdp_append(sdp, "a=rtpmap:96 H264/90000");
+    } else {
+      sdp_append(sdp, "a=fmtp:%d level-id=93;profile-id=1;tier-flag=0;tx-mode=SRST", PT_H265);
+      sdp_append(sdp, "a=rtpmap:%d H265/90000", PT_H265);
+    }
+    if (rtx) {
+      sdp_append(sdp, "a=rtpmap:%d rtx/90000", rtx_pt_of(pts[i]));
+      sdp_append(sdp, "a=fmtp:%d apt=%d", rtx_pt_of(pts[i]), pts[i]);
+    }
+  }
+  if (rtx) sdp_append(sdp, "a=ssrc-group:FID 1 2");
+  sdp_append(sdp, "a=ssrc:1 cname:webrtc-video");
+  if (rtx) sdp_append(sdp, "a=ssrc:2 cname:webrtc-video");
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:video");
   sdp_append(sdp, "a=rtcp-mux");
