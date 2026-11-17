@@ -325,9 +325,13 @@ int agent_liveness_expired(const Agent* agent, uint32_t now_ms);
  * when there has been none. */
 int agent_liveness_age_ms(const Agent* agent, uint32_t now_ms, uint32_t* age_ms);
 
-int agent_select_candidate_pair(Agent* agent);
+int agent_select_candidate_pair(Agent* agent, uint32_t now_ms);
 
-int agent_connectivity_check(Agent* agent);
+int agent_connectivity_check(Agent* agent, uint32_t now_ms);
+
+/* Read and handle waiting STUN packets without sending checks. A reply that
+ * lands after its pair's window credits the pair in any state. */
+void agent_receive_pending(Agent* agent);
 
 void agent_clear_candidates(Agent* agent);
 
