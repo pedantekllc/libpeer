@@ -19,12 +19,9 @@
 /* Connectivity checks run on the wall clock: every in-progress pair sends a
  * check each AGENT_CONNCHECK_PERIOD_MS and stays in progress for
  * AGENT_PAIR_WINDOW_MS from its first check, however slow the replies are. All
- * pairs are checked at once, so a late-trickled pair starts at once. With no
- * end-of-candidates the session stops waiting for more candidates once none
- * has arrived for AGENT_CANDIDATE_QUIET_MS. */
+ * pairs are checked at once, so a late-trickled pair starts at once. */
 #define AGENT_CONNCHECK_PERIOD_MS 50
 #define AGENT_PAIR_WINDOW_MS 3000
-#define AGENT_CANDIDATE_QUIET_MS 3000
 // After the first pair succeeds, keep checking for up to this long if a
 // strictly higher-priority pair is still in progress, so a direct (host/prflx)
 // path can win over a relay that merely answered first. Bounded so a
@@ -48,8 +45,6 @@ void agent_clear_candidates(Agent* agent) {
   agent->mdns_timed_out = 0;
   agent->selected_remote_type = -1;
   agent->remote_end_of_candidates = 0;
-  agent->has_candidate_ms = 0;
-  agent->last_candidate_ms = 0;
   agent->gather_tasks_num = 0;
   agent->stash_count = 0;
   agent->has_liveness = 0;
@@ -71,10 +66,8 @@ int agent_mdns_pending(const Agent* agent) {
   return n;
 }
 
-int agent_ice_exhausted(const Agent* agent, uint32_t now_ms) {
-  if (agent_mdns_pending(agent) != 0 || agent_gathering(agent)) return 0;
-  if (agent->remote_end_of_candidates) return 1;
-  return agent->has_candidate_ms && (uint32_t)(now_ms - agent->last_candidate_ms) >= AGENT_CANDIDATE_QUIET_MS;
+int agent_ice_exhausted(const Agent* agent) {
+  return agent->remote_end_of_candidates && agent_mdns_pending(agent) == 0 && !agent_gathering(agent);
 }
 
 void agent_set_remote_end_of_candidates(Agent* agent) {
@@ -1094,11 +1087,17 @@ static int agent_higher_priority_pending(Agent* agent, uint64_t threshold) {
   return 0;
 }
 
-int agent_connectivity_check(Agent* agent, uint32_t now_ms) {
+void agent_receive_pending(Agent* agent) {
   uint8_t buf[1400];
+  int recv_count = 0;
+  while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
+    recv_count++;
+  }
+}
+
+int agent_connectivity_check(Agent* agent, uint32_t now_ms) {
   int i;
   int inprogress_count = 0;
-  int recv_count = 0;
 
   // Send binding requests to all in-progress pairs
   for (i = 0; i < agent->candidate_pairs_num; i++) {
@@ -1111,7 +1110,8 @@ int agent_connectivity_check(Agent* agent, uint32_t now_ms) {
       }
       if (p->conncheck == 0 || (uint32_t)(now_ms - p->last_check_ms) >= AGENT_CONNCHECK_PERIOD_MS) {
         agent_send_binding_to_pair(agent, p);
-        p->last_check_ms = now_ms;
+        /* Stagger: pairs that start together do not stay in lockstep. */
+        p->last_check_ms = now_ms - (p->conncheck == 0 ? (uint32_t)((i * 7) % AGENT_CONNCHECK_PERIOD_MS) : 0);
         p->conncheck++;
       }
     }
@@ -1119,9 +1119,7 @@ int agent_connectivity_check(Agent* agent, uint32_t now_ms) {
 
   // Drain pending packets first so responses can flip pairs to SUCCEEDED
   // before we evaluate which pair to commit to.
-  while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
-    recv_count++;
-  }
+  agent_receive_pending(agent);
 
   // Prefer the highest-priority succeeded pair, not whichever happened to
   // succeed first or sits earliest in the (partially unsorted) array. Relay
@@ -1178,17 +1176,11 @@ int agent_select_candidate_pair(Agent* agent, uint32_t now_ms) {
     }
   }
 
-  if (!agent->has_candidate_ms) {
-    agent->has_candidate_ms = 1;
-    agent->last_candidate_ms = now_ms;
-  }
-
   // Second pass: start every frozen pair. Kept running even after a pair has
   // succeeded so a higher-priority (direct) pair still gets started and a
   // chance to win the settle window.
   for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
-      agent->last_candidate_ms = now_ms;
       agent->candidate_pairs[i].conncheck = 0;
       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
       if (agent->nominated_pair == NULL) {
