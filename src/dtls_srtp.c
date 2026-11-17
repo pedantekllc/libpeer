@@ -845,12 +845,12 @@ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
 
   /* Anything else negative is an actual decrypt/protocol failure. The
    * dispatch loop checks `ret > 0` and silently skips otherwise, so log
-   * it here or the failure mode (corrupt record, bad MAC, TIMEOUT from a
-   * misbehaving BIO recv) is invisible. */
+   * it here or the failure mode (corrupt record, bad MAC, or TIMEOUT when
+   * the WANT_WRITE retry budget expires) is invisible. */
   if (ret < 0) {
     LOGE("dtls_srtp_read: mbedtls_ssl_read error %d (-0x%04x)%s",
          ret, (unsigned)(-ret),
-         ret == MBEDTLS_ERR_SSL_TIMEOUT ? " read timeout" : "");
+         ret == MBEDTLS_ERR_SSL_TIMEOUT ? " write-budget expired" : "");
   }
   return ret;
 }
