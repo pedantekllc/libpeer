@@ -1858,11 +1858,9 @@ int peer_connection_loop(PeerConnection* pc) {
             if (ret > 0) {
               sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
             } else if (ret < 0) {
-              /* dtls_srtp_read itself logs the mbedtls code; this LOGW marks
-               * the corresponding inbound wire packet so the two can be
-               * correlated when triaging silent drops. */
-              LOGW("DTLS dispatch: dropping %d-byte wire packet (decrypt failed) a=%p ret=%d",
-                   pc->agent_ret, (void*)&pc->sctp, ret);   /* TEMP: correlate to the wedged assoc */
+              /* dtls_srtp_read logs the mbedtls error name and code. */
+              LOGW("DTLS dispatch: mbedtls_ssl_read error %d on %d-byte wire packet a=%p",
+                   ret, pc->agent_ret, (void*)&pc->sctp);
             }
           } while (ret > 0);
           pl_dtls_read_ms += ports_get_epoch_time() - pl_dread_t0;
