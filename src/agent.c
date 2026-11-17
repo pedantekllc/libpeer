@@ -16,9 +16,12 @@
 #include "utils.h"
 
 #define AGENT_POLL_TIMEOUT 1
-#define AGENT_CONNCHECK_MAX 100
-#define AGENT_CONNCHECK_PERIOD 10
-#define AGENT_MAX_INPROGRESS 5  // Parallel pair checking
+/* Connectivity checks run on the wall clock: every in-progress pair sends a
+ * check each AGENT_CONNCHECK_PERIOD_MS and stays in progress for
+ * AGENT_PAIR_WINDOW_MS from its first check, however slow the replies are. All
+ * pairs are checked at once, so a late-trickled pair starts at once. */
+#define AGENT_CONNCHECK_PERIOD_MS 50
+#define AGENT_PAIR_WINDOW_MS 3000
 // After the first pair succeeds, keep checking for up to this long if a
 // strictly higher-priority pair is still in progress, so a direct (host/prflx)
 // path can win over a relay that merely answered first. Bounded so a
@@ -596,7 +599,7 @@ int agent_consent_tick(Agent* agent, uint32_t now_ms) {
  * pairs start FROZEN and are picked up by the normal check pump. */
 /* One pair per (local, remote). A remote candidate can reach the agent twice —
  * trickled, then again inside the answer — and pairing it twice puts identical
- * checks in the AGENT_MAX_INPROGRESS slots, starving candidates paired later. */
+ * checks, wasting the pair table. */
 static int agent_pair_exists(const Agent* agent, const IceCandidate* local, const IceCandidate* remote) {
   int i;
   for (i = 0; i < agent->candidate_pairs_num; i++) {
@@ -626,6 +629,8 @@ void agent_pair_remote_candidate(Agent* agent, IceCandidate* remote) {
     pair->priority = (uint64_t)agent->local_candidates[i].priority + (uint64_t)remote->priority;
     pair->state = ICE_CANDIDATE_STATE_FROZEN;
     pair->conncheck = 0;
+    pair->start_ms = 0;
+    pair->last_check_ms = 0;
     agent->candidate_pairs_num++;
   }
 }
@@ -644,6 +649,8 @@ void agent_pair_local_candidate(Agent* agent, IceCandidate* local) {
     pair->priority = (uint64_t)local->priority + (uint64_t)remote->priority;
     pair->state = ICE_CANDIDATE_STATE_FROZEN;
     pair->conncheck = 0;
+    pair->start_ms = 0;
+    pair->last_check_ms = 0;
     agent->candidate_pairs_num++;
   }
 }
@@ -777,6 +784,8 @@ int agent_add_prflx_candidate(Agent* agent, Address* addr) {
     pair->priority = (uint64_t)agent->local_candidates[i].priority + (uint64_t)prflx->priority;
     pair->state = ICE_CANDIDATE_STATE_INPROGRESS;
     pair->conncheck = 0;
+    pair->start_ms = 0;
+    pair->last_check_ms = 0;
     agent->candidate_pairs_num++;
   }
 
@@ -1078,29 +1087,39 @@ static int agent_higher_priority_pending(Agent* agent, uint64_t threshold) {
   return 0;
 }
 
-int agent_connectivity_check(Agent* agent) {
+void agent_receive_pending(Agent* agent) {
   uint8_t buf[1400];
+  int recv_count = 0;
+  while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
+    recv_count++;
+  }
+}
+
+int agent_connectivity_check(Agent* agent, uint32_t now_ms) {
   int i;
   int inprogress_count = 0;
-  int recv_count = 0;
 
   // Send binding requests to all in-progress pairs
   for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
       inprogress_count++;
-      // Send on first check (conncheck==0) and every PERIOD thereafter
-      if (agent->candidate_pairs[i].conncheck % AGENT_CONNCHECK_PERIOD == 0) {
-        agent_send_binding_to_pair(agent, &agent->candidate_pairs[i]);
+      IceCandidatePair* p = &agent->candidate_pairs[i];
+      // First check opens the pair's window; then one check per period.
+      if (p->conncheck == 0) {
+        p->start_ms = now_ms;
       }
-      agent->candidate_pairs[i].conncheck++;  // Increment AFTER the send decision
+      if (p->conncheck == 0 || (uint32_t)(now_ms - p->last_check_ms) >= AGENT_CONNCHECK_PERIOD_MS) {
+        agent_send_binding_to_pair(agent, p);
+        /* Stagger: pairs that start together do not stay in lockstep. */
+        p->last_check_ms = now_ms - (p->conncheck == 0 ? (uint32_t)((i * 7) % AGENT_CONNCHECK_PERIOD_MS) : 0);
+        p->conncheck++;
+      }
     }
   }
 
   // Drain pending packets first so responses can flip pairs to SUCCEEDED
   // before we evaluate which pair to commit to.
-  while (recv_count < 10 && agent_recv(agent, buf, sizeof(buf)) > 0) {
-    recv_count++;
-  }
+  agent_receive_pending(agent);
 
   // Prefer the highest-priority succeeded pair, not whichever happened to
   // succeed first or sits earliest in the (partially unsorted) array. Relay
@@ -1108,7 +1127,7 @@ int agent_connectivity_check(Agent* agent) {
   IceCandidatePair* best = agent_best_succeeded_pair(agent);
   if (best != NULL) {
     if (agent->first_success_time == 0) {
-      agent->first_success_time = ports_get_epoch_time();
+      agent->first_success_time = now_ms;
     }
     agent->selected_pair = best;
     agent->nominated_pair = best;
@@ -1117,7 +1136,7 @@ int agent_connectivity_check(Agent* agent) {
     // (e.g. the direct path while a relay answered first), don't commit yet —
     // give it a bounded chance to win so we keep media off the relay.
     if (agent_higher_priority_pending(agent, best->priority) &&
-        (uint32_t)(ports_get_epoch_time() - agent->first_success_time) < AGENT_PAIR_SETTLE_MS) {
+        (uint32_t)(now_ms - agent->first_success_time) < AGENT_PAIR_SETTLE_MS) {
       return -1;
     }
 
@@ -1133,7 +1152,7 @@ int agent_connectivity_check(Agent* agent) {
   return -1;
 }
 
-int agent_select_candidate_pair(Agent* agent) {
+int agent_select_candidate_pair(Agent* agent, uint32_t now_ms) {
   int i;
   int inprogress_count = 0;
   int succeeded_count = 0;
@@ -1147,19 +1166,20 @@ int agent_select_candidate_pair(Agent* agent) {
       succeeded_count++;
     } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
       inprogress_count++;
-      // Check for timeout (conncheck is incremented in agent_connectivity_check)
-      if (agent->candidate_pairs[i].conncheck >= AGENT_CONNCHECK_MAX) {
+      // The window opens at the pair's first check (agent_connectivity_check).
+      if (agent->candidate_pairs[i].conncheck > 0 &&
+          (uint32_t)(now_ms - agent->candidate_pairs[i].start_ms) >= AGENT_PAIR_WINDOW_MS) {
         agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
         inprogress_count--;
-        LOGD("Pair %d failed after %d checks", i, AGENT_CONNCHECK_MAX);
+        LOGD("Pair %d failed: no reply within %d ms", i, AGENT_PAIR_WINDOW_MS);
       }
     }
   }
 
-  // Second pass: start frozen pairs if we have room (parallel checking). Kept
-  // running even after a pair has succeeded so a higher-priority (direct) pair
-  // still gets started and a chance to win the settle window.
-  for (i = 0; i < agent->candidate_pairs_num && inprogress_count < AGENT_MAX_INPROGRESS; i++) {
+  // Second pass: start every frozen pair. Kept running even after a pair has
+  // succeeded so a higher-priority (direct) pair still gets started and a
+  // chance to win the settle window.
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
       agent->candidate_pairs[i].conncheck = 0;
       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;

@@ -48,7 +48,9 @@ struct IceCandidatePair {
   IceCandidateState state;
   IceCandidate* local;
   IceCandidate* remote;
-  int conncheck;
+  int conncheck;          /* checks sent                              */
+  uint32_t start_ms;      /* first check; opens the pair's window     */
+  uint32_t last_check_ms;
   uint64_t priority;
 };
 

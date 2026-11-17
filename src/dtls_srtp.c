@@ -313,7 +313,10 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
   mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &g_shared_cert.cert, NULL);
   mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &g_shared_cert.cert, &g_shared_cert.pkey);
   mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &g_shared_cert.ctr_drbg);
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+  /* Reads never time out: the pc loop polls non-blocking, and a read timer
+   * armed by one WANT_READ would fail the next datagram after an idle gap and
+   * lose it. The handshake keeps its own deadline (DTLS_HANDSHAKE_TIMEOUT_S). */
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 0);
 
   /* Configure DTLS-SRTP specific options */
   mbedtls_ssl_conf_dtls_srtp_protection_profiles(&dtls_srtp->conf, default_profiles);
@@ -842,11 +845,12 @@ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
 
   /* Anything else negative is an actual decrypt/protocol failure. The
    * dispatch loop checks `ret > 0` and silently skips otherwise, so log
-   * it here or the failure mode (corrupt record, bad MAC, TIMEOUT from a
-   * misbehaving BIO recv) is invisible. */
+   * it here or the failure mode (corrupt record, bad MAC, or TIMEOUT when
+   * the WANT_WRITE retry budget expires) is invisible. */
   if (ret < 0) {
-    LOGE("dtls_srtp_read: mbedtls_ssl_read returned %d (0x%04x)",
-         ret, (unsigned)(-ret));
+    LOGE("dtls_srtp_read: mbedtls_ssl_read error %d (-0x%04x)%s",
+         ret, (unsigned)(-ret),
+         ret == MBEDTLS_ERR_SSL_TIMEOUT ? " write-budget expired" : "");
   }
   return ret;
 }

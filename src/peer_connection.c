@@ -1680,7 +1680,7 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
-      if (agent_select_candidate_pair(&pc->agent) < 0) {
+      if (agent_select_candidate_pair(&pc->agent, ports_get_epoch_time()) < 0) {
         /* Nothing succeeded and nothing is in progress. That is failure ONLY
          * once no further remote candidate can arrive (RFC 8838): the remote
          * has sent end-of-candidates and no .local name is still resolving.
@@ -1688,7 +1688,8 @@ int peer_connection_loop(PeerConnection* pc) {
          * routinely lands before its srflx/relay trickle does, and the
          * trickled candidate is paired the moment it arrives
          * (peer_connection_add_ice_candidate). The wait is bounded by the
-         * caller's gather timeout, not by this loop. */
+         * caller's gather timeout. Replies still on their way are read, so
+         * one that lands after its pair's window still connects. */
         if (agent_ice_exhausted(&pc->agent)) {
           pc->ice_failure = (pc->agent.candidate_pairs_num == 0)
                                 ? PEER_ICE_FAILURE_NO_PAIRS
@@ -1698,8 +1699,10 @@ int peer_connection_loop(PeerConnection* pc) {
                                                              : "all checks failed",
                pc->agent.candidate_pairs_num);
           STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        } else {
+          agent_receive_pending(&pc->agent);
         }
-      } else if (agent_connectivity_check(&pc->agent) == 0) {
+      } else if (agent_connectivity_check(&pc->agent, ports_get_epoch_time()) == 0) {
         pc->b_dtls_handshake_logged = 0;  /* fresh handshake attempt: re-arm the once-only log below */
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
@@ -1858,11 +1861,9 @@ int peer_connection_loop(PeerConnection* pc) {
             if (ret > 0) {
               sctp_incoming_data(&pc->sctp, (char*)pc->temp_buf, ret);
             } else if (ret < 0) {
-              /* dtls_srtp_read itself logs the mbedtls code; this LOGW marks
-               * the corresponding inbound wire packet so the two can be
-               * correlated when triaging silent drops. */
-              LOGW("DTLS dispatch: dropping %d-byte wire packet (decrypt failed) a=%p ret=%d",
-                   pc->agent_ret, (void*)&pc->sctp, ret);   /* TEMP: correlate to the wedged assoc */
+              /* dtls_srtp_read logs the mbedtls error name and code. */
+              LOGW("DTLS dispatch: mbedtls_ssl_read error %d on %d-byte wire packet a=%p",
+                   ret, pc->agent_ret, (void*)&pc->sctp);
             }
           } while (ret > 0);
           pl_dtls_read_ms += ports_get_epoch_time() - pl_dread_t0;
