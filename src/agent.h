@@ -153,6 +153,8 @@ struct Agent {
   uint32_t last_consent_sent_ms;
   int has_consent_sent;
   uint32_t consent_sent_total;  /* consent checks sent this attempt          */
+  uint32_t last_candidate_ms;   /* when the newest pair started checking (or checks began) */
+  int has_candidate_ms;
   uint32_t first_success_time;  // ms (ports_get_epoch_time) of first pair success; 0 = none yet
   AgentState state;
 
@@ -213,10 +215,11 @@ struct Agent {
 };
 
 /* 1 when no further remote candidate can arrive: the remote has signalled
- * end-of-candidates AND no parked .local candidate is still resolving. Only
+ * end-of-candidates (or no pair has started for 3 s) AND no parked .local
+ * candidate is still resolving. Only
  * then may a check list with no succeeded/in-progress pair be declared
  * failed (peer_connection_loop). */
-int agent_ice_exhausted(const Agent* agent);
+int agent_ice_exhausted(const Agent* agent, uint32_t now_ms);
 
 /* Count of parked .local candidates still awaiting resolution. */
 int agent_mdns_pending(const Agent* agent);
@@ -325,9 +328,9 @@ int agent_liveness_expired(const Agent* agent, uint32_t now_ms);
  * when there has been none. */
 int agent_liveness_age_ms(const Agent* agent, uint32_t now_ms, uint32_t* age_ms);
 
-int agent_select_candidate_pair(Agent* agent);
+int agent_select_candidate_pair(Agent* agent, uint32_t now_ms);
 
-int agent_connectivity_check(Agent* agent);
+int agent_connectivity_check(Agent* agent, uint32_t now_ms);
 
 void agent_clear_candidates(Agent* agent);
 

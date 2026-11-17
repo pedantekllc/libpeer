@@ -1680,16 +1680,17 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
-      if (agent_select_candidate_pair(&pc->agent) < 0) {
+      if (agent_select_candidate_pair(&pc->agent, ports_get_epoch_time()) < 0) {
         /* Nothing succeeded and nothing is in progress. That is failure ONLY
          * once no further remote candidate can arrive (RFC 8838): the remote
-         * has sent end-of-candidates and no .local name is still resolving.
+         * has sent end-of-candidates (or none arrived for 3 s) and no .local name is
+         * still resolving.
          * Before that it is an empty check list — the browser's answer
          * routinely lands before its srflx/relay trickle does, and the
          * trickled candidate is paired the moment it arrives
-         * (peer_connection_add_ice_candidate). The wait is bounded by the
-         * caller's gather timeout, not by this loop. */
-        if (agent_ice_exhausted(&pc->agent)) {
+         * (peer_connection_add_ice_candidate). Without end-of-candidates the
+         * wait ends once no candidate has arrived for 3 s. */
+        if (agent_ice_exhausted(&pc->agent, ports_get_epoch_time())) {
           pc->ice_failure = (pc->agent.candidate_pairs_num == 0)
                                 ? PEER_ICE_FAILURE_NO_PAIRS
                                 : PEER_ICE_FAILURE_CHECKS_FAILED;
@@ -1699,7 +1700,7 @@ int peer_connection_loop(PeerConnection* pc) {
                pc->agent.candidate_pairs_num);
           STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
         }
-      } else if (agent_connectivity_check(&pc->agent) == 0) {
+      } else if (agent_connectivity_check(&pc->agent, ports_get_epoch_time()) == 0) {
         pc->b_dtls_handshake_logged = 0;  /* fresh handshake attempt: re-arm the once-only log below */
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
