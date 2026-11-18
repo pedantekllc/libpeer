@@ -19,6 +19,7 @@
 #include "send_seq.h"
 #include "rtp.h"
 #include "rtx_history.h"
+#include "rtx_stats.h"
 #include "sctp.h"
 #include "sdp.h"
 #include "twcc.h"
@@ -200,6 +201,8 @@ struct PeerConnection {
    * the shared pacer and sleeps outside every lock. The probe thread is the same
    * pattern. */
   uint16_t rtx_q[RTX_QUEUE_SLOTS];
+  uint32_t rtx_q_ms[RTX_QUEUE_SLOTS]; /* NACK arrival of each queued seq        */
+  rtx_stats rtx_st;                   /* guarded by rtx_mtx                      */
   unsigned rtx_q_first;
   unsigned rtx_q_n;
   pthread_cond_t rtx_cv;
@@ -430,7 +433,7 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
 static void peer_connection_rtx_store(PeerConnection* pc, const uint8_t* data, size_t size) {
   if (!pc->rtx_hist.slots) return;
   pthread_mutex_lock(&pc->rtx_mtx);
-  rtx_history_store(&pc->rtx_hist, data, size);
+  rtx_history_store(&pc->rtx_hist, data, size, rtx_now_ms());
   pthread_mutex_unlock(&pc->rtx_mtx);
 }
 
@@ -442,6 +445,7 @@ static size_t peer_connection_rtx_build(PeerConnection* pc, uint16_t seq, uint8_
   pthread_mutex_lock(&pc->rtx_mtx);
   rtx_slot_t* slot = rtx_history_find(&pc->rtx_hist, seq);
   /* The pair the offer made for the original's codec; none when the answer kept no RTX for it. */
+  if (!slot) rtx_stats_on_miss(&pc->rtx_st);
   const int orig_pt = slot ? (slot->data[1] & 0x7f) : -1;
   const int rtx_pt = rtp_rtx_pt(orig_pt, pc->video_dual);
   const MediaCodec orig_codec = orig_pt == PT_H265 ? CODEC_H265 : CODEC_H264;
@@ -478,6 +482,7 @@ static void* peer_connection_rtx_main(void* arg) {
       return NULL;
     }
     uint16_t seq = pc->rtx_q[pc->rtx_q_first];
+    const uint32_t queued_ms = pc->rtx_q_ms[pc->rtx_q_first];
     pc->rtx_q_first = (pc->rtx_q_first + 1) % RTX_QUEUE_SLOTS;
     pc->rtx_q_n--;
     pthread_mutex_unlock(&pc->rtx_mtx);
@@ -485,6 +490,10 @@ static void* peer_connection_rtx_main(void* arg) {
     size_t out_len = peer_connection_rtx_build(pc, seq, buf);
     if (out_len == 0) continue;
     peer_connection_pace(pc, out_len + 10, 0);
+    const uint32_t wait_ms = rtx_now_ms() - queued_ms;
+    pthread_mutex_lock(&pc->rtx_mtx);
+    rtx_stats_on_sent(&pc->rtx_st, wait_ms);
+    pthread_mutex_unlock(&pc->rtx_mtx);
     pthread_mutex_lock(&pc->send_mtx);
     peer_connection_twcc_stamp(pc, buf, out_len);
     dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, buf, (int*)&out_len);
@@ -499,10 +508,9 @@ static void* peer_connection_rtx_main(void* arg) {
  * (the receiver NACKs again). */
 static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_lock(&pc->rtx_mtx);
-  rtx_slot_t* slot = rtx_history_find(&pc->rtx_hist, seq);
   uint32_t now = rtx_now_ms();
-  if (slot && pc->rtx_q_n < RTX_QUEUE_SLOTS &&
-      (slot->last_resend_ms == 0 || now - slot->last_resend_ms >= RTX_MIN_RESEND_MS)) {
+  rtx_slot_t* slot = rtx_stats_on_nack_seq(&pc->rtx_st, &pc->rtx_hist, seq, now, RTX_MIN_RESEND_MS);
+  if (slot && pc->rtx_q_n < RTX_QUEUE_SLOTS) {
     if (!pc->rtx_thread_started) {
       if (pthread_create(&pc->rtx_thread, NULL, peer_connection_rtx_main, pc) != 0) {
         pthread_mutex_unlock(&pc->rtx_mtx);
@@ -512,6 +520,7 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
       pc->rtx_thread_started = 1;
     }
     slot->last_resend_ms = now;
+    pc->rtx_q_ms[(pc->rtx_q_first + pc->rtx_q_n) % RTX_QUEUE_SLOTS] = now;
     pc->rtx_q[(pc->rtx_q_first + pc->rtx_q_n) % RTX_QUEUE_SLOTS] = seq;
     pc->rtx_q_n++;
     pthread_cond_signal(&pc->rtx_cv);
@@ -1096,6 +1105,9 @@ static void peer_connection_walk_twcc(void* ctx, const uint8_t* pkt, size_t len)
 static void peer_connection_walk_keyframe(void* ctx) {
   PeerConnection* pc = (PeerConnection*)ctx;
   LOGD("RTCP_PSFB keyframe request");
+  pthread_mutex_lock(&pc->rtx_mtx);
+  rtx_stats_on_pli(&pc->rtx_st);
+  pthread_mutex_unlock(&pc->rtx_mtx);
   if (pc->config.on_request_keyframe) pc->config.on_request_keyframe(pc->config.user_data);
 }
 
@@ -1108,6 +1120,15 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
   };
   rtcp_walk_result res = rtcp_walk(buf, len, &ops, pc);
   if (res.status != RTCP_WALK_OK) LOGD("rtcp: compound stopped after %zu packets (status %d)", res.packets, (int)res.status);
+}
+
+int peer_connection_rtx_stats_drain(PeerConnection* pc, rtx_stats_snapshot* out) {
+  if (!pc || !out) return -1;
+  pthread_mutex_lock(&pc->rtx_mtx);
+  *out = rtx_stats_drain(&pc->rtx_st);
+  out->hist_oldest_ms = rtx_history_oldest_age_ms(&pc->rtx_hist, rtx_now_ms());
+  pthread_mutex_unlock(&pc->rtx_mtx);
+  return 0;
 }
 
 int peer_connection_rtt_ms(PeerConnection* pc, uint32_t* out) {
@@ -1366,6 +1387,7 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
 
   /* RTX: history ring + lock (skipped entirely when disabled). */
   pthread_mutex_init(&pc->rtx_mtx, NULL);
+  rtx_stats_init(&pc->rtx_st);
   pthread_mutex_init(&pc->send_mtx, NULL);
   pthread_mutex_init(&pc->probe_mtx, NULL);
   pthread_cond_init(&pc->probe_cv, NULL);
