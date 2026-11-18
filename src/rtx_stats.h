@@ -6,7 +6,7 @@
  *
  * Counts what the NACK path does: NACKed packets received, retransmits sent,
  * NACKs the history could no longer answer, NACKs the repeat guard dropped, PLIs
- * received, and how long a sent retransmit waited between its NACK arriving and
+ * received, retransmits dropped for waiting too long, and how long a sent retransmit waited between its NACK arriving and
  * leaving the pacer (max and median over the window). Counters only; nothing
  * here changes what is sent.
  *
@@ -26,6 +26,7 @@ typedef struct {
   uint32_t miss;       /* named packets the history no longer held              */
   uint32_t suppressed; /* named packets inside the repeat guard                 */
   uint32_t pli;        /* PLI / FIR received                                    */
+  uint32_t stale;      /* queued retransmits dropped unsent for waiting too long */
   uint32_t wait_max_ms;
   uint32_t wait_p50_ms;
   uint32_t wait_n;     /* retransmits with a wait sample (the window's sent)    */
@@ -33,7 +34,7 @@ typedef struct {
 } rtx_stats_snapshot;
 
 typedef struct {
-  uint32_t nacked, sent, miss, suppressed, pli;
+  uint32_t nacked, sent, miss, suppressed, pli, stale;
   uint32_t wait_n;     /* sent retransmits whose wait was measured              */
   uint32_t wait_max_ms;
   uint16_t waits[RTX_STATS_WAIT_SAMPLES]; /* first samples of the window, ms, saturated */
@@ -42,10 +43,30 @@ typedef struct {
 void rtx_stats_init(rtx_stats* s);
 void rtx_stats_on_miss(rtx_stats* s);
 void rtx_stats_on_pli(rtx_stats* s);
+/* A NACKed packet was already queued or being sent: counted as suppressed. */
+void rtx_stats_on_dup(rtx_stats* s);
+/* `n` queued retransmits were dropped unsent for waiting longer than RTX_QUEUE_MAX_AGE_MS. */
+void rtx_stats_on_stale(rtx_stats* s, uint32_t n);
+
+/* The connection's round trip time: known, or not measured yet. */
+typedef struct {
+  int known;
+  uint32_t ms; /* meaningful only when known */
+} rtx_rtt;
+
+/* The repeat guard: a packet is not retransmitted again until about one round trip
+ * after its last send, because a NACK sent before the first copy could arrive is not
+ * news. The RTT clamped to [RTX_GUARD_MIN_MS, RTX_GUARD_MAX_MS], or RTX_GUARD_FALLBACK_MS
+ * while the RTT is unknown. */
+#define RTX_GUARD_MIN_MS 20u
+#define RTX_GUARD_MAX_MS 250u
+#define RTX_GUARD_FALLBACK_MS 100u
+uint32_t rtx_guard_ms(rtx_rtt rtt);
 /* Answer one NACKed seq against the history and count it: nacked always, plus miss
  * (history no longer holds it) or suppressed (retransmitted less than `guard_ms`
  * ago). Returns the slot to retransmit, or NULL when nothing is to be sent. The
- * caller queues it, and stamps slot->last_resend_ms. */
+ * caller queues it (rtx_queue.h) and stamps the slot when the packet is SENT
+ * (rtx_history_mark_sent), so the guard counts from the last send. */
 rtx_slot_t* rtx_stats_on_nack_seq(rtx_stats* s, rtx_history* h, uint16_t seq, uint32_t now_ms,
                                   uint32_t guard_ms);
 

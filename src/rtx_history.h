@@ -51,4 +51,8 @@ uint32_t rtx_history_oldest_age_ms(const rtx_history* h, uint32_t now_ms);
 /* The slot holding `seq`, or NULL when it is no longer held. */
 rtx_slot_t* rtx_history_find(rtx_history* h, uint16_t seq);
 
+/* The packet `seq` left at `now_ms`: the repeat guard counts from here. No-op when
+ * it is no longer held. */
+void rtx_history_mark_sent(rtx_history* h, uint16_t seq, uint32_t now_ms);
+
 #endif /* RTX_HISTORY_H_ */

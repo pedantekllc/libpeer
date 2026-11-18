@@ -67,3 +67,8 @@ uint32_t rtx_history_oldest_age_ms(const rtx_history* h, uint32_t now_ms) {
   }
   return oldest;
 }
+
+void rtx_history_mark_sent(rtx_history* h, uint16_t seq, uint32_t now_ms) {
+  rtx_slot_t* slot = rtx_history_find(h, seq);
+  if (slot) slot->last_resend_ms = now_ms;
+}

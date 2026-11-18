@@ -16,6 +16,20 @@ void rtx_stats_on_pli(rtx_stats* s) {
   s->pli++;
 }
 
+void rtx_stats_on_dup(rtx_stats* s) {
+  s->suppressed++;
+}
+
+void rtx_stats_on_stale(rtx_stats* s, uint32_t n) {
+  s->stale += n;
+}
+
+uint32_t rtx_guard_ms(rtx_rtt rtt) {
+  if (!rtt.known) return RTX_GUARD_FALLBACK_MS;
+  if (rtt.ms < RTX_GUARD_MIN_MS) return RTX_GUARD_MIN_MS;
+  return rtt.ms > RTX_GUARD_MAX_MS ? RTX_GUARD_MAX_MS : rtt.ms;
+}
+
 void rtx_stats_on_sent(rtx_stats* s, uint32_t wait_ms) {
   s->sent++;
   if (wait_ms > s->wait_max_ms) s->wait_max_ms = wait_ms;
@@ -48,6 +62,7 @@ rtx_stats_snapshot rtx_stats_drain(rtx_stats* s) {
       .miss = s->miss,
       .suppressed = s->suppressed,
       .pli = s->pli,
+      .stale = s->stale,
       .wait_max_ms = s->wait_max_ms,
       .wait_n = s->wait_n,
   };

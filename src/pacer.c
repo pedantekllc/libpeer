@@ -60,3 +60,35 @@ uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes,
   pthread_mutex_unlock(&p->mtx);
   return wait_ns;
 }
+
+uint64_t pacer_shared_take_rtx(pacer_shared* p, uint32_t bps, size_t bytes, uint64_t now_ns) {
+  if (bps == 0) return 0;
+  pthread_mutex_lock(&p->mtx);
+  pacer_state* st = &p->st;
+  if (!st->rtx_started) {
+    st->rtx_started = 1;
+    st->rtx_last_ns = now_ns;
+    st->rtx_budget_bytes = PACER_BURST_BYTES;
+  }
+  double rtx_rate = (double)bps * PACER_RTX_SHARE_PCT / 100.0;
+  st->rtx_budget_bytes += (double)(now_ns - st->rtx_last_ns) / 1e9 * rtx_rate / 8.0;
+  st->rtx_last_ns = now_ns;
+  if (st->rtx_budget_bytes > PACER_BURST_BYTES) st->rtx_budget_bytes = PACER_BURST_BYTES;
+  st->rtx_budget_bytes -= (double)bytes;
+
+  /* The media's bucket pays for the same bytes. */
+  if (st->started) {
+    st->budget_bytes += (double)(now_ns - st->last_ns) / 1e9 * (double)bps / 8.0;
+    st->last_ns = now_ns;
+    if (st->budget_bytes > PACER_BURST_BYTES) st->budget_bytes = PACER_BURST_BYTES;
+    st->budget_bytes -= (double)bytes;
+  }
+
+  uint64_t wait_ns = 0;
+  if (st->rtx_budget_bytes < 0) {
+    double w = -st->rtx_budget_bytes * 8.0 / rtx_rate * 1e9;
+    wait_ns = w > (double)PACER_MAX_SLEEP_NS ? PACER_MAX_SLEEP_NS : (uint64_t)w;
+  }
+  pthread_mutex_unlock(&p->mtx);
+  return wait_ns;
+}

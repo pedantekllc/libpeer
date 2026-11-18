@@ -19,6 +19,7 @@
 #include "send_seq.h"
 #include "rtp.h"
 #include "rtx_history.h"
+#include "rtx_queue.h"
 #include "rtx_stats.h"
 #include "sctp.h"
 #include "sdp.h"
@@ -63,8 +64,6 @@ typedef struct dtls_fragment_state_s dtls_fragment_state_t;
 /* NACKed seqs waiting for their pace: every packet the history can hold, so a
  * loss burst across a whole keyframe is queued at once. */
 #define RTX_QUEUE_SLOTS   RTX_HISTORY_MAX_SLOTS
-/* Don't answer repeat-NACKs for the same seq more often than this. */
-#define RTX_MIN_RESEND_MS 40
 
 
 struct PeerConnection {
@@ -200,11 +199,8 @@ struct PeerConnection {
    * and wakes this lazily started thread, which draws each packet's budget from
    * the shared pacer and sleeps outside every lock. The probe thread is the same
    * pattern. */
-  uint16_t rtx_q[RTX_QUEUE_SLOTS];
-  uint32_t rtx_q_ms[RTX_QUEUE_SLOTS]; /* NACK arrival of each queued seq        */
+  rtx_queue rtx_q;                    /* guarded by rtx_mtx; one entry per seq   */
   rtx_stats rtx_st;                   /* guarded by rtx_mtx                      */
-  unsigned rtx_q_first;
-  unsigned rtx_q_n;
   pthread_cond_t rtx_cv;
   pthread_t rtx_thread;
   int rtx_thread_started;
@@ -313,6 +309,18 @@ static inline uint64_t sb_mono_ns(void) {
 
 static uint64_t sb_mono_us(void) {
   return sb_mono_ns() / 1000u;
+}
+
+/* A retransmission takes its budget ahead of the media (pacer_shared_take_rtx). */
+static void peer_connection_pace_rtx(PeerConnection* pc, size_t bytes) {
+  uint32_t bps = pc->pacer_bps;
+  if (bps == 0) return;
+  uint64_t wait_ns = pacer_shared_take_rtx(&pc->pacer, bps, bytes, sb_mono_ns());
+  if (wait_ns == 0) return;
+  struct timespec ts;
+  ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
+  ts.tv_nsec = (long)(wait_ns % 1000000000ull);
+  nanosleep(&ts, NULL);
 }
 
 /* `video` packets draw on the queue behind them (pacer_video_queue): the rest of the
@@ -475,24 +483,32 @@ static void* peer_connection_rtx_main(void* arg) {
   uint8_t buf[RTX_SLOT_BYTES + 2 + 64];   /* +OSN +SRTP trailer slack */
   for (;;) {
     pthread_mutex_lock(&pc->rtx_mtx);
-    while (!atomic_load(&pc->rtx_stop) && pc->rtx_q_n == 0)
+    while (!atomic_load(&pc->rtx_stop) && pc->rtx_q.n == 0)
       pthread_cond_wait(&pc->rtx_cv, &pc->rtx_mtx);
     if (atomic_load(&pc->rtx_stop)) {
       pthread_mutex_unlock(&pc->rtx_mtx);
       return NULL;
     }
-    uint16_t seq = pc->rtx_q[pc->rtx_q_first];
-    const uint32_t queued_ms = pc->rtx_q_ms[pc->rtx_q_first];
-    pc->rtx_q_first = (pc->rtx_q_first + 1) % RTX_QUEUE_SLOTS;
-    pc->rtx_q_n--;
+    uint16_t seq = 0;
+    uint32_t queued_ms = 0, stale = 0;
+    int have = rtx_queue_pop(&pc->rtx_q, rtx_now_ms(), &seq, &queued_ms, &stale);
+    rtx_stats_on_stale(&pc->rtx_st, stale);
     pthread_mutex_unlock(&pc->rtx_mtx);
+    if (!have) continue;
 
     size_t out_len = peer_connection_rtx_build(pc, seq, buf);
-    if (out_len == 0) continue;
-    peer_connection_pace(pc, out_len + 10, 0);
-    const uint32_t wait_ms = rtx_now_ms() - queued_ms;
+    if (out_len == 0) {
+      pthread_mutex_lock(&pc->rtx_mtx);
+      rtx_queue_done(&pc->rtx_q, seq);
+      pthread_mutex_unlock(&pc->rtx_mtx);
+      continue;
+    }
+    peer_connection_pace_rtx(pc, out_len + 10);
+    const uint32_t now_ms = rtx_now_ms();
     pthread_mutex_lock(&pc->rtx_mtx);
-    rtx_stats_on_sent(&pc->rtx_st, wait_ms);
+    rtx_stats_on_sent(&pc->rtx_st, now_ms - queued_ms);
+    rtx_history_mark_sent(&pc->rtx_hist, seq, now_ms);
+    rtx_queue_done(&pc->rtx_q, seq);
     pthread_mutex_unlock(&pc->rtx_mtx);
     pthread_mutex_lock(&pc->send_mtx);
     peer_connection_twcc_stamp(pc, buf, out_len);
@@ -504,13 +520,15 @@ static void* peer_connection_rtx_main(void* arg) {
 
 /* Queue one NACKed sequence number for retransmission. Reactor thread: takes
  * only rtx_mtx and never sleeps; the pace happens on the RTX thread. A repeat
- * NACK inside RTX_MIN_RESEND_MS, or one that finds the queue full, is dropped
- * (the receiver NACKs again). */
+ * NACK inside the guard of the last send (about one RTT), for a seq already queued, or
+ * one that finds the queue full, is dropped (the receiver NACKs again). */
 static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_lock(&pc->rtx_mtx);
   uint32_t now = rtx_now_ms();
-  rtx_slot_t* slot = rtx_stats_on_nack_seq(&pc->rtx_st, &pc->rtx_hist, seq, now, RTX_MIN_RESEND_MS);
-  if (slot && pc->rtx_q_n < RTX_QUEUE_SLOTS) {
+  uint32_t rtt_ms = 0;
+  rtx_rtt rtt = {.known = peer_connection_rtt_ms(pc, &rtt_ms) == 0, .ms = rtt_ms};
+  rtx_slot_t* slot = rtx_stats_on_nack_seq(&pc->rtx_st, &pc->rtx_hist, seq, now, rtx_guard_ms(rtt));
+  if (slot) {
     if (!pc->rtx_thread_started) {
       if (pthread_create(&pc->rtx_thread, NULL, peer_connection_rtx_main, pc) != 0) {
         pthread_mutex_unlock(&pc->rtx_mtx);
@@ -519,11 +537,9 @@ static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
       }
       pc->rtx_thread_started = 1;
     }
-    slot->last_resend_ms = now;
-    pc->rtx_q_ms[(pc->rtx_q_first + pc->rtx_q_n) % RTX_QUEUE_SLOTS] = now;
-    pc->rtx_q[(pc->rtx_q_first + pc->rtx_q_n) % RTX_QUEUE_SLOTS] = seq;
-    pc->rtx_q_n++;
-    pthread_cond_signal(&pc->rtx_cv);
+    rtx_push_result r = rtx_queue_push(&pc->rtx_q, seq, now);
+    if (r == RTX_PUSH_DUP) rtx_stats_on_dup(&pc->rtx_st);
+    if (r == RTX_PUSH_QUEUED) pthread_cond_signal(&pc->rtx_cv);
   }
   pthread_mutex_unlock(&pc->rtx_mtx);
 }
@@ -1396,6 +1412,10 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   if (pc->config.rtx) {
     if (rtx_history_init(&pc->rtx_hist, RTX_HISTORY_INITIAL_SLOTS, RTX_HISTORY_MAX_SLOTS) != 0)
       LOGW("rtx history alloc failed - retransmissions disabled for this peer");
+    else if (rtx_queue_init(&pc->rtx_q, RTX_QUEUE_SLOTS) != 0) {
+      LOGW("rtx queue alloc failed - retransmissions disabled for this peer");
+      rtx_history_free(&pc->rtx_hist);
+    }
   }
 
   /* Propagate the optional interface pin into the agent BEFORE agent_create so
@@ -1458,6 +1478,7 @@ void peer_connection_destroy(PeerConnection* pc) {
     if (pc->frag_state) {
       free(pc->frag_state);
     }
+    rtx_queue_free(&pc->rtx_q);
     rtx_history_free(&pc->rtx_hist);
     twcc_sender_deinit(&pc->twcc_tx);
     pthread_mutex_destroy(&pc->rtx_mtx);
