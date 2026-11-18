@@ -34,7 +34,7 @@ static void grow(rtx_history* h) {
   h->cap = cap;
 }
 
-void rtx_history_store(rtx_history* h, const uint8_t* pkt, size_t len) {
+void rtx_history_store(rtx_history* h, const uint8_t* pkt, size_t len, uint32_t now_ms) {
   if (!h->slots || len < 12 || len > RTX_SLOT_BYTES) return;
   h->frame_pkts++;
   while (h->frame_pkts * 2 > h->cap && h->cap < h->max_cap) {
@@ -47,6 +47,7 @@ void rtx_history_store(rtx_history* h, const uint8_t* pkt, size_t len) {
   slot->seq = seq;
   slot->len = (uint16_t)len;
   slot->last_resend_ms = 0;
+  slot->stored_ms = now_ms;
   memcpy(slot->data, pkt, len);
   if (pkt[1] & 0x80) h->frame_pkts = 0;
 }
@@ -55,4 +56,19 @@ rtx_slot_t* rtx_history_find(rtx_history* h, uint16_t seq) {
   if (!h->slots) return NULL;
   rtx_slot_t* slot = &h->slots[seq % h->cap];
   return slot->len >= 12 && slot->seq == seq ? slot : NULL;
+}
+
+uint32_t rtx_history_oldest_age_ms(const rtx_history* h, uint32_t now_ms) {
+  uint32_t oldest = 0;
+  for (unsigned i = 0; h->slots && i < h->cap; i++) {
+    if (!h->slots[i].len) continue;
+    uint32_t age = now_ms - h->slots[i].stored_ms;
+    if (age > oldest) oldest = age;
+  }
+  return oldest;
+}
+
+void rtx_history_mark_sent(rtx_history* h, uint16_t seq, uint32_t now_ms) {
+  rtx_slot_t* slot = rtx_history_find(h, seq);
+  if (slot) slot->last_resend_ms = now_ms;
 }

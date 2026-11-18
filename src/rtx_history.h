@@ -26,6 +26,7 @@ typedef struct {
   uint16_t seq;            /* media seq stored here (slot = seq % cap)  */
   uint16_t len;            /* 0 = empty                                 */
   uint32_t last_resend_ms; /* monotonic ms of its last retransmission   */
+  uint32_t stored_ms;      /* monotonic ms it was stored                */
   uint8_t data[RTX_SLOT_BYTES]; /* final pre-SRTP media packet          */
 } rtx_slot_t;
 
@@ -42,9 +43,16 @@ void rtx_history_free(rtx_history* h);
 
 /* Record one outgoing media packet. A packet shorter than an RTP header or
  * longer than a slot is not recorded. A failed grow keeps the current ring. */
-void rtx_history_store(rtx_history* h, const uint8_t* pkt, size_t len);
+void rtx_history_store(rtx_history* h, const uint8_t* pkt, size_t len, uint32_t now_ms);
+
+/* Age in ms of the oldest packet held at `now_ms`; 0 when empty. Scans the ring. */
+uint32_t rtx_history_oldest_age_ms(const rtx_history* h, uint32_t now_ms);
 
 /* The slot holding `seq`, or NULL when it is no longer held. */
 rtx_slot_t* rtx_history_find(rtx_history* h, uint16_t seq);
+
+/* The packet `seq` left at `now_ms`: the repeat guard counts from here. No-op when
+ * it is no longer held. */
+void rtx_history_mark_sent(rtx_history* h, uint16_t seq, uint32_t now_ms);
 
 #endif /* RTX_HISTORY_H_ */

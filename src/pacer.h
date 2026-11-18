@@ -36,10 +36,22 @@
 /* Per-packet sleep cap: guards against a pathological rate stalling a worker. */
 #define PACER_MAX_SLEEP_NS 50000000ull
 
+/* A retransmission's sleep is the time its share of the rate takes to repay one packet
+ * (a 1312-byte packet at 200 kbit is 105 ms), so the share holds strictly; the cap only
+ * guards a pathological rate. */
+#define PACER_RTX_MAX_SLEEP_NS 1000000000ull
+
+/* The share of the pace rate retransmissions may use, in percent (libwebrtc paces
+ * retransmissions ahead of media; the share keeps a NACK flood from starving it). */
+#define PACER_RTX_SHARE_PCT 50u
+
 typedef struct {
   double budget_bytes; /* current bucket level (may go negative) */
   uint64_t last_ns;
   int started;
+  double rtx_budget_bytes; /* retransmission bucket (pacer_shared_take_rtx) */
+  uint64_t rtx_last_ns;
+  int rtx_started;
 } pacer_state;
 
 /* A pacer that two threads draw on. The sleep a take returns is served by the
@@ -82,7 +94,13 @@ pacer_queue pacer_video_queue(uint64_t queue_limit_ns, uint64_t au_bytes, uint64
 uint64_t pacer_take(pacer_state* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns);
 
 /* pacer_take on the shared bucket. Media and retransmissions both come through
- * here, so a retransmission is charged against the same budget as the media. */
+ * here; a retransmission goes through pacer_shared_take_rtx. */
 uint64_t pacer_shared_take(pacer_shared* p, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, size_t bytes, uint64_t now_ns, uint64_t queue_limit_ns);
+
+/* A retransmission's take. It draws on its own bucket, refilled at PACER_RTX_SHARE_PCT
+ * of `bps`, so it never waits behind the media's deficit, and it is charged to the
+ * media's bucket as well, so the media yields the bytes. Returns the nanoseconds to
+ * sleep before sending (0 = send now). `bps` 0 disables pacing. */
+uint64_t pacer_shared_take_rtx(pacer_shared* p, uint32_t bps, size_t bytes, uint64_t now_ns);
 
 #endif  // PACER_H_

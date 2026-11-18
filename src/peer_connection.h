@@ -10,6 +10,7 @@
 
 #include "pacer.h"
 #include "pair_info.h"
+#include "rtx_stats.h"
 #include "twcc.h"
 #include "twcc_send.h"
 
@@ -415,6 +416,13 @@ uint64_t peer_connection_sent_dropped(PeerConnection* pc);
  *        Callable from any thread.
  */
 int peer_connection_rtt_ms(PeerConnection* pc, uint32_t* out_ms);
+
+/**
+ * @brief the retransmission counters since the last call (see rtx_stats.h), and
+ *        the age of the oldest packet the history holds. Resets the window.
+ *        Callable from any thread. Returns 0, or -1 for a NULL argument.
+ */
+int peer_connection_rtx_stats_drain(PeerConnection* pc, rtx_stats_snapshot* out);
 
 /**
  * @brief the ICE pair this connection sends on (the agent's nominated pair).
