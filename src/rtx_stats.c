@@ -26,8 +26,9 @@ void rtx_stats_on_stale(rtx_stats* s, uint32_t n) {
 
 uint32_t rtx_guard_ms(rtx_rtt rtt) {
   if (!rtt.known) return RTX_GUARD_FALLBACK_MS;
-  if (rtt.ms < RTX_GUARD_MIN_MS) return RTX_GUARD_MIN_MS;
-  return rtt.ms > RTX_GUARD_MAX_MS ? RTX_GUARD_MAX_MS : rtt.ms;
+  uint32_t half = rtt.ms / 2;
+  if (half < RTX_GUARD_MIN_MS) return RTX_GUARD_MIN_MS;
+  return half > RTX_GUARD_MAX_MS ? RTX_GUARD_MAX_MS : half;
 }
 
 void rtx_stats_on_sent(rtx_stats* s, uint32_t wait_ms) {

@@ -54,12 +54,15 @@ typedef struct {
   uint32_t ms; /* meaningful only when known */
 } rtx_rtt;
 
-/* The repeat guard: a packet is not retransmitted again until about one round trip
- * after its last send, because a NACK sent before the first copy could arrive is not
- * news. The RTT clamped to [RTX_GUARD_MIN_MS, RTX_GUARD_MAX_MS], or RTX_GUARD_FALLBACK_MS
- * while the RTT is unknown. */
+/* The repeat guard: a packet is not retransmitted again until half a round trip after its
+ * last send. The receiver repeats a NACK for a sequence one RTT after its last NACK for
+ * it, and the copy leaves the pacer some time after that NACK arrived, so a guard of a
+ * whole RTT from the send would still hold when the repeat arrives and the lost copy
+ * would wait for the next one, about two RTTs. Half an RTT is the copy's own flight, the
+ * time before which a repeat is not news. The RTT/2 clamped to [RTX_GUARD_MIN_MS,
+ * RTX_GUARD_MAX_MS], or RTX_GUARD_FALLBACK_MS while the RTT is unknown. */
 #define RTX_GUARD_MIN_MS 20u
-#define RTX_GUARD_MAX_MS 250u
+#define RTX_GUARD_MAX_MS 125u
 #define RTX_GUARD_FALLBACK_MS 100u
 uint32_t rtx_guard_ms(rtx_rtt rtt);
 /* Answer one NACKed seq against the history and count it: nacked always, plus miss
