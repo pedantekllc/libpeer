@@ -520,7 +520,7 @@ static void* peer_connection_rtx_main(void* arg) {
 
 /* Queue one NACKed sequence number for retransmission. Reactor thread: takes
  * only rtx_mtx and never sleeps; the pace happens on the RTX thread. A repeat
- * NACK inside the guard of the last send (about one RTT), for a seq already queued, or
+ * NACK inside the guard of the last send (half an RTT), for a seq already queued, or
  * one that finds the queue full, is dropped (the receiver NACKs again). */
 static void peer_connection_rtx_resend(PeerConnection* pc, uint16_t seq) {
   pthread_mutex_lock(&pc->rtx_mtx);

@@ -2,13 +2,15 @@
 #define RTX_STATS_H_
 
 /*
- * Per-connection retransmission counters for one reporting window.
+ * Per-connection retransmission counters for one reporting window, and the
+ * repeat guard that decides whether a NACKed sequence is queued again.
  *
  * Counts what the NACK path does: NACKed packets received, retransmits sent,
  * NACKs the history could no longer answer, NACKs the repeat guard dropped, PLIs
- * received, retransmits dropped for waiting too long, and how long a sent retransmit waited between its NACK arriving and
- * leaving the pacer (max and median over the window). Counters only; nothing
- * here changes what is sent.
+ * received, retransmits dropped for waiting too long, and how long a sent
+ * retransmit waited between its NACK arriving and leaving the pacer (max and
+ * median over the window). rtx_guard_ms and rtx_stats_on_nack_seq decide
+ * suppression: a sequence re-sent within the guard is not queued again.
  *
  * Pure: no lock, no clock, no I/O. The caller serialises every call and passes
  * the times in.
