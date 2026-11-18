@@ -36,6 +36,11 @@
 /* Per-packet sleep cap: guards against a pathological rate stalling a worker. */
 #define PACER_MAX_SLEEP_NS 50000000ull
 
+/* A retransmission's sleep is the time its share of the rate takes to repay one packet
+ * (a 1312-byte packet at 200 kbit is 105 ms), so the share holds strictly; the cap only
+ * guards a pathological rate. */
+#define PACER_RTX_MAX_SLEEP_NS 1000000000ull
+
 /* The share of the pace rate retransmissions may use, in percent (libwebrtc paces
  * retransmissions ahead of media; the share keeps a NACK flood from starving it). */
 #define PACER_RTX_SHARE_PCT 50u
