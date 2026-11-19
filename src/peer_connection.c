@@ -142,6 +142,8 @@ struct PeerConnection {
   _Atomic uint32_t last_rtp_ts;  // also read by the probe thread
 
   /* RTCP SR counters — cumulative across the connection lifetime.           */
+  int sr_pending_media;      /* a video packet is awaiting its send */
+  uint32_t sr_pending_octets; /* payload octets of the video packet being sent, 0 when none; counted once it is not abandoned */
   uint32_t sr_packets_sent;  /* RTP packets sent for video SSRC */
   uint32_t sr_octets_sent;   /* RTP payload octets sent (wraps at 2^32) */
 
@@ -454,9 +456,20 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
    * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
   uint64_t t0 = sb_mono_ns();
   const int video_pkt = size >= 12 && (rtp_is_video_pt(data[1] & 0x7F) || (data[1] & 0x7F) == PT_RED);
-  if (video_pkt && pc->au_abandoned) return; /* the rest of an abandoned access unit */
+  if (video_pkt && pc->au_abandoned) { /* the rest of an abandoned access unit */
+    pc->sr_pending_media = 0;
+    return;
+  }
   peer_connection_pace(pc, size + 10, video_pkt);
-  if (video_pkt && pc->au_abandoned) return;
+  if (video_pkt && pc->au_abandoned) {
+    pc->sr_pending_media = 0;
+    return;
+  }
+  if (pc->sr_pending_media) { /* sender-report totals count the packets that leave */
+    pc->sr_packets_sent++;
+    pc->sr_octets_sent += pc->sr_pending_octets;
+    pc->sr_pending_media = 0;
+  }
   uint64_t t1 = sb_mono_ns();
   pthread_mutex_lock(&pc->send_mtx);
   uint64_t t2 = sb_mono_ns();
@@ -750,9 +763,8 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
      * size minus the 12-byte RTP fixed header (the extension is already part
      * of the packet at this point, but SR octet count counts only payload
      * octets per RFC 3550 §6.4.1; subtract the header only, not the ext).  */
-    pc->sr_packets_sent++;
-    if (size > 12)
-      pc->sr_octets_sent += (uint32_t)(size - 12);
+    pc->sr_pending_octets = size > 12 ? (uint32_t)(size - 12) : 0;
+    pc->sr_pending_media = 1;
   }
   /* Every outgoing RTP packet (video, audio) carries the transport-wide seq
    * element; the value is stamped under send_mtx at the transmit tail. */
@@ -2453,4 +2465,9 @@ int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
    * this they sat in the table unpaired and were never checked. */
   agent_pair_remote_candidate(agent, slot);
   return 0;
+}
+
+void peer_connection_test_sr_totals(const PeerConnection* pc, uint32_t* packets, uint32_t* octets) {
+  *packets = pc->sr_packets_sent;
+  *octets = pc->sr_octets_sent;
 }
