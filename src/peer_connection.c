@@ -161,6 +161,9 @@ struct PeerConnection {
    * word race). */
   uint32_t pacer_bps;             /* 0 = pacing disabled                      */
   pacer_shared pacer;             /* token bucket (pacer.h), shared with the RTX thread */
+  peer_leaving_fn leaving_fn;     /* whether the AU in hand is being replaced  */
+  void* leaving_ctx;
+  int au_abandoned;               /* the AU in hand was abandoned: its remaining packets are dropped */
   peer_backlog_fn backlog_fn;     /* the caller's send queue behind the AU    */
   void* backlog_ctx;
   uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
@@ -343,6 +346,11 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
                                       now_ns - pc->pace_queue_start_ns, ring_bytes, ring_wait_ns);
     queued = q.bytes;
     queued_for = q.waited_ns;
+    if (pc->leaving_fn &&
+        pacer_abandons(pc->leaving_fn(pc->leaving_ctx), bps, queued, queued_for, queue_limit_ns)) {
+      pc->au_abandoned = 1;
+      return;
+    }
   }
   uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns, queue_limit_ns);
   if (video) pc->pace_queue_bytes = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes - bytes : 0;
@@ -351,6 +359,12 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
   ts.tv_nsec = (long)(wait_ns % 1000000000ull);
   nanosleep(&ts, NULL);
+}
+
+void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, void* ctx) {
+  if (!pc) return;
+  pc->leaving_fn = fn;
+  pc->leaving_ctx = ctx;
 }
 
 void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx) {
@@ -413,7 +427,10 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
   /* Pace BEFORE taking the send lock (sleeps must never hold it); budget on
    * the approximate on-wire size (payload + ~10-byte SRTP auth trailer). */
   uint64_t t0 = sb_mono_ns();
-  peer_connection_pace(pc, size + 10, size >= 12 && (rtp_is_video_pt(data[1] & 0x7F) || (data[1] & 0x7F) == PT_RED));
+  const int video_pkt = size >= 12 && (rtp_is_video_pt(data[1] & 0x7F) || (data[1] & 0x7F) == PT_RED);
+  if (video_pkt && pc->au_abandoned) return; /* the rest of an abandoned access unit */
+  peer_connection_pace(pc, size + 10, video_pkt);
+  if (video_pkt && pc->au_abandoned) return;
   uint64_t t1 = sb_mono_ns();
   pthread_mutex_lock(&pc->send_mtx);
   uint64_t t2 = sb_mono_ns();
@@ -1568,6 +1585,7 @@ int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, co
   pc->pace_queue_bytes = (uint64_t)len + len / 32;
   pc->pace_queue_start_ns = sv_t0;
   pc->pace_queue_limit_ns = queue_limit_ns;
+  pc->au_abandoned = 0;
   int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
   uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
   if (total_ms >= 30) {

@@ -167,6 +167,13 @@ void peer_connection_set_playout_delay(PeerConnection* pc, uint32_t min_ms, uint
  * oldest entry has waited. Called by the pacer on the send path, once per video packet. */
 typedef void (*peer_backlog_fn)(void* ctx, uint64_t* bytes, uint64_t* oldest_wait_ns);
 
+/* Whether the access unit being sent belongs to a picture that is being replaced (its viewer's
+ * switch to another encoder is decided). Called by the pacer on the send path, once per video
+ * packet; a leaving unit the queue limit would force above the pace is abandoned
+ * (pacer_abandons): its remaining packets are not sent. NULL clears it. */
+typedef int (*peer_leaving_fn)(void* ctx);
+void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, void* ctx);
+
 /* The pacer counts this backlog in its queue-time rule (pacer.h). NULL clears it. */
 void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx);
 

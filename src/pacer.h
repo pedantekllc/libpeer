@@ -71,6 +71,15 @@ void pacer_shared_destroy(pacer_shared* p);
  * sooner. */
 uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, uint64_t queue_limit_ns);
 
+/* Whether a packet of an access unit that is LEAVING (its viewer's switch to another
+ * encoder is decided, so the picture it belongs to is replaced by that encoder's
+ * keyframe) is abandoned instead of paced: when the queue limit would force the pace
+ * above `bps` to drain it (pacer_effective_bps), the unit cannot go out at the rate
+ * the link was granted, and bursting it ahead of the replacement keyframe is what
+ * delays that keyframe. A leaving unit that drains at `bps` within its limit is sent;
+ * an access unit that is not leaving is never abandoned. */
+int pacer_abandons(int leaving, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, uint64_t queue_limit_ns);
+
 /* What a video packet's pace draws on. */
 typedef struct {
   uint64_t bytes;     /* the queue, in bytes */
