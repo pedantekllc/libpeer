@@ -167,10 +167,20 @@ void peer_connection_set_playout_delay(PeerConnection* pc, uint32_t min_ms, uint
  * oldest entry has waited. Called by the pacer on the send path, once per video packet. */
 typedef void (*peer_backlog_fn)(void* ctx, uint64_t* bytes, uint64_t* oldest_wait_ns);
 
-/* Whether the access unit being sent belongs to a picture that is being replaced (its viewer's
- * switch to another encoder is decided). Called by the pacer on the send path, once per video
- * packet; a leaving unit the queue limit would force above the pace is abandoned
- * (pacer_abandons): its remaining packets are not sent. NULL clears it. */
+/* The fate of the access unit being sent. PEER_AU_KEEP: sent. PEER_AU_LEAVING: its viewer is
+ * switching DOWN to another encoder; it is abandoned when the queue limit would force the pace
+ * above the granted rate (pacer_abandons). PEER_AU_SUPERSEDED: the switch committed, the
+ * replacement keyframe is next; it is abandoned at once. An abandoned unit's remaining packets
+ * and every delta frame after it are not sent until the next keyframe, and one video sequence
+ * number is skipped so the receiver sees the hole and asks for a keyframe. Called by the pacer
+ * on the send path, once per video packet. NULL clears it. */
+/* Test-only: marks the connection completed and hands every RTP packet it would send (after
+ * pacing, sequence numbering and extensions, before SRTP) to `tap` instead of the network. A NULL
+ * `tap` returns it to NEW, so it can be destroyed. */
+typedef void (*peer_tx_tap_fn)(void* ctx, const uint8_t* pkt, size_t len);
+void peer_connection_test_open_media(PeerConnection* pc, peer_tx_tap_fn tap, void* ctx);
+
+enum { PEER_AU_KEEP = 0, PEER_AU_LEAVING = 1, PEER_AU_SUPERSEDED = 2 };
 typedef int (*peer_leaving_fn)(void* ctx);
 void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, void* ctx);
 

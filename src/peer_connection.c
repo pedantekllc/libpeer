@@ -161,9 +161,11 @@ struct PeerConnection {
    * word race). */
   uint32_t pacer_bps;             /* 0 = pacing disabled                      */
   pacer_shared pacer;             /* token bucket (pacer.h), shared with the RTX thread */
+  peer_tx_tap_fn tx_tap;          /* test-only: receives each RTP packet instead of the wire */
+  void* tx_tap_ctx;
   peer_leaving_fn leaving_fn;     /* whether the AU in hand is being replaced  */
   void* leaving_ctx;
-  int au_abandoned;               /* the AU in hand was abandoned: its remaining packets are dropped */
+  int au_abandoned;               /* an AU was abandoned: its remaining packets and every delta frame after it are dropped until the next keyframe */
   peer_backlog_fn backlog_fn;     /* the caller's send queue behind the AU    */
   void* backlog_ctx;
   uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
@@ -331,6 +333,20 @@ static void peer_connection_pace_rtx(PeerConnection* pc, size_t bytes) {
  * send_video was given for that access unit; the pace rate rises when that would not
  * drain within it. Other packets (audio, retransmissions) see no backlog but draw on the
  * same bucket. */
+static void peer_connection_abandon_au(PeerConnection* pc) {
+  if (pc->au_abandoned) return;
+  pc->au_abandoned = 1;
+  /* The viewer must see the hole: a video sequence number is drawn at send, so without
+   * this the packets after the abandoned ones would be contiguous and the browser would
+   * decode deltas against a keyframe it never got without a NACK or a PLI. The FEC path
+   * stamped the abandoned packet's sequence number before this point. */
+  if (!pc->config.fec) {
+    pthread_mutex_lock(&pc->send_mtx);
+    pc->video_seq.next++;
+    pthread_mutex_unlock(&pc->send_mtx);
+  }
+}
+
 static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
@@ -346,10 +362,13 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
                                       now_ns - pc->pace_queue_start_ns, ring_bytes, ring_wait_ns);
     queued = q.bytes;
     queued_for = q.waited_ns;
-    if (pc->leaving_fn &&
-        pacer_abandons(pc->leaving_fn(pc->leaving_ctx), bps, queued, queued_for, queue_limit_ns)) {
-      pc->au_abandoned = 1;
-      return;
+    if (pc->leaving_fn) {
+      const int fate = pc->leaving_fn(pc->leaving_ctx);
+      if (fate == PEER_AU_SUPERSEDED ||
+          pacer_abandons(fate == PEER_AU_LEAVING, bps, queued, queued_for, queue_limit_ns)) {
+        peer_connection_abandon_au(pc);
+        return;
+      }
     }
   }
   uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns, queue_limit_ns);
@@ -359,6 +378,13 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
   ts.tv_nsec = (long)(wait_ns % 1000000000ull);
   nanosleep(&ts, NULL);
+}
+
+void peer_connection_test_open_media(PeerConnection* pc, peer_tx_tap_fn tap, void* ctx) {
+  if (!pc) return;
+  pc->tx_tap = tap;
+  pc->tx_tap_ctx = ctx;
+  pc->state = tap ? PEER_CONNECTION_COMPLETED : PEER_CONNECTION_NEW;
 }
 
 void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, void* ctx) {
@@ -441,6 +467,11 @@ static void peer_connection_xmit_rtp(PeerConnection* pc, uint8_t* data, size_t s
     peer_connection_rtx_store(pc, data, size);
   }
   peer_connection_twcc_stamp(pc, data, size);
+  if (pc->tx_tap) { /* test-only: the packet as it would be protected and sent */
+    pc->tx_tap(pc->tx_tap_ctx, data, size);
+    pthread_mutex_unlock(&pc->send_mtx);
+    return;
+  }
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   uint64_t t2b = sb_mono_ns();
   agent_send(&pc->agent, data, size);
@@ -1546,6 +1577,8 @@ int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, co
    * after frames already sent) is rebased onto the stream's clock: the RTP timestamp,
    * abs-capture-time and SR below all derive from the rebased time, so none of them
    * steps back. */
+  if (key) pc->au_abandoned = 0;
+  else if (pc->au_abandoned) return 0; /* its reference never left: the viewer recovers at a keyframe */
   capture_time_ns = rtp_video_clock_map(&pc->video_clock, capture_time_ns);
   /* Derive the frame's capture WALL-CLOCK (→ abs-capture-time) and refresh the
    * SR reference pair. capture_time_ns is the frame's timestamp; on a real
@@ -1585,7 +1618,6 @@ int peer_connection_send_video(PeerConnection* pc, MediaCodec codec, int key, co
   pc->pace_queue_bytes = (uint64_t)len + len / 32;
   pc->pace_queue_start_ns = sv_t0;
   pc->pace_queue_limit_ns = queue_limit_ns;
-  pc->au_abandoned = 0;
   int rc = rtp_encoder_encode(&pc->vrtp_encoder, buf, len, capture_time_ns);
   uint64_t total_ms = (sb_mono_ns() - sv_t0) / 1000000ull;
   if (total_ms >= 30) {
