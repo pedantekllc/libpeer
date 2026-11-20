@@ -13,6 +13,11 @@ uint32_t pacer_effective_bps(uint32_t bps, uint64_t queued_bytes, uint64_t queue
   return needed >= 4294967295.0 ? UINT32_MAX : (uint32_t)needed;
 }
 
+int pacer_abandons(int leaving, uint32_t bps, uint64_t queued_bytes, uint64_t queued_for_ns, uint64_t queue_limit_ns) {
+  if (!leaving || bps == 0) return 0;
+  return pacer_effective_bps(bps, queued_bytes, queued_for_ns, queue_limit_ns) > bps;
+}
+
 pacer_queue pacer_video_queue(uint64_t queue_limit_ns, uint64_t au_bytes, uint64_t au_age_ns, uint64_t ring_bytes, uint64_t ring_wait_ns) {
   if (queue_limit_ns < PACER_QUEUE_LIMIT_NS) {
     pacer_queue own = {au_bytes, au_age_ns};
