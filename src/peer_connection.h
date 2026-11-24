@@ -189,6 +189,17 @@ void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, vo
 /* The pacer counts this backlog in its queue-time rule (pacer.h). NULL clears it. */
 void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx);
 
+/* The caller's own per-connection work, run while the pacer holds the media thread waiting for
+ * budget. The thread that sends media is also the one that pumps the connection (reads the
+ * socket, answers RTCP, applies queued ICE candidates); a paced burst of seconds would
+ * otherwise leave all of that undone. The pacer calls `fn` at least every
+ * PEER_PACE_SERVICE_SLICE_MS while it waits, on the thread that called
+ * peer_connection_set_pace_service and never from the retransmission or probe threads, and
+ * never from inside `fn` itself. NULL clears it. Set it on the sending thread before each send. */
+#define PEER_PACE_SERVICE_SLICE_MS 2
+typedef void (*peer_pace_service_fn)(void* ctx);
+void peer_connection_set_pace_service(PeerConnection* pc, peer_pace_service_fn fn, void* ctx);
+
 const char* peer_connection_state_to_string(PeerConnectionState state);
 
 PeerConnectionState peer_connection_get_state(PeerConnection* pc);
