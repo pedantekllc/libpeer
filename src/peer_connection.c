@@ -169,6 +169,8 @@ struct PeerConnection {
   void* leaving_ctx;
   int au_abandoned;               /* an AU was abandoned: its remaining packets and every delta frame after it are dropped until the next keyframe */
   peer_backlog_fn backlog_fn;     /* the caller's send queue behind the AU    */
+  peer_pace_service_fn pace_service_fn; /* the caller's per-connection work while the pacer waits */
+  void* pace_service_ctx;
   void* backlog_ctx;
   uint64_t pace_queue_bytes;      /* unsent rest of the access unit in hand   */
   uint64_t pace_queue_start_ns;   /* when that access unit entered the pacer  */
@@ -349,6 +351,23 @@ static void peer_connection_abandon_au(PeerConnection* pc) {
   }
 }
 
+/* Wait out `wait_ns` of media pacing in naps of at most a slice; after each whole slice napped
+ * the service runs, so the connection keeps being pumped through a long wait, and a wait shorter
+ * than a slice (every packet at a fast pace) is one nap with no service. */
+static void peer_connection_pace_wait(PeerConnection* pc, uint64_t wait_ns) {
+  const uint64_t slice_ns = (uint64_t)PEER_PACE_SERVICE_SLICE_MS * 1000000ull;
+  const uint64_t deadline_ns = sb_mono_ns() + wait_ns;
+  for (;;) {
+    const uint64_t now_ns = sb_mono_ns();
+    if (now_ns >= deadline_ns) return;
+    const uint64_t left_ns = deadline_ns - now_ns;
+    const uint64_t nap_ns = left_ns < slice_ns ? left_ns : slice_ns;
+    struct timespec ts = {.tv_sec = 0, .tv_nsec = (long)nap_ns};
+    nanosleep(&ts, NULL);
+    if (nap_ns == slice_ns && pc->pace_service_fn) pc->pace_service_fn(pc->pace_service_ctx);
+  }
+}
+
 static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint32_t bps = pc->pacer_bps;
   if (bps == 0) return;
@@ -376,10 +395,7 @@ static void peer_connection_pace(PeerConnection* pc, size_t bytes, int video) {
   uint64_t wait_ns = pacer_shared_take(&pc->pacer, bps, queued, queued_for, bytes, now_ns, queue_limit_ns);
   if (video) pc->pace_queue_bytes = pc->pace_queue_bytes > bytes ? pc->pace_queue_bytes - bytes : 0;
   if (wait_ns == 0) return;
-  struct timespec ts;
-  ts.tv_sec = (time_t)(wait_ns / 1000000000ull);
-  ts.tv_nsec = (long)(wait_ns % 1000000000ull);
-  nanosleep(&ts, NULL);
+  peer_connection_pace_wait(pc, wait_ns);
 }
 
 void peer_connection_test_open_media(PeerConnection* pc, peer_tx_tap_fn tap, void* ctx) {
@@ -393,6 +409,12 @@ void peer_connection_set_send_leaving(PeerConnection* pc, peer_leaving_fn fn, vo
   if (!pc) return;
   pc->leaving_fn = fn;
   pc->leaving_ctx = ctx;
+}
+
+void peer_connection_set_pace_service(PeerConnection* pc, peer_pace_service_fn fn, void* ctx) {
+  if (!pc) return;
+  pc->pace_service_fn = fn;
+  pc->pace_service_ctx = ctx;
 }
 
 void peer_connection_set_send_backlog(PeerConnection* pc, peer_backlog_fn fn, void* ctx) {
